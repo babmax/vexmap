@@ -23,6 +23,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # The same data-core tests on the production database. They wipe its public schema, hence one thread.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo test -p vexmap-core --test core --locked -- --test-threads=1
+        env:
+          VEXMAP_TEST_POSTGRES_URL: postgres://postgres:ci-only@localhost:5432/postgres
+
   native:
     runs-on: ubuntu-latest
     timeout-minutes: 90

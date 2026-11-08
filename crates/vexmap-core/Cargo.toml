@@ -1,0 +1,19 @@
+[package]
+name = "vexmap-core"
+description = "VexMap data core: players, roles, feature flags and the append-only journal, on SQLite or PostgreSQL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+uuid = { workspace = true, features = ["v4"] }
