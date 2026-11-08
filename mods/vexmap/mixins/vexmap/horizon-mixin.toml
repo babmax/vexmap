@@ -21,6 +21,19 @@ file = "crates/horizon-client/src/game.rs"
 name = "vexmap_link"
 source = "sidecar_link.rs"
 
+# Also the `vexmap-ui` crate.
+[[module]]
+id = "ui"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_ui"
+source = "ui.rs"
+
+[[module]]
+id = "screen"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_screen"
+source = "map_screen.rs"
+
 [[module]]
 id = "runtime"
 file = "crates/horizon-client/src/game.rs"
@@ -73,6 +86,41 @@ bindings = [
   { name = "data", ty = "&[u8]", value = "data" },
 ]
 
+[[injection]]
+id = "resource-pack-status"
+hook = "resource_pack_status"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/resource_pack_status.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "status", ty = "i32", value = "status" },
+]
+
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/register_commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<horizon_client::mod_api::NativeCommand>", value = "&mut *commands" },
+]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/perform_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&horizon_client::mod_api::NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
 # ---- client
 
 [[injection]]
@@ -93,3 +141,111 @@ hook_version = 1
 kind = "HEAD"
 helper = "hooks/frame.rs"
 bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+[[injection]]
+id = "key"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "hud"
+hook = "hud"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/hud.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]
+
+[[injection]]
+id = "gui-layer-pre"
+hook = "gui_layer_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/gui_layer_pre.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "screen-render-post"
+hook = "screen_render_post"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/screen_render_post.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+  { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+]
+
+[[injection]]
+id = "mouse-pressed"
+hook = "screen_mouse_button_pressed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/mouse_pressed.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+  { name = "button", ty = "i32", value = "button" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "mouse-released"
+hook = "screen_mouse_button_released_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/mouse_released.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "button", ty = "i32", value = "button" },
+]
+
+[[injection]]
+id = "mouse-dragged"
+hook = "screen_mouse_dragged_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/mouse_dragged.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "delta", ty = "[f32; 2]", value = "delta" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "mouse-scrolled"
+hook = "screen_mouse_scrolled_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/mouse_scrolled.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+  { name = "scroll", ty = "[f64; 2]", value = "scroll" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "key-pressed"
+hook = "screen_key_pressed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/key_pressed.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "repeat", ty = "bool", value = "repeat" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]

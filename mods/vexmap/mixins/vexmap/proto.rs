@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 pub const CHANNEL: &str = "vexmap:main";
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 pub const FRAME_VERSION: u8 = 1;
 pub const MAGIC: [u8; 2] = *b"VM";
 pub const HEADER_LEN: usize = 12;
@@ -38,6 +38,7 @@ pub enum Kind {
     PositionDelta = 8,
     PositionStreams = 9,
     PositionClusters = 10,
+    OpenMap = 11,
 }
 
 impl Kind {
@@ -53,6 +54,7 @@ impl Kind {
             8 => Kind::PositionDelta,
             9 => Kind::PositionStreams,
             10 => Kind::PositionClusters,
+            11 => Kind::OpenMap,
             _ => return None,
         })
     }
@@ -133,6 +135,8 @@ pub enum Message {
     Welcome {
         protocol: u16,
         features: u64,
+        /// The client's own UUID as the server knows it, so the map can leave the player's own marker out.
+        player: u128,
     },
     Reject {
         reason: String,
@@ -146,6 +150,8 @@ pub enum Message {
     PositionStreams(Vec<u32>),
     /// Everything the client has no markers for, summed up. Replaces the previous list.
     PositionClusters(Vec<Cluster>),
+    /// The player ran `/map`. Commands live on the server, the screen on the client.
+    OpenMap,
 }
 
 /// A player on the map. Coordinates in 1/8 of a block, `yaw` in 1/256 of a turn.
@@ -223,6 +229,7 @@ impl Message {
             Message::PositionDelta(_) => Kind::PositionDelta,
             Message::PositionStreams(_) => Kind::PositionStreams,
             Message::PositionClusters(_) => Kind::PositionClusters,
+            Message::OpenMap => Kind::OpenMap,
         }
     }
 
@@ -234,13 +241,14 @@ impl Message {
                 out.extend_from_slice(&features.to_le_bytes());
                 put_str(&mut out, mod_version, MAX_MOD_VERSION);
             }
-            Message::Welcome { protocol, features } => {
+            Message::Welcome { protocol, features, player } => {
                 out.extend_from_slice(&protocol.to_le_bytes());
                 out.extend_from_slice(&features.to_le_bytes());
+                out.extend_from_slice(&player.to_le_bytes());
             }
             Message::Reject { reason } => put_str(&mut out, reason, MAX_REASON),
             Message::Ping(stamp) | Message::Pong(stamp) => out.extend_from_slice(&stamp.to_le_bytes()),
-            Message::Probe => {}
+            Message::Probe | Message::OpenMap => {}
             Message::PositionKey(frame) => {
                 out.extend_from_slice(&frame.stream.to_le_bytes());
                 out.extend_from_slice(&frame.key.to_le_bytes());
@@ -283,11 +291,14 @@ impl Message {
                 features: reader.u64()?,
                 mod_version: reader.string(MAX_MOD_VERSION)?,
             },
-            Kind::Welcome => Message::Welcome { protocol: reader.u16()?, features: reader.u64()? },
+            Kind::Welcome => {
+                Message::Welcome { protocol: reader.u16()?, features: reader.u64()?, player: reader.u128()? }
+            }
             Kind::Reject => Message::Reject { reason: reader.string(MAX_REASON)? },
             Kind::Ping => Message::Ping(reader.u64()?),
             Kind::Pong => Message::Pong(reader.u64()?),
             Kind::Probe => Message::Probe,
+            Kind::OpenMap => Message::OpenMap,
             Kind::PositionKey => Message::PositionKey(PositionKey {
                 stream: reader.u32()?,
                 key: reader.u32()?,
@@ -432,6 +443,12 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn u128(&mut self) -> Result<u128, DecodeError> {
+        let mut b = [0; 16];
+        b.copy_from_slice(self.take(16)?);
+        Ok(u128::from_le_bytes(b))
     }
 
     fn u32(&mut self) -> Result<u32, DecodeError> {
@@ -859,6 +876,8 @@ pub enum KickReason {
     NoHello,
     /// The client speaks another protocol version.
     Protocol { client: u16 },
+    /// The required resource pack was not applied (ADR-008).
+    Pack(PackFailure),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -942,6 +961,152 @@ impl AdmissionGate {
     }
 }
 
+/// How a required pack failed, which decides what the player is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackFailure {
+    Declined,
+    /// Download, an unusable address or the reload failed: not the player's choice.
+    Failed,
+    /// No final answer in time.
+    TimedOut,
+}
+
+/// `ServerboundResourcePackPacket.Action`, as `native_resource_pack_status` numbers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackStatus {
+    Loaded,
+    Declined,
+    Accepted,
+    Downloaded,
+    Failed,
+    Discarded,
+}
+
+impl PackStatus {
+    pub fn from_action(action: i32) -> Option<PackStatus> {
+        Some(match action {
+            0 => PackStatus::Loaded,
+            1 => PackStatus::Declined,
+            2 | 5 | 6 => PackStatus::Failed,
+            3 => PackStatus::Accepted,
+            4 => PackStatus::Downloaded,
+            7 => PackStatus::Discarded,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PackProgress {
+    Waiting { deadline_ms: u64 },
+    Done,
+}
+
+/// Server side of decision 133: every admitted player must apply the pack, or is told why and disconnected. Each region
+/// server asks again, because a proxy hides from the client which server it talks to.
+pub struct PackGate {
+    /// Time to answer the prompt.
+    pub answer_ms: u64,
+    /// Time to download and apply once accepted.
+    pub apply_ms: u64,
+    players: HashMap<u128, PackProgress>,
+}
+
+impl Default for PackGate {
+    fn default() -> Self {
+        PackGate { answer_ms: 120_000, apply_ms: 120_000, players: HashMap::new() }
+    }
+}
+
+impl PackGate {
+    /// `true` the first time for this player on this server: send the pack now. `Hello` repeats, the pack must not.
+    pub fn offer(&mut self, player: u128, now_ms: u64) -> bool {
+        if self.players.contains_key(&player) {
+            return false;
+        }
+        self.players.insert(player, PackProgress::Waiting { deadline_ms: now_ms + self.answer_ms });
+        true
+    }
+
+    pub fn leave(&mut self, player: u128) {
+        self.players.remove(&player);
+    }
+
+    /// The client's answer. `Some` means disconnect. Answers from someone we are not waiting on change nothing.
+    pub fn status(&mut self, player: u128, status: PackStatus, now_ms: u64) -> Option<PackFailure> {
+        let progress = self.players.get_mut(&player)?;
+        if !matches!(progress, PackProgress::Waiting { .. }) {
+            return None;
+        }
+        match status {
+            PackStatus::Loaded => *progress = PackProgress::Done,
+            PackStatus::Accepted | PackStatus::Downloaded => {
+                *progress = PackProgress::Waiting { deadline_ms: now_ms + self.apply_ms };
+            }
+            PackStatus::Discarded => {}
+            PackStatus::Declined | PackStatus::Failed => {
+                *progress = PackProgress::Done;
+                return Some(if status == PackStatus::Declined { PackFailure::Declined } else { PackFailure::Failed });
+            }
+        }
+        None
+    }
+
+    /// Players past their deadline. Each is returned once.
+    pub fn poll(&mut self, now_ms: u64) -> Vec<u128> {
+        let mut late = Vec::new();
+        for (player, progress) in &mut self.players {
+            if matches!(progress, PackProgress::Waiting { deadline_ms } if now_ms >= *deadline_ms) {
+                *progress = PackProgress::Done;
+                late.push(*player);
+            }
+        }
+        late
+    }
+}
+
+/// How long the mod holds the server tick. Fixed memory, so measuring costs next to nothing.
+pub struct TickMeter {
+    samples: Vec<u32>,
+    filled: usize,
+    scratch: Vec<u32>,
+}
+
+/// One report of [`TickMeter`], in microseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickReport {
+    pub ticks: usize,
+    pub p50_us: u32,
+    pub p99_us: u32,
+    pub max_us: u32,
+}
+
+impl TickMeter {
+    /// `window` ticks per report.
+    pub fn new(window: usize) -> Self {
+        TickMeter { samples: vec![0; window.max(1)], filled: 0, scratch: Vec::with_capacity(window.max(1)) }
+    }
+
+    /// `Some` every `window` ticks.
+    pub fn record(&mut self, nanos: u64) -> Option<TickReport> {
+        let slot = self.samples.get_mut(self.filled)?;
+        *slot = nanos.min(u64::from(u32::MAX)) as u32;
+        self.filled += 1;
+        if self.filled < self.samples.len() {
+            return None;
+        }
+        self.filled = 0;
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.samples);
+        self.scratch.sort_unstable();
+        let at = |fraction: f64| {
+            let index = ((self.scratch.len() - 1) as f64 * fraction).round() as usize;
+            self.scratch.get(index).copied().unwrap_or(0) / 1000
+        };
+        Some(TickReport { ticks: self.scratch.len(), p50_us: at(0.5), p99_us: at(0.99), max_us: at(1.0) })
+    }
+}
+
 /// Client side of the handshake. A client cannot tell when a proxy moves it to another server, so it repeats `Hello`
 /// until welcomed and answers every `Probe` at once.
 pub struct ClientHandshake {
@@ -1005,7 +1170,8 @@ mod tests {
     fn every_message_roundtrips() {
         for message in [
             Message::Hello { protocol: PROTOCOL, features: 0b1011, mod_version: "0.1.0".into() },
-            Message::Welcome { protocol: PROTOCOL, features: 3 },
+            Message::Welcome { protocol: PROTOCOL, features: 3, player: u128::MAX - 7 },
+            Message::OpenMap,
             Message::Reject { reason: "Установите мод VexMap".into() },
             Message::Ping(42),
             Message::Pong(u64::MAX),
@@ -1384,5 +1550,79 @@ mod tests {
         client.probed();
         assert!(!client.is_welcomed());
         assert!(client.due(10_001));
+    }
+
+    const NOW: u64 = 1_000;
+
+    #[test]
+    fn the_pack_is_offered_once_per_player_on_this_server() {
+        let mut gate = PackGate::default();
+        assert!(gate.offer(1, NOW));
+        assert!(!gate.offer(1, NOW + 5));
+        assert!(gate.offer(2, NOW));
+        gate.leave(1);
+        assert!(gate.offer(1, NOW + 9));
+    }
+
+    #[test]
+    fn declining_or_failing_disconnects_with_the_right_reason() {
+        let mut gate = PackGate::default();
+        gate.offer(1, NOW);
+        assert_eq!(gate.status(1, PackStatus::Declined, NOW), Some(PackFailure::Declined));
+        gate.offer(2, NOW);
+        gate.status(2, PackStatus::Accepted, NOW);
+        assert_eq!(gate.status(2, PackStatus::Failed, NOW), Some(PackFailure::Failed));
+    }
+
+    #[test]
+    fn a_finished_pack_ignores_later_answers_and_deadlines() {
+        let mut gate = PackGate::default();
+        gate.offer(1, NOW);
+        for status in [PackStatus::Accepted, PackStatus::Downloaded, PackStatus::Loaded] {
+            assert_eq!(gate.status(1, status, NOW), None);
+        }
+        assert_eq!(gate.status(1, PackStatus::Declined, NOW), None);
+        assert!(gate.poll(NOW + 10_000_000).is_empty());
+    }
+
+    #[test]
+    fn answers_from_strangers_change_nothing() {
+        assert_eq!(PackGate::default().status(9, PackStatus::Declined, NOW), None);
+    }
+
+    #[test]
+    fn silence_times_out_once_and_acceptance_extends_the_deadline() {
+        let mut gate = PackGate { answer_ms: 100, apply_ms: 1000, ..PackGate::default() };
+        gate.offer(1, 0);
+        gate.offer(2, 0);
+        gate.status(2, PackStatus::Accepted, 90);
+        assert_eq!(gate.poll(100), vec![1]);
+        assert!(gate.poll(1000).is_empty());
+        assert_eq!(gate.poll(1090), vec![2]);
+        assert!(gate.poll(5000).is_empty());
+    }
+
+    #[test]
+    fn pack_actions_follow_vanillas_numbers() {
+        assert_eq!(PackStatus::from_action(0), Some(PackStatus::Loaded));
+        assert_eq!(PackStatus::from_action(1), Some(PackStatus::Declined));
+        for failed in [2, 5, 6] {
+            assert_eq!(PackStatus::from_action(failed), Some(PackStatus::Failed));
+        }
+        assert_eq!(PackStatus::from_action(3), Some(PackStatus::Accepted));
+        assert_eq!(PackStatus::from_action(4), Some(PackStatus::Downloaded));
+        assert_eq!(PackStatus::from_action(7), Some(PackStatus::Discarded));
+        assert_eq!(PackStatus::from_action(8), None);
+    }
+
+    #[test]
+    fn the_tick_meter_reports_each_window_and_starts_over() {
+        let mut meter = TickMeter::new(100);
+        for value in 1..100 {
+            assert_eq!(meter.record(value * 1000), None);
+        }
+        let report = meter.record(1_000_000).unwrap();
+        assert_eq!(report, TickReport { ticks: 100, p50_us: 51, p99_us: 99, max_us: 1000 });
+        assert_eq!(meter.record(5), None);
     }
 }

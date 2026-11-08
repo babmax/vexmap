@@ -13,10 +13,10 @@
         <rect x="48" y="96" width="136" height="112" rx="12" fill="#35d0a5"/><text x="116" y="136" font-size="26" font-weight="800" fill="#08201a">0</text><text x="116" y="162" fill="#08201a">Аудит и ADR</text>
         <rect x="196" y="96" width="136" height="112" rx="12" fill="#4f9dff"/><text x="264" y="136" font-size="26" font-weight="800" fill="#07192f">1</text><text x="264" y="162" fill="#07192f">Хуки и сборка</text>
         <rect x="344" y="96" width="136" height="112" rx="12" fill="#4f9dff"/><text x="412" y="136" font-size="26" font-weight="800" fill="#07192f">2</text><text x="412" y="162" fill="#07192f">Данные и API</text>
-        <rect x="492" y="96" width="136" height="112" rx="12" fill="#ffb547"/><text x="560" y="136" font-size="26" font-weight="800" fill="#2b1c02">3</text><text x="560" y="162" fill="#2b1c02">Realtime</text>
+        <rect x="492" y="96" width="136" height="112" rx="12" fill="#4f9dff"/><text x="560" y="136" font-size="26" font-weight="800" fill="#07192f">3</text><text x="560" y="162" fill="#07192f">Realtime</text>
       </g>
       <g fill="#c8d4ea">
-        <rect x="640" y="96" width="136" height="112" rx="12" fill="#2a3a59"/><text x="708" y="136" font-size="26" font-weight="800">4</text><text x="708" y="162">Интеграция</text><text x="708" y="182">в игру</text>
+        <rect x="640" y="96" width="136" height="112" rx="12" fill="#ffb547"/><text x="708" y="136" font-size="26" font-weight="800" fill="#2b1c02">4</text><text x="708" y="162" fill="#2b1c02">Интеграция</text><text x="708" y="182" fill="#2b1c02">в игру</text>
         <rect x="788" y="96" width="136" height="112" rx="12" fill="#2a3a59"/><text x="856" y="136" font-size="26" font-weight="800">5</text><text x="856" y="162">Тайлы, глобус</text>
         <rect x="936" y="96" width="136" height="112" rx="12" fill="#2a3a59"/><text x="1004" y="136" font-size="26" font-weight="800">6</text><text x="1004" y="162">GPS, маршруты</text>
         <rect x="1084" y="96" width="148" height="112" rx="12" fill="#2a3a59"/><text x="1158" y="136" font-size="26" font-weight="800">7</text><text x="1158" y="162">Страны, вики</text>

@@ -6,6 +6,7 @@
 Writes to --out:
   vexmap-mod-<version>.tar.gz                  the mod bundle (mods/vexmap) the launcher builds from
   vexmap-server-linux-x86_64-<version>.tar.gz  the region server engine with the mod, if --server is given
+  vexmap-pack.zip, vexmap-pack.sha1            the server resource pack, if --pack is given (host it, see docs/phase-4)
   manifest.json                                version, Horizon pins, file sizes and SHA-256
   SHA256SUMS, SHA256SUMS.minisig               sums, and their signature
 
@@ -56,6 +57,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", required=True)
     parser.add_argument("--server", type=Path, help="built horizon-client with the mod, for the server archive")
+    parser.add_argument("--pack", type=Path, help="directory with vexmap-pack.zip and vexmap-pack.sha1")
     parser.add_argument("--out", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     version = args.version.removeprefix("v")
@@ -71,6 +73,12 @@ def main():
         server_archive = out / f"vexmap-server-linux-x86_64-{version}.tar.gz"
         tar_gz(server_archive, [("horizon-engine", args.server), ("LICENSE", ROOT / "LICENSE")])
         files.append(server_archive)
+
+    if args.pack:
+        for name in ("vexmap-pack.zip", "vexmap-pack.sha1"):
+            copied = out / name
+            copied.write_bytes((args.pack / name).read_bytes())
+            files.append(copied)
 
     compat = json.loads((MOD / "compatibility.json").read_text(encoding="utf-8"))
     manifest = out / "manifest.json"

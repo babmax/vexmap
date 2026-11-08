@@ -1,0 +1,18 @@
+[package]
+name = "vexmap-ui"
+description = "VexMap's client interface logic: settings, presets, the map view and draw lists. The same file is injected into the game."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# This exact source is also injected into Horizon as the `vexmap_ui` module, see mods/vexmap/mixins/vexmap.
+path = "../../mods/vexmap/mixins/vexmap/ui.rs"
+
+[[bench]]
+name = "ui"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }

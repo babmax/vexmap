@@ -24,11 +24,12 @@ jobs:
           git -C .deps/horizon-mixins checkout "$rev"
       - run: cargo test --workspace --locked
       - run: python3 tools/dev/stage.py build mods/vexmap --profile release
+      - run: cargo run --locked -p vexmap-resourcepack -- .deps/pack
       - name: Package and sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: python3 tools/release/sign.py --version "${GITHUB_REF_NAME}" --server .deps/target/release/horizon-client --out dist
+        run: python3 tools/release/sign.py --version "${GITHUB_REF_NAME}" --server .deps/target/release/horizon-client --pack .deps/pack --out dist
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

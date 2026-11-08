@@ -9,6 +9,7 @@ API ему присваивает `tools/stamp_native_hooks.py` после сл�
 | 1 | Хук `custom_payload_from_client` на сервере | Приём нашего канала (ADR-003) | **Уже в `main`**: `27200f64c`, #10461, фрагмент ждёт номера API. Наш PR не нужен | Миксин на `native_custom_payload_from_client` до пина на версию с номером |
 | 2 | Хук размера кадра для съёмки (вместо `Renderer::screenshot_size`) | Панорамы без подмены внутренней функции (ADR-005) | Не начат. В `main` появился только `native_take_screenshot`, он пишет файл как F2 и для фона не годится | Миксин на `screenshot_size` в моде панорам (Фаза 9) |
 | 3 | Определение Horizon-клиента за прокси | `horizon-clients-only`, `mod_net`, дальний рельеф и серверные предметы за Velocity (S5) | Не начат. В `main` проверки `brand == "horizon"` прежние: `lan/conn.rs`, `native_net.rs`, `lan/hub.rs` | Plugin channel и своё рукопожатие (ADR-003, ADR-007) |
+| 4 | Хелпер `native_close_screen` или разрешение открывать экран мода поверх меню паузы | Кнопка карты в меню паузы (Фаза 4) | Не начат | Прямая запись `game.screen` в `map_screen.rs`, как у `horizon-ctl resume` |
 
 ## PR 2: хук кадра для съёмки
 
@@ -40,3 +41,4 @@ API ему присваивает `tools/stamp_native_hooks.py` после сл�
 | Цель | Где | Убрать когда |
 |---|---|---|
 | `Game::native_custom_payload_from_client` | `mods/vexmap` | Пин на ревизию, где `custom_payload_from_client` получил номер API |
+| Поле `Game::screen` (запись `Screen::Playing`) | `map_screen.rs::apply_requests` | Принят PR 4 |

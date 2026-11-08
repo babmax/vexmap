@@ -6,6 +6,8 @@
 
 use super::vexmap_link as link;
 use super::vexmap_proto as proto;
+use super::vexmap_screen as screen;
+use super::vexmap_ui as ui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -27,7 +29,13 @@ static DELIVERIES: link::DeliveryBox = link::DeliveryBox::new();
 const KICK_NO_MOD: &str = "VexMap: this server needs the VexMap client mod.\n\
 Этому серверу нужен клиентский мод VexMap.";
 
-fn now_ms() -> u64 {
+/// `vexmap_resourcepack::PACK_ID`. Fixed, so a new version replaces the old one on the client.
+const PACK_ID: u128 = 0x5645_584d_4150_5041_434b_0000_0000_0001;
+/// One report a minute at 20 TPS.
+const TICK_REPORT_TICKS: usize = 1200;
+const TICK_REPORT_TICKS_BENCH: usize = 200;
+
+pub(super) fn now_ms() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
@@ -45,6 +53,48 @@ struct Server {
     next_sample_ms: u64,
     samples: Vec<link::PlayerSample>,
     deliveries: Vec<link::Delivery>,
+    pack: Option<PackOffer>,
+    packs: proto::PackGate,
+    tick_meter: proto::TickMeter,
+    bench_admit_all: bool,
+}
+
+/// Where the resource pack is hosted. Without it the server does not ask for a pack: fine on a bench, wrong in production.
+struct PackOffer {
+    url: String,
+    sha1: String,
+}
+
+/// `Err` says what is wrong, so a typo stops the pack loudly instead of kicking every player on a bad address.
+fn parse_pack_offer(url: Option<&str>, sha1: Option<&str>) -> Result<Option<PackOffer>, String> {
+    let (url, sha1) = match (url, sha1) {
+        (None, None) => return Ok(None),
+        (Some(url), Some(sha1)) => (url.trim(), sha1.trim()),
+        _ => return Err("set both VEXMAP_PACK_URL and VEXMAP_PACK_SHA1".to_owned()),
+    };
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("VEXMAP_PACK_URL is not http(s)".to_owned());
+    }
+    if sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("VEXMAP_PACK_SHA1 is not 40 lowercase hex digits".to_owned());
+    }
+    Ok(Some(PackOffer { url: url.to_owned(), sha1: sha1.to_owned() }))
+}
+
+fn load_pack_offer() -> Option<PackOffer> {
+    let url = std::env::var("VEXMAP_PACK_URL").ok();
+    let sha1 = std::env::var("VEXMAP_PACK_SHA1").ok();
+    match parse_pack_offer(url.as_deref(), sha1.as_deref()) {
+        Ok(Some(offer)) => Some(offer),
+        Ok(None) => {
+            log(format_args!("no resource pack configured (VEXMAP_PACK_URL): players are not asked for one"));
+            None
+        }
+        Err(error) => {
+            log(format_args!("resource pack is off: {error}"));
+            None
+        }
+    }
 }
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
@@ -53,6 +103,12 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
     let mut guard = SERVER.lock().ok()?;
     let server = guard.get_or_insert_with(|| {
         start_sidecar_link();
+        // Only for load tests with bots, which cannot answer the handshake. Never set in production.
+        let bench_admit_all = std::env::var_os("VEXMAP_BENCH_ADMIT_ALL").is_some();
+        if bench_admit_all {
+            log(format_args!("VEXMAP_BENCH_ADMIT_ALL is set: every player is admitted without the mod"));
+        }
+        let window = if bench_admit_all { TICK_REPORT_TICKS_BENCH } else { TICK_REPORT_TICKS };
         Server {
             gate: proto::AdmissionGate::new(SERVER_FEATURES.load(Ordering::Relaxed)),
             inbound: HashMap::new(),
@@ -60,6 +116,10 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             next_sample_ms: 0,
             samples: Vec::new(),
             deliveries: Vec::new(),
+            pack: load_pack_offer(),
+            packs: proto::PackGate::default(),
+            tick_meter: proto::TickMeter::new(window),
+            bench_admit_all,
         }
     });
     Some(f(server))
@@ -132,6 +192,21 @@ fn kick_text(reason: proto::KickReason) -> String {
             proto::PROTOCOL,
             proto::PROTOCOL
         ),
+        proto::KickReason::Pack(proto::PackFailure::Declined) => {
+            "VexMap: this server needs its resource pack. Accept it to play.\n\
+             Этому серверу нужен его ресурс-пак. Примите его, чтобы играть."
+                .to_owned()
+        }
+        proto::KickReason::Pack(proto::PackFailure::Failed) => {
+            "VexMap: the resource pack did not load. Try to join again.\n\
+             Ресурс-пак не загрузился. Попробуйте войти снова."
+                .to_owned()
+        }
+        proto::KickReason::Pack(proto::PackFailure::TimedOut) => {
+            "VexMap: the resource pack took too long. Try to join again.\n\
+             Ресурс-пак загружался слишком долго. Попробуйте войти снова."
+                .to_owned()
+        }
     }
 }
 
@@ -160,6 +235,11 @@ fn send_deliveries(game: &mut crate::game::Game<'_>, server: &mut Server) {
 pub(super) fn player_logged_in(game: &mut crate::game::Game<'_>, player: u128) {
     with_server(|server| {
         server.gate.join(player, now_ms());
+        if server.bench_admit_all {
+            server.gate.server_features = SERVER_FEATURES.load(Ordering::Relaxed);
+            server.gate.hello(player, proto::PROTOCOL, FEATURES);
+            return;
+        }
         send_to_player(game, &mut server.outbox, player, &proto::Message::Probe);
     });
 }
@@ -168,12 +248,14 @@ pub(super) fn player_logged_in(game: &mut crate::game::Game<'_>, player: u128) {
 pub(super) fn player_logged_out(player: u128) {
     with_server(|server| {
         server.gate.leave(player);
+        server.packs.leave(player);
         server.inbound.remove(&player);
     });
 }
 
 /// Once per server tick, on the tick thread. O(players waiting for admission).
 pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
+    let started = Instant::now();
     let now = now_ms();
     with_server(|server| {
         for action in server.gate.poll(now) {
@@ -187,8 +269,59 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
         if now >= server.next_sample_ms {
             sample_players(game, server, now);
         }
+        for player in server.packs.poll(now) {
+            kick(game, &mut server.outbox, player, proto::KickReason::Pack(proto::PackFailure::TimedOut));
+        }
         send_deliveries(game, server);
+        if let Some(report) = server.tick_meter.record(started.elapsed().as_nanos() as u64) {
+            log(format_args!(
+                "tick us: n={} p50={} p99={} max={}",
+                report.ticks, report.p50_us, report.p99_us, report.max_us
+            ));
+        }
     });
+}
+
+/// The answer to the pack we offered. It is the only pack the mod sends, so the first version of the hook, which has no
+/// pack id, is enough, and it is the one in the catalogue of named hooks.
+pub(super) fn resource_pack_status(game: &mut crate::game::Game<'_>, player: u128, action: i32) {
+    let Some(status) = proto::PackStatus::from_action(action) else { return };
+    let now = now_ms();
+    with_server(|server| {
+        log(format_args!("pack {player:032x}: {status:?}"));
+        if let Some(failure) = server.packs.status(player, status, now) {
+            kick(game, &mut server.outbox, player, proto::KickReason::Pack(failure));
+        }
+    });
+}
+
+fn offer_pack(game: &mut crate::game::Game<'_>, server: &mut Server, player: u128, now: u64) {
+    let Some(offer) = &server.pack else { return };
+    if !server.packs.offer(player, now) {
+        return;
+    }
+    let prompt = horizon_client::text::Text::literal("VexMap: icons for the map / иконки для карты");
+    if !game.native_send_resource_pack(player, PACK_ID, &offer.url, &offer.sha1, Some(&prompt), true) {
+        log(format_args!("pack was not sent to {player:032x}"));
+    }
+}
+
+/// `/map` is on the server because commands are, and the screen is on the client, so the server just passes it on.
+pub(super) fn register_commands(commands: &mut Vec<horizon_client::mod_api::NativeCommand>) {
+    commands.push(horizon_client::mod_api::NativeCommand::new("map"));
+}
+
+pub(super) fn perform_command(
+    game: &mut crate::game::Game<'_>,
+    player: &horizon_client::mod_api::NativeServerPlayer,
+    command: &str,
+    ran: &mut bool,
+) {
+    if command != "map" {
+        return;
+    }
+    *ran = true;
+    with_server(|server| send_to_player(game, &mut server.outbox, player.uuid, &proto::Message::OpenMap));
 }
 
 /// A plugin channel message from a client, on the tick thread. Untrusted input.
@@ -211,8 +344,9 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
                         log(format_args!(
                             "admit {player:032x} mod {mod_version} features {features:#x} region {region_modules:#x}"
                         ));
-                        let welcome = proto::Message::Welcome { protocol: proto::PROTOCOL, features };
+                        let welcome = proto::Message::Welcome { protocol: proto::PROTOCOL, features, player };
                         send_to_player(game, &mut server.outbox, player, &welcome);
+                        offer_pack(game, server, player, now);
                     }
                     proto::HelloOutcome::Reject(reason) => kick(game, &mut server.outbox, player, reason),
                 }
@@ -227,24 +361,62 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
 
 // ---------------------------------------------------------------- client
 
-struct Client {
+pub(super) struct Client {
     handshake: proto::ClientHandshake,
     inbound: proto::Reassembler,
     outbox: proto::Outbox,
-    positions: proto::PositionTables,
+    pub(super) positions: proto::PositionTables,
     reported_markers: usize,
+    pub(super) ui: ui::Ui,
+    /// This player, from `Welcome`.
+    pub(super) me: Option<u128>,
+    pub(super) settings_path: Option<std::path::PathBuf>,
+    /// The last GUI size drawn at. Input hooks are not told it.
+    pub(super) gui_size: [f32; 2],
+    pub(super) open_requested: bool,
+    pub(super) close_requested: bool,
+    pub(super) scratch: Vec<ui::Op>,
 }
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 
-fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
+/// Read once: a missing file means a first run, which is when the map offers to pick a preset.
+fn load_settings() -> (ui::Settings, bool, Option<std::path::PathBuf>) {
+    let path = match crate::game::Game::native_config_dir() {
+        Ok(directory) => directory.join(ui::SETTINGS_FILE),
+        Err(error) => {
+            log(format_args!("settings stay in memory: {error}"));
+            return (ui::Settings::default(), true, None);
+        }
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let settings = ui::Settings::parse(&text);
+            let offer = !settings.autotuned;
+            (settings, offer, Some(path))
+        }
+        Err(_) => (ui::Settings::default(), true, Some(path)),
+    }
+}
+
+pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
     let mut guard = CLIENT.lock().ok()?;
-    let client = guard.get_or_insert_with(|| Client {
-        handshake: proto::ClientHandshake::default(),
-        inbound: proto::Reassembler::new(proto::Limits::default()),
-        outbox: proto::Outbox::default(),
-        positions: proto::PositionTables::default(),
-        reported_markers: 0,
+    let client = guard.get_or_insert_with(|| {
+        let (settings, offer_autotune, settings_path) = load_settings();
+        Client {
+            handshake: proto::ClientHandshake::default(),
+            inbound: proto::Reassembler::new(proto::Limits::default()),
+            outbox: proto::Outbox::default(),
+            positions: proto::PositionTables::default(),
+            reported_markers: 0,
+            ui: ui::Ui::new(settings, offer_autotune),
+            me: None,
+            settings_path,
+            gui_size: [0.0, 0.0],
+            open_requested: false,
+            close_requested: false,
+            scratch: Vec::new(),
+        }
     });
     Some(f(client))
 }
@@ -287,6 +459,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>) {
         if client.handshake.due(now) {
             introduce(game, client);
         }
+        screen::frame(game, client, now);
     });
 }
 
@@ -306,10 +479,12 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
                 client.handshake.due(now);
                 introduce(game, client);
             }
-            proto::Message::Welcome { protocol, features } => {
+            proto::Message::Welcome { protocol, features, player } => {
                 client.handshake.welcomed();
+                client.me = Some(player);
                 log(format_args!("welcomed: protocol {protocol}, features {features:#x}"));
             }
+            proto::Message::OpenMap => screen::open_from_server(game, client),
             proto::Message::Reject { reason } => log(format_args!("rejected: {reason}")),
             proto::Message::Ping(stamp) => {
                 send_to_server(game, &mut client.outbox, &proto::Message::Pong(stamp));

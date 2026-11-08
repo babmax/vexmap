@@ -1,0 +1,12 @@
+[package]
+name = "vexmap-resourcepack"
+description = "Builds the VexMap server resource pack. Every image is drawn by this code, so the pack has no third-party assets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+png = "0.18"
+sha1 = "0.10"
+zip = { version = "6", default-features = false, features = ["deflate"] }

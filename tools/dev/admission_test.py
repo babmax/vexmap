@@ -146,8 +146,9 @@ def join(logs, server="a"):
 def modded(logs, results, sidecar):
     s5.log("modded client")
     admits = {name: len(lines(path, "[vexmap] admit")) for name, path in logs.items()}
-    welcomes = len(lines(CLIENT_LOG, "[vexmap] welcomed"))
     launch(MODDED)
+    # After the launch: each launch starts this log again, so an earlier count would be stale.
+    welcomes = len(lines(CLIENT_LOG, "[vexmap] welcomed"))
     results["modded_join_s"] = join(logs)
     s5.ctl("wait-ready", "60", timeout=90)
     results["modded_admit_a_s"] = wait_for(logs["a"], "[vexmap] admit", admits["a"], 20)

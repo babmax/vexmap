@@ -7,14 +7,14 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-35d0a5" alt="MIT"></a>
   <img src="https://img.shields.io/badge/Rust-1.99-b7410e?logo=rust" alt="Rust 1.99">
   <img src="https://img.shields.io/badge/Minecraft-26.3%20on%20Horizon-4f9dff" alt="Minecraft 26.3 on Horizon">
-  <img src="https://img.shields.io/badge/status-Phase%203-ffb547" alt="Phase 3">
+  <img src="https://img.shields.io/badge/status-Phase%204-ffb547" alt="Phase 4">
 </p>
 
 **VexMap** это функциональный аналог Google Maps и Google Earth для ролевого мира на [Horizon](https://github.com/horizon-rust/horizon), Rust-версии Minecraft Java 26.3.
 Нативный мод для клиента и серверов регионов: круглая карта и 3D-глобус, GPS, страны и границы, места с отзывами, панорамы улиц, вики, дипломатия и войны. Всё внутри игры, без сайта.
 
 > [!NOTE]
-> Проект в разработке, идёт Фаза 3 из 15. Позиции игроков уже доходят до клиентов по каналам стран, но карта их пока не рисует: интерфейс появится в Фазах 4–5.
+> Проект в разработке, идёт Фаза 4 из 15. В игре уже есть окно карты, миникарта и настройки, но карта пока схематичная: суша, сетка и игроки. Тайлы и глобус появятся в Фазе 5.
 
 ## Что уже работает
 
@@ -25,11 +25,13 @@
 | **Локальный API** | REST для RP-модов, только loopback, с лимитами и идемпотентностью |
 | **Позиции** | Снимок 2 Гц, кванты 1/8 блока, ключевые кадры и дельты |
 | **Видимость** | Участник страны видит свою страну, модераторы и выше видят всех. Решает сервер |
+| **Ресурс-пак** | Обязательный пак с оригинальными значками, отказ и сбой загрузки обрабатываются при входе |
+| **Интерфейс** | Клавиша M, команда `/map` и кнопка в меню паузы открывают карту. Миникарта, 6 пресетов, настройки клавиш, русский и английский |
 | **Масштаб** | Большие каналы делятся на клетки и кластеры: 1,9 КБ/с на зрителя в симуляции канала на 5000 игроков |
 | **Изоляция** | Тик не ждёт сеть и базу. Sidecar упал, а игра продолжается |
 | **Релизы** | Подпись minisign и воспроизводимые архивы |
 
-Замеры, стендовые тесты и нерешённые вопросы лежат в [docs/phase-3](docs/phase-3/README.md).
+Замеры, стендовые тесты и нерешённые вопросы лежат в [docs/phase-3](docs/phase-3/README.md) и [docs/phase-4](docs/phase-4/README.md).
 
 ## Архитектура
 
@@ -37,12 +39,12 @@
   <img src="docs/assets/architecture.svg" alt="Клиенты подключаются через Velocity к серверам регионов, а те по локальному TCP к sidecar с базой данных" width="100%">
 </p>
 
-Ключевые решения и их альтернативы записаны как ADR: [аудит Horizon](docs/phase-0/audit.md), [Фаза 0](docs/phase-0/adr.md), [Фаза 2](docs/phase-2/README.md), [Фаза 3](docs/phase-3/README.md).
+Ключевые решения и их альтернативы записаны как ADR: [аудит Horizon](docs/phase-0/audit.md), [Фаза 0](docs/phase-0/adr.md), [Фаза 2](docs/phase-2/README.md), [Фаза 3](docs/phase-3/README.md), [Фаза 4](docs/phase-4/README.md).
 
 ## Фазы
 
 <p align="center">
-  <img src="docs/assets/roadmap.svg" alt="Фаза 0 готова, у Фаз 1 и 2 готова основа, идёт Фаза 3, Фазы с 4 по 15 впереди" width="100%">
+  <img src="docs/assets/roadmap.svg" alt="Фаза 0 готова, у Фаз 1, 2 и 3 готова основа, идёт Фаза 4, Фазы с 5 по 15 впереди" width="100%">
 </p>
 
 ## Устройство кода
@@ -56,10 +58,13 @@ mods/vexmap/                 бандл horizon-mixins: один мод на к�
   compatibility.json         пин Horizon и horizon-mixins
   mixins/vexmap/proto.rs     протокол, только std, он же крейт vexmap-proto
   mixins/vexmap/runtime.rs   связь с API Horizon
+  mixins/vexmap/ui.rs        логика интерфейса, только std, она же крейт vexmap-ui
+  mixins/vexmap/map_screen.rs окно карты и миникарта через хелперы GUI
 crates/vexmap-proto/         Cargo-обёртка над proto.rs для тестов и sidecar
 crates/vexmap-core/          игроки, роли, страны, выключатели модулей, журнал изменений
 crates/vexmap-sidecar/       отдельный процесс: REST API, приём игроков, раздача позиций
 crates/vexmap-link/          Cargo-обёртка над sidecar_link.rs: связь сервера региона с sidecar
+crates/vexmap-resourcepack/  сборка ресурс-пака, все изображения рисуются кодом
 tools/dev/stage.py           применить мод к Horizon и запустить cargo (Windows и Linux)
 tools/release/sign.py        архивы релиза, SHA256SUMS, подпись minisign
 ```
