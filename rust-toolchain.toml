@@ -1,0 +1,5 @@
+# The launcher builds players' clients with 1.99.1 (spike S0), so CI and the dev bench use the same.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,28 @@
+# Daily: the mod against Horizon's current main. Red here means upstream moved: a hook changed or a temporary mixin
+# target is gone (docs/phase-1/horizon-prs.md). The pin is only bumped after this is green.
+name: upstream
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Horizon build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+      - name: Repin to Horizon main
+        run: |
+          head=$(git ls-remote https://github.com/horizon-rust/horizon refs/heads/main | cut -f1)
+          echo "Horizon main: $head"
+          sed -i -E "s/\"horizon_revision\": \"[0-9a-f]+\"/\"horizon_revision\": \"$head\"/" mods/vexmap/compatibility.json
+          sed -i -E "s/^horizon_revision = \"[0-9a-f]+\"/horizon_revision = \"$head\"/" mods/vexmap/mixins/vexmap/horizon-mixin.toml
+      - name: horizon-mixins main
+        run: git clone https://github.com/horizon-rust/horizon-mixins .deps/horizon-mixins
+      - run: python3 tools/dev/stage.py check mods/vexmap

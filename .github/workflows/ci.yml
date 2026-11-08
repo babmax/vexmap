@@ -1,0 +1,46 @@
+# Every push and PR: protocol tests on the three player OSes, and the mod checked inside the pinned Horizon on Linux.
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  proto:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --all --check
+      - run: rustfmt --edition 2024 --check mods/vexmap/mixins/vexmap/runtime.rs mods/vexmap/mixins/vexmap/hooks/*.rs
+        shell: bash
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Horizon build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+      - name: horizon-mixins at the pinned revision
+        run: |
+          rev=$(python3 -c 'import json; print(json.load(open("mods/vexmap/compatibility.json"))["horizon_mixins_revision"])')
+          git clone https://github.com/horizon-rust/horizon-mixins .deps/horizon-mixins
+          git -C .deps/horizon-mixins checkout "$rev"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .deps/target
+            .deps/horizon-mixins/target
+          key: native-${{ hashFiles('mods/vexmap/compatibility.json') }}
+      - run: python3 tools/dev/stage.py check mods/vexmap

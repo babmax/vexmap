@@ -1,0 +1,87 @@
+# Throwaway spike S2: background cube panorama capture. Press N in game to toggle. Not for release.
+[mod]
+id = "vexmap_s2"
+version = "0.0.1"
+priority = 100
+
+[compatibility]
+horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
+
+[[module]]
+id = "capture"
+file = "crates/horizon-client-render/src/gfx.rs"
+name = "vexmap_s2"
+source = "capture.rs"
+visibility = "pub"
+
+# Not a hook point: the renderer's private function. A real mod needs a PR for this (see spikes.md).
+[[injection]]
+id = "size"
+kind = "HEAD"
+target = "horizon_client_render::gfx::Renderer::screenshot_size"
+helper = "size.rs"
+cancellable = true
+bindings = [{ name = "renderer", ty = "&crate::gfx::Renderer", value = "&*self" }]
+
+[[injection]]
+id = "draw"
+hook = "hand_drawn"
+hook_version = 1
+kind = "HEAD"
+helper = "draw.rs"
+bindings = [{ name = "hand", ty = "&mut crate::gfx::native_render::HandDrawn<'_>", value = "&mut *hand" }]
+
+[[injection]]
+id = "key"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "key.rs"
+bindings = [
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "frame"
+hook = "frame"
+hook_version = 1
+kind = "HEAD"
+helper = "frame.rs"
+bindings = [{ name = "game", ty = "&crate::game::Game<'_>", value = "&*self" }]
+
+[[injection]]
+id = "pose"
+hook = "camera_pose"
+hook_version = 1
+kind = "HEAD"
+helper = "pose.rs"
+bindings = [
+  { name = "position", ty = "&mut [f64; 3]", value = "&mut *position" },
+  { name = "yaw", ty = "&mut f32", value = "&mut *yaw" },
+  { name = "pitch", ty = "&mut f32", value = "&mut *pitch" },
+]
+
+[[injection]]
+id = "fov"
+hook = "compute_fov"
+hook_version = 1
+kind = "HEAD"
+helper = "fov.rs"
+bindings = [{ name = "degrees", ty = "&mut f32", value = "&mut *degrees" }]
+
+[[injection]]
+id = "hand"
+hook = "render_hand"
+hook_version = 1
+kind = "HEAD"
+helper = "hand.rs"
+bindings = [{ name = "canceled", ty = "&mut bool", value = "&mut *canceled" }]
+
+[[injection]]
+id = "name-tag"
+hook = "render_name_tag"
+hook_version = 1
+kind = "HEAD"
+helper = "name_tag.rs"
+bindings = [{ name = "visible", ty = "&mut bool", value = "&mut *visible" }]

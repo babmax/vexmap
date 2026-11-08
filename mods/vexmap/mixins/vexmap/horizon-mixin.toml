@@ -1,0 +1,88 @@
+# VexMap: one bundle for both the player's client and the region server (`horizon-client --dedicated`).
+[mod]
+id = "vexmap"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
+
+# Protocol first: runtime refers to it as `super::vexmap_proto`. Also the `vexmap-proto` crate.
+[[module]]
+id = "proto"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_proto"
+source = "proto.rs"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap"
+source = "runtime.rs"
+
+# ---- server
+
+[[injection]]
+id = "server-tick"
+hook = "server_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/server_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "&horizon_client::mod_api::ServerTickPhase", value = "&phase" },
+]
+
+[[injection]]
+id = "logged-in"
+hook = "player_logged_in"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/logged_in.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+]
+
+[[injection]]
+id = "logged-out"
+hook = "player_logged_out"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/logged_out.rs"
+bindings = [{ name = "player", ty = "u128", value = "player" }]
+
+# TEMPORARY(horizon#10461): merged upstream as `custom_payload_from_client`, no API number yet at our pin.
+# Switch to `hook = "custom_payload_from_client"` once the pin carries the stamped hook. See docs/phase-1/horizon-prs.md.
+[[injection]]
+id = "payload-from-client"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_custom_payload_from_client"
+helper = "hooks/payload_from_client.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+# ---- client
+
+[[injection]]
+id = "client-packet"
+hook = "client_packet"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/client_packet.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "packet", ty = "&horizon_client::mod_api::ClientboundPlayPacket", value = "packet" },
+]
+
+[[injection]]
+id = "frame"
+hook = "frame"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/frame.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]

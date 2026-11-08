@@ -1,0 +1,5 @@
+# Horizon checkouts, staged sources and build output: never commit game files or exported sources.
+.deps/
+target/
+.local/
+dist/

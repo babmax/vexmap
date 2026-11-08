@@ -1,0 +1,21 @@
+# Throwaway spike: proves the bundle -> mixins -> cargo pipeline works on this machine. Not for release.
+[mod]
+id = "vexmap_s0"
+version = "0.0.1"
+priority = 100
+
+[compatibility]
+horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_s0"
+source = "runtime.rs"
+
+[[injection]]
+id = "before-break"
+kind = "HEAD"
+target = "horizon_client::game::Game<'_>::break_block"
+helper = "break.rs"
+bindings = [{ name = "pos", ty = "[i32;3]", value = "pos" }]

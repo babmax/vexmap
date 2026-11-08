@@ -1,0 +1,65 @@
+# Throwaway spike S1: a full-screen globe in a mod screen, drawn through `hand_drawn`. Press M in game. Not for release.
+[mod]
+id = "vexmap_s1"
+version = "0.0.1"
+priority = 100
+
+[compatibility]
+horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
+
+[[module]]
+id = "globe"
+file = "crates/horizon-client-render/src/gfx.rs"
+name = "vexmap_s1"
+source = "globe.rs"
+visibility = "pub"
+
+[[injection]]
+id = "draw"
+hook = "hand_drawn"
+hook_version = 1
+kind = "HEAD"
+helper = "draw.rs"
+bindings = [{ name = "hand", ty = "&mut crate::gfx::native_render::HandDrawn<'_>", value = "&mut *hand" }]
+
+[[injection]]
+id = "key"
+hook = "key"
+hook_version = 1
+kind = "HEAD"
+helper = "key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+[[injection]]
+id = "frame"
+hook = "frame"
+hook_version = 1
+kind = "HEAD"
+helper = "frame.rs"
+bindings = [{ name = "game", ty = "&crate::game::Game<'_>", value = "&*self" }]
+
+[[injection]]
+id = "drag"
+hook = "screen_mouse_dragged_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "drag.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "delta", ty = "[f32; 2]", value = "delta" },
+]
+
+[[injection]]
+id = "scroll"
+hook = "screen_mouse_scrolled_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "scroll.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "scroll", ty = "[f64; 2]", value = "scroll" },
+]

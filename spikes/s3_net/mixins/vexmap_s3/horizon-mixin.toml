@@ -1,0 +1,78 @@
+# Throwaway spike S3/S4: the cost of `horizon:mod_net` on a dedicated server. Not for release.
+[mod]
+id = "vexmap_s3"
+version = "0.0.1"
+priority = 100
+
+[compatibility]
+horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_s3"
+source = "runtime.rs"
+
+[[injection]]
+id = "tick"
+hook = "server_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "&horizon_client::mod_api::ServerTickPhase", value = "&phase" },
+]
+
+[[injection]]
+id = "from-client"
+hook = "net_from_client"
+hook_version = 1
+kind = "HEAD"
+helper = "from_client.rs"
+bindings = [
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "from-server"
+hook = "net_from_server"
+hook_version = 1
+kind = "HEAD"
+helper = "from_server.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "client-packet"
+hook = "client_packet"
+hook_version = 1
+kind = "HEAD"
+helper = "client_packet.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "packet", ty = "&horizon_client::mod_api::ClientboundPlayPacket", value = "packet" },
+]
+
+[[injection]]
+id = "frame"
+hook = "frame"
+hook_version = 1
+kind = "HEAD"
+helper = "frame.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+# Not in the hook catalog at this commit, so a raw target: see ADR-002's exception for spikes.
+[[injection]]
+id = "payload-from-client"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_custom_payload_from_client"
+helper = "payload_from_client.rs"
+bindings = [
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]

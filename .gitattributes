@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+# A spike file that contains NUL bytes: kept exactly as it was measured.
+spikes/s3_net/mixins/vexmap_s3/runtime.rs -text
