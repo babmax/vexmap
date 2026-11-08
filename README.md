@@ -3,7 +3,7 @@
 Карта мира в духе Google Maps и Google Earth внутри Minecraft 26.3 на [Horizon](https://github.com/horizon-rust/horizon).
 Нативный мод для клиента и для серверов регионов. Лицензия MIT.
 
-Состояние: Фаза 3, начат realtime-слой. Ядро данных и локальный API уже есть. План и решения лежат в [docs/](docs/).
+Состояние: Фаза 3, realtime-слой. Позиции игроков доходят от серверов регионов до sidecar, раздачи игрокам пока нет. Ядро данных и локальный API уже есть. План и решения лежат в [docs/](docs/).
 
 ## Устройство
 
@@ -14,8 +14,8 @@ mods/vexmap/                 бандл horizon-mixins: один мод на к�
   mixins/vexmap/runtime.rs   связь с API Horizon
 crates/vexmap-proto/         Cargo-обёртка над proto.rs для тестов и sidecar
 crates/vexmap-core/          игроки, роли, выключатели модулей, журнал изменений (SQLite и PostgreSQL)
-crates/vexmap-sidecar/       отдельный процесс: ядро данных за локальным REST API
-crates/vexmap-link/          Cargo-обёртка над sidecar_link.rs: связь сервера региона с sidecar
+crates/vexmap-sidecar/       отдельный процесс: ядро данных за локальным REST API, приём потока игроков
+crates/vexmap-link/          Cargo-обёртка над sidecar_link.rs: связь сервера региона с sidecar и формат потока
 tools/dev/stage.py           применить мод к Horizon и запустить cargo (Windows и Linux)
 tools/release/sign.py        архивы релиза, SHA256SUMS, подпись minisign
 ```

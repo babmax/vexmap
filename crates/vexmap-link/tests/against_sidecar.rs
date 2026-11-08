@@ -15,7 +15,7 @@ async fn serve() -> (Core, SocketAddr, TempDir) {
     let core = Core::connect(&url).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(core.clone(), RateLimit { per_second: 1000, burst: 1000 });
+    let app = router(core.clone(), RateLimit { per_second: 1000, burst: 1000 }, Default::default());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (core, addr, dir)
 }

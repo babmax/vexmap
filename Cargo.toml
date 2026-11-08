@@ -10,12 +10,13 @@ license = "MIT"
 
 [workspace.dependencies]
 vexmap-core = { path = "crates/vexmap-core" }
+vexmap-link = { path = "crates/vexmap-link" }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.9", default-features = false, features = ["any", "migrate", "macros", "postgres", "runtime-tokio", "sqlite-bundled"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde"] }

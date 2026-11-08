@@ -79,11 +79,12 @@ PostgreSQL сейчас совпадают дословно и должны со
 | `GET /v1/features?region=` | | Включённые модули и маска для `Hello.features` |
 | `PUT /v1/features/{module}` | `enabled`, `region?`, `actor?` | Выключатель. Флаг региона важнее глобального, не заданный модуль выключен |
 | `GET /v1/journal?after=&limit=` | | Записи по порядку, до 1000 за раз |
+| `GET /v1/positions?region=` | | Последние позиции игроков по регионам, см. [Фазу 3](../phase-3/README.md) |
 
 Правила ролей: владелец и локальный мод меняют любые роли, админ только ниже админа, остальные никакие. Последнего владельца снять
 нельзя. Категории бывают только у модератора и обязательны для него. Выключатели меняют админ, владелец и локальный мод.
 
-Настройки sidecar: `VEXMAP_DATABASE_URL`, `VEXMAP_API_ADDR`, `VEXMAP_OWNER_UUID`, `VEXMAP_API_RATE`, `VEXMAP_API_BURST`, `RUST_LOG`.
+Настройки sidecar: `VEXMAP_DATABASE_URL`, `VEXMAP_API_ADDR`, `VEXMAP_FEED_ADDR`, `VEXMAP_OWNER_UUID`, `VEXMAP_API_RATE`, `VEXMAP_API_BURST`, `RUST_LOG`.
 Путь SQLite пишется без `//`: `sqlite:C:/data/vexmap.db?mode=rwc`, иначе разбор адреса потеряет букву диска.
 
 ## 4. Тесты

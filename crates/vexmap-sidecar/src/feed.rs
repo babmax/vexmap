@@ -1,0 +1,255 @@
+//! Receives each region server's player list over a local socket: who is online and, with `realtime` on, where.
+//!
+//! Positions live only in memory: they are a stream, not map edits (Phase 2). A player's name is the one thing that
+//! reaches the database, once per connection.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use uuid::Uuid;
+use vexmap_core::{Actor, ClientName, CommandContext, Core, RegionId, RequestId};
+use vexmap_link::{FeedBatch, FeedPlayer, MAX_FEED_MESSAGE, decode_batch, decode_hello};
+
+const MAX_CONNECTIONS: usize = 256;
+/// A server sends every 500 ms even when empty, so this much silence means it has hung.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Batches closer together than this are dropped: the rate limit of this channel, four times the real rate.
+const MIN_BATCH_GAP: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PlayerPosition {
+    pub uuid: Uuid,
+    pub name: String,
+    pub dimension: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RegionPositions {
+    pub region: String,
+    /// Gaps mean the server produced batches that were replaced before they could be sent.
+    pub seq: u64,
+    pub age_ms: u64,
+    pub players: Vec<PlayerPosition>,
+}
+
+struct Region {
+    connection: u64,
+    seq: u64,
+    received: Instant,
+    players: Vec<PlayerPosition>,
+}
+
+/// The newest list of each connected region. A region disappears when its server does.
+#[derive(Default)]
+pub struct PositionStore {
+    regions: RwLock<HashMap<String, Region>>,
+}
+
+impl PositionStore {
+    /// `connection` now speaks for `region`, replacing an earlier connection after a restart.
+    fn claim(&self, region: &str, connection: u64) {
+        if let Ok(mut regions) = self.regions.write() {
+            let entry = Region { connection, seq: 0, received: Instant::now(), players: Vec::new() };
+            regions.insert(region.to_owned(), entry);
+        }
+    }
+
+    /// `false` when a newer connection has taken the region over.
+    fn update(&self, region: &str, connection: u64, seq: u64, players: Vec<PlayerPosition>) -> bool {
+        let Ok(mut regions) = self.regions.write() else { return false };
+        match regions.get_mut(region) {
+            Some(entry) if entry.connection == connection => {
+                entry.seq = seq;
+                entry.received = Instant::now();
+                entry.players = players;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release(&self, region: &str, connection: u64) {
+        if let Ok(mut regions) = self.regions.write()
+            && regions.get(region).is_some_and(|entry| entry.connection == connection)
+        {
+            regions.remove(region);
+        }
+    }
+
+    /// One region, or all of them, in name order. A player crossing between regions can show in both for one batch.
+    pub fn snapshot(&self, only: Option<&RegionId>) -> Vec<RegionPositions> {
+        let Ok(regions) = self.regions.read() else { return Vec::new() };
+        let mut out: Vec<RegionPositions> = regions
+            .iter()
+            .filter(|(name, _)| only.is_none_or(|region| region.as_str() == name.as_str()))
+            .map(|(name, entry)| RegionPositions {
+                region: name.clone(),
+                seq: entry.seq,
+                age_ms: entry.received.elapsed().as_millis() as u64,
+                players: entry.players.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.region.cmp(&b.region));
+        out
+    }
+}
+
+fn position_of(player: &FeedPlayer) -> Option<PlayerPosition> {
+    let place = player.position.as_ref()?;
+    Some(PlayerPosition {
+        uuid: Uuid::from_u128(player.uuid),
+        name: player.name.clone(),
+        dimension: place.dimension.clone(),
+        x: f64::from(place.x) / 8.0,
+        y: f64::from(place.y) / 8.0,
+        z: f64::from(place.z) / 8.0,
+        yaw: f32::from(place.yaw) * 360.0 / 256.0,
+    })
+}
+
+/// Accepts region servers until the listener fails. Connection ids start from the clock, so the request ids built from
+/// them are not replays of an earlier run of the sidecar.
+pub async fn serve(listener: TcpListener, core: Core, store: Arc<PositionStore>) {
+    let start = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let connections = AtomicU64::new(start);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!("feed accept: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("feed: too many connections");
+            continue;
+        };
+        let connection = connections.fetch_add(1, Ordering::Relaxed);
+        let (core, store) = (core.clone(), store.clone());
+        tokio::spawn(async move {
+            let _slot = slot;
+            handle(stream, connection, core, store).await;
+        });
+    }
+}
+
+async fn read_message(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<(), String> {
+    let length = timeout(READ_TIMEOUT, stream.read_u32_le())
+        .await
+        .map_err(|_| "silent for too long".to_owned())?
+        .map_err(|error| error.to_string())? as usize;
+    if length > MAX_FEED_MESSAGE {
+        return Err(format!("message of {length} bytes"));
+    }
+    buffer.resize(length, 0);
+    timeout(READ_TIMEOUT, stream.read_exact(buffer))
+        .await
+        .map_err(|_| "silent for too long".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn handle(mut stream: TcpStream, connection: u64, core: Core, store: Arc<PositionStore>) {
+    let mut buffer = Vec::new();
+    let region = match read_message(&mut stream, &mut buffer).await.and_then(|()| hello_region(&buffer)) {
+        Ok(region) => region,
+        Err(error) => {
+            tracing::warn!("feed: refused a connection: {error}");
+            return;
+        }
+    };
+    store.claim(region.as_str(), connection);
+    tracing::info!(region = region.as_str(), "feed: region connected");
+    let reason = run_connection(&mut stream, &region, connection, &core, &store, &mut buffer).await;
+    store.release(region.as_str(), connection);
+    tracing::info!(region = region.as_str(), "feed: region gone: {reason}");
+}
+
+fn hello_region(body: &[u8]) -> Result<RegionId, String> {
+    let region = decode_hello(body).map_err(|error| format!("{error:?}"))?;
+    RegionId::new(&region).map_err(|error| error.to_string())
+}
+
+/// Returns why the connection ended.
+async fn run_connection(
+    stream: &mut TcpStream,
+    region: &RegionId,
+    connection: u64,
+    core: &Core,
+    store: &PositionStore,
+    buffer: &mut Vec<u8>,
+) -> String {
+    let mut recorded = HashMap::new();
+    let mut last: Option<Instant> = None;
+    loop {
+        if let Err(error) = read_message(stream, buffer).await {
+            return error;
+        }
+        let batch = match decode_batch(buffer) {
+            Ok(batch) => batch,
+            Err(error) => return format!("bad batch: {error:?}"),
+        };
+        let now = Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < MIN_BATCH_GAP) {
+            continue;
+        }
+        last = Some(now);
+        let players = batch.players.iter().filter_map(position_of).collect();
+        if !store.update(region.as_str(), connection, batch.seq, players) {
+            return "replaced by a newer connection".to_owned();
+        }
+        recorded = record_new_players(core, region, connection, &batch, recorded).await;
+    }
+}
+
+/// Records whoever this connection has not recorded yet. A failure is retried with the next batch.
+async fn record_new_players(
+    core: &Core,
+    region: &RegionId,
+    connection: u64,
+    batch: &FeedBatch,
+    mut known: HashMap<u128, String>,
+) -> HashMap<u128, String> {
+    let mut current = HashMap::with_capacity(batch.players.len());
+    for player in &batch.players {
+        if known.get(&player.uuid) == Some(&player.name) {
+            if let Some(name) = known.remove(&player.uuid) {
+                current.insert(player.uuid, name);
+            }
+            continue;
+        }
+        match record_player(core, region, connection, player).await {
+            Ok(()) => {
+                current.insert(player.uuid, player.name.clone());
+            }
+            Err(error) => tracing::warn!(player = %Uuid::from_u128(player.uuid), "feed: not recorded: {error}"),
+        }
+    }
+    current
+}
+
+async fn record_player(core: &Core, region: &RegionId, connection: u64, player: &FeedPlayer) -> Result<(), String> {
+    let failed = |error: vexmap_core::CoreError| error.to_string();
+    // The name is part of the key: a rename seen on one connection is a new change, not a replay.
+    let key = format!("{:010x}-{}-{}", connection & 0xff_ffff_ffff, Uuid::from_u128(player.uuid).simple(), player.name);
+    let ctx = CommandContext {
+        actor: Actor::System(ClientName::new("region-feed").map_err(failed)?),
+        region: region.clone(),
+        request_id: RequestId::new(&key).map_err(failed)?,
+    };
+    core.record_player(&ctx, Uuid::from_u128(player.uuid), &player.name).await.map_err(failed)?;
+    Ok(())
+}

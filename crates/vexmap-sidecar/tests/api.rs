@@ -44,7 +44,7 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
 #[tokio::test]
 async fn a_player_is_recorded_promoted_and_journaled() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let id = Uuid::new_v4();
 
     let uri = format!("/v1/players/{id}");
@@ -69,7 +69,7 @@ async fn a_player_is_recorded_promoted_and_journaled() {
 #[tokio::test]
 async fn a_repeated_key_is_a_replay() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let uri = format!("/v1/players/{}", Uuid::new_v4());
     let body = json!({"name": "Alex"});
     send(&app, request("PUT", &uri, Some("same"), Some(body.clone()))).await;
@@ -84,7 +84,7 @@ async fn the_actors_role_comes_from_the_database() {
     bootstrap_owner(&core, owner).await.unwrap();
     bootstrap_owner(&core, owner).await.unwrap();
     assert_eq!(core.journal_head().await.unwrap(), 1, "bootstrap is idempotent");
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
 
     let nobody = Uuid::new_v4();
     let denied = json!({"enabled": true, "actor": nobody});
@@ -105,7 +105,7 @@ async fn the_actors_role_comes_from_the_database() {
 #[tokio::test]
 async fn bad_requests_are_refused_with_a_reason() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let id = Uuid::new_v4();
     let uri = format!("/v1/players/{id}");
 
@@ -131,7 +131,7 @@ async fn bad_requests_are_refused_with_a_reason() {
 #[tokio::test]
 async fn a_client_must_name_itself() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let anonymous = Request::builder().uri("/v1/journal").header("host", "localhost").body(Body::empty()).unwrap();
     assert_eq!(send(&app, anonymous).await.0, StatusCode::BAD_REQUEST);
 }
@@ -139,7 +139,7 @@ async fn a_client_must_name_itself() {
 #[tokio::test]
 async fn a_foreign_host_is_refused_even_for_health() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let rebound = Request::builder().uri("/healthz").header("host", "evil.example").body(Body::empty()).unwrap();
     assert_eq!(send(&app, rebound).await.0, StatusCode::FORBIDDEN);
 }
@@ -147,15 +147,25 @@ async fn a_foreign_host_is_refused_even_for_health() {
 #[tokio::test]
 async fn health_needs_no_client_name_and_shows_the_head() {
     let (core, _dir) = core().await;
-    let app = router(core, OPEN);
+    let app = router(core, OPEN, Default::default());
     let health = Request::builder().uri("/healthz").header("host", "localhost").body(Body::empty()).unwrap();
     assert_eq!(send(&app, health).await, (StatusCode::OK, json!({"status": "ok", "journal_head": 0})));
 }
 
 #[tokio::test]
+async fn positions_start_empty_and_check_the_region() {
+    let (core, _dir) = core().await;
+    let app = router(core, OPEN, Default::default());
+    let (status, body) = send(&app, request("GET", "/v1/positions?region=eu-1", None, None)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({"regions": []})));
+    let (status, _) = send(&app, request("GET", "/v1/positions?region=BAD%20NAME", None, None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn a_flooding_client_gets_429() {
     let (core, _dir) = core().await;
-    let app = router(core, RateLimit { per_second: 1, burst: 2 });
+    let app = router(core, RateLimit { per_second: 1, burst: 2 }, Default::default());
     for _ in 0..2 {
         assert_eq!(send(&app, request("GET", "/v1/journal", None, None)).await.0, StatusCode::OK);
     }

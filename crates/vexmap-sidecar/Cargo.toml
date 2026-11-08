@@ -15,6 +15,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 vexmap-core.workspace = true
+vexmap-link.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true

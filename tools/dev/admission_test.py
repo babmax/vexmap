@@ -6,6 +6,8 @@
 2. The launcher's stock Horizon client (same version, no vexmap mod) joins and must be kicked with our message.
 3. Phase 3: each server takes its region's modules from the sidecar (tiles on in a, off in b), and when the sidecar dies
    a server keeps its last modules and still admits players.
+4. Phase 3: an admitted player reaches the sidecar: recorded in the database, located in the region they are on and
+   gone from the region they left.
 
 Local only, everything under .deps/run/admission. Reuses the S5 harness (two servers, Velocity, horizon-ctl).
 
@@ -32,6 +34,8 @@ STOCK = s5.VERSION / "horizon-client.exe"
 CLIENT_LOG = Path(os.environ["TEMP"]) / "horizon-control.log"
 SIDECAR = s5.ROOT / "target" / "debug" / "vexmap-sidecar.exe"
 SIDECAR_ADDR = "127.0.0.1:25620"
+FEED_ADDR = "127.0.0.1:25621"
+REALTIME_BIT = 1 << 0
 TILES_BIT = 1 << 1
 
 
@@ -74,7 +78,7 @@ def start_sidecar():
     database = s5.RUN / "sidecar.db"
     for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
         path.unlink(missing_ok=True)
-    env = dict(os.environ, VEXMAP_API_ADDR=SIDECAR_ADDR,
+    env = dict(os.environ, VEXMAP_API_ADDR=SIDECAR_ADDR, VEXMAP_FEED_ADDR=FEED_ADDR,
                VEXMAP_DATABASE_URL=f"sqlite:{database.as_posix()}?mode=rwc")
     process = subprocess.Popen([str(SIDECAR)], env=env, stdout=(s5.RUN / "sidecar.log").open("w", encoding="utf-8"),
                                stderr=subprocess.STDOUT)
@@ -89,7 +93,30 @@ def start_sidecar():
             time.sleep(0.2)
     api("PUT", "/v1/features/tiles", "bench-1", {"enabled": True})
     api("PUT", "/v1/features/tiles", "bench-2", {"enabled": False, "region": "b"})
+    api("PUT", "/v1/features/realtime", "bench-3", {"enabled": True})
     return process
+
+
+def positions():
+    """Region name to its list of players, for every region connected to the sidecar."""
+    return {r["region"]: r["players"] for r in api("GET", "/v1/positions")["regions"]}
+
+
+def check_feed(results):
+    """After the last switch the player is on b. Two sample intervals and a poll are enough to settle."""
+    deadline = time.monotonic() + 10
+    while True:
+        seen = positions()
+        if len(seen.get("b", [])) == 1 and not seen.get("a") or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    results["feed_regions"] = {name: len(players) for name, players in seen.items()}
+    on_b = seen.get("b", [])
+    if len(on_b) != 1:
+        return
+    player = on_b[0]
+    results["feed_position"] = {key: player[key] for key in ("dimension", "x", "y", "z", "yaw")}
+    results["feed_recorded_name"] = api("GET", f"/v1/players/{player['uuid']}")["name"] == player["name"]
 
 
 def launch(game):
@@ -126,6 +153,7 @@ def modded(logs, results, sidecar):
     results["modded_switches"] = moves
     results["region_a_mask"] = admitted_region_mask(logs["a"])
     results["region_b_mask"] = admitted_region_mask(logs["b"])
+    check_feed(results)
 
     sidecar.kill()
     sidecar.wait(timeout=10)
@@ -165,7 +193,7 @@ def main():
     sidecar = start_sidecar()
     try:
         for name, port in s5.BACKENDS.items():
-            region_env = {"VEXMAP_REGION": name, "VEXMAP_API_ADDR": SIDECAR_ADDR}
+            region_env = {"VEXMAP_REGION": name, "VEXMAP_API_ADDR": SIDECAR_ADDR, "VEXMAP_FEED_ADDR": FEED_ADDR}
             process, logfile = s5.start_backend(name, port, secret, None, extra_env=region_env)
             processes.append(process)
             logs[name] = logfile
@@ -194,10 +222,13 @@ def main():
     passed = bool(results.get("modded_admit_a_s") is not None and results.get("modded_welcomed_client")
                   and all(m["admit_after_switch_s"] is not None for m in results.get("modded_switches", []))
                   and results.get("modded_kicks") == 0 and results.get("stock_kick_after_join_s") is not None
-                  and results.get("region_a_mask") == TILES_BIT and results.get("region_b_mask") == 0
+                  and results.get("region_a_mask") == REALTIME_BIT | TILES_BIT
+                  and results.get("region_b_mask") == REALTIME_BIT
                   and results.get("admit_without_sidecar_s") is not None
-                  and results.get("region_a_mask_without_sidecar") == TILES_BIT
-                  and results.get("sidecar_loss_logged"))
+                  and results.get("region_a_mask_without_sidecar") == REALTIME_BIT | TILES_BIT
+                  and results.get("sidecar_loss_logged")
+                  and results.get("feed_regions") == {"a": 0, "b": 1}
+                  and results.get("feed_recorded_name") is True)
     results["passed"] = passed
     (s5.RUN / "results.json").write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(results, indent=1, ensure_ascii=False))

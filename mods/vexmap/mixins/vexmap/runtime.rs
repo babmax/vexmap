@@ -17,6 +17,10 @@ pub(super) const FEATURES: u64 = 0;
 
 /// Modules switched on for this region, kept current by the sidecar link. All off until the sidecar first answers.
 static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
+/// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
+const REALTIME: u64 = 1;
+/// The newest list of this server's players, on its way to the sidecar.
+static PLAYER_FEED: link::Mailbox = link::Mailbox::new();
 
 const KICK_NO_MOD: &str = "VexMap: this server needs the VexMap client mod.\n\
 Этому серверу нужен клиентский мод VexMap.";
@@ -36,6 +40,8 @@ struct Server {
     gate: proto::AdmissionGate,
     inbound: HashMap<u128, proto::Reassembler>,
     outbox: proto::Outbox,
+    next_sample_ms: u64,
+    samples: Vec<link::PlayerSample>,
 }
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
@@ -48,15 +54,18 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             gate: proto::AdmissionGate::new(SERVER_FEATURES.load(Ordering::Relaxed)),
             inbound: HashMap::new(),
             outbox: proto::Outbox::default(),
+            next_sample_ms: 0,
+            samples: Vec::new(),
         }
     });
     Some(f(server))
 }
 
-/// Runs once, on the first server hook, so a player's client never starts the thread. A failure leaves all modules off
+/// Runs once, on the first server hook, so a player's client never starts these threads. A failure leaves the map off
 /// and admission working.
 fn start_sidecar_link() {
     let addr = std::env::var("VEXMAP_API_ADDR").ok();
+    let feed_addr = std::env::var("VEXMAP_FEED_ADDR").ok();
     let region = std::env::var("VEXMAP_REGION").ok();
     match link::Config::parse(addr.as_deref(), region.as_deref()) {
         Ok(config) => {
@@ -66,6 +75,34 @@ fn start_sidecar_link() {
         }
         Err(error) => log(format_args!("sidecar link is off: {error}")),
     }
+    match link::FeedConfig::parse(feed_addr.as_deref(), region.as_deref()) {
+        Ok(config) => {
+            if let Err(error) = link::start_feed(config, &PLAYER_FEED) {
+                log(format_args!("player feed did not start: {error}"));
+            }
+        }
+        Err(error) => log(format_args!("player feed is off: {error}")),
+    }
+}
+
+/// At 2 Hz, on the tick thread. Only admitted players count, so a client about to be kicked never reaches the database.
+/// With `realtime` off the sidecar still learns who is online, because roles need the player's record.
+fn sample_players(game: &crate::game::Game<'_>, server: &mut Server, now: u64) {
+    server.next_sample_ms = now + link::SAMPLE_EVERY_MS;
+    server.samples.clear();
+    for player in game.native_server_players() {
+        if server.gate.features(player.uuid).is_some() {
+            server.samples.push(link::PlayerSample {
+                uuid: player.uuid,
+                name: player.name,
+                dimension: player.dimension,
+                position: player.position,
+                yaw: player.yaw,
+            });
+        }
+    }
+    let realtime = SERVER_FEATURES.load(Ordering::Relaxed) & REALTIME != 0;
+    PLAYER_FEED.publish(&mut server.samples, realtime);
 }
 
 fn send_to_player(
@@ -127,6 +164,9 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
                 }
                 proto::Action::Kick(player, reason) => kick(game, &mut server.outbox, player, reason),
             }
+        }
+        if now >= server.next_sample_ms {
+            sample_players(game, server, now);
         }
     });
 }

@@ -430,8 +430,7 @@ impl AdmissionGate {
         self.players.remove(&player);
     }
 
-    // For the map modules of later phases.
-    #[allow(dead_code)]
+    /// `Some` once the player is admitted.
     pub fn features(&self, player: u128) -> Option<u64> {
         match self.players.get(&player) {
             Some(Admission::Admitted { features }) => Some(*features),

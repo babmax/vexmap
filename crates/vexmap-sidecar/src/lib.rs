@@ -17,6 +17,10 @@ use serde_json::json;
 use uuid::Uuid;
 use vexmap_core::{Actor, Category, ClientName, CommandContext, Core, CoreError, Module, RegionId, RequestId, Role};
 
+pub mod feed;
+
+pub use feed::PositionStore;
+
 const MAX_BODY: usize = 64 * 1024;
 const MAX_CLIENTS: usize = 256;
 
@@ -24,6 +28,7 @@ const MAX_CLIENTS: usize = 256;
 pub struct Config {
     pub database_url: String,
     pub addr: SocketAddr,
+    pub feed_addr: SocketAddr,
     pub owner: Option<Uuid>,
     pub rate: RateLimit,
 }
@@ -38,11 +43,16 @@ impl Config {
     /// Reads the settings through `var`. A non-loopback address is an error: this API has no authentication.
     pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let database_url = var("VEXMAP_DATABASE_URL").unwrap_or_else(|| "sqlite:vexmap-dev.db?mode=rwc".to_owned());
-        let addr = var("VEXMAP_API_ADDR").unwrap_or_else(|| "127.0.0.1:7878".to_owned());
-        let addr: SocketAddr = addr.parse().map_err(|_| format!("VEXMAP_API_ADDR is not an address: {addr}"))?;
-        if !addr.ip().is_loopback() {
-            return Err(format!("VEXMAP_API_ADDR must be a loopback address, got {addr}"));
-        }
+        let loopback = |name: &str, default: &str| -> Result<SocketAddr, String> {
+            let text = var(name).unwrap_or_else(|| default.to_owned());
+            let addr: SocketAddr = text.parse().map_err(|_| format!("{name} is not an address: {text}"))?;
+            if !addr.ip().is_loopback() {
+                return Err(format!("{name} must be a loopback address, got {addr}"));
+            }
+            Ok(addr)
+        };
+        let addr = loopback("VEXMAP_API_ADDR", "127.0.0.1:7878")?;
+        let feed_addr = loopback("VEXMAP_FEED_ADDR", "127.0.0.1:7879")?;
         let owner = var("VEXMAP_OWNER_UUID")
             .map(|value| value.parse().map_err(|_| "VEXMAP_OWNER_UUID is not a UUID".to_owned()))
             .transpose()?;
@@ -54,7 +64,7 @@ impl Config {
             },
         };
         let rate = RateLimit { per_second: number("VEXMAP_API_RATE", 500)?, burst: number("VEXMAP_API_BURST", 1000)? };
-        Ok(Config { database_url, addr, owner, rate })
+        Ok(Config { database_url, addr, feed_addr, owner, rate })
     }
 }
 
@@ -65,8 +75,12 @@ pub async fn run(config: Config) -> Result<(), String> {
         bootstrap_owner(&core, owner).await.map_err(|error| format!("owner: {error}"))?;
     }
     let listener = tokio::net::TcpListener::bind(config.addr).await.map_err(|error| format!("bind: {error}"))?;
-    tracing::info!("VexMap API on http://{}", config.addr);
-    axum::serve(listener, router(core, config.rate))
+    let feed_listener =
+        tokio::net::TcpListener::bind(config.feed_addr).await.map_err(|error| format!("bind feed: {error}"))?;
+    tracing::info!("VexMap API on http://{}, player feed on {}", config.addr, config.feed_addr);
+    let positions = Arc::new(PositionStore::default());
+    tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone()));
+    axum::serve(listener, router(core, config.rate, positions))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -89,11 +103,13 @@ pub async fn bootstrap_owner(core: &Core, owner: Uuid) -> Result<(), CoreError> 
 struct AppState {
     core: Core,
     limiter: Arc<Limiter>,
+    positions: Arc<PositionStore>,
 }
 
-pub fn router(core: Core, rate: RateLimit) -> Router {
-    let state = AppState { core, limiter: Arc::new(Limiter::new(rate)) };
+pub fn router(core: Core, rate: RateLimit, positions: Arc<PositionStore>) -> Router {
+    let state = AppState { core, limiter: Arc::new(Limiter::new(rate)), positions };
     let api = Router::new()
+        .route("/positions", get(get_positions))
         .route("/players/{id}", get(get_player).put(put_player))
         .route("/players/{id}/role", put(put_role))
         .route("/features", get(get_features))
@@ -298,6 +314,15 @@ struct FeaturesQuery {
     region: Option<String>,
 }
 
+/// For local mods, which are trusted (assumption 10). Visibility rules belong to what is sent on to players.
+async fn get_positions(
+    State(state): State<AppState>,
+    Query(query): Query<FeaturesQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let region = query.region.as_deref().map(RegionId::new).transpose()?;
+    Ok(Json(json!({ "regions": state.positions.snapshot(region.as_ref()) })))
+}
+
 async fn get_features(
     State(state): State<AppState>,
     Query(query): Query<FeaturesQuery>,
@@ -369,6 +394,7 @@ mod tests {
         assert!(Config::from_env(env(&[("VEXMAP_API_ADDR", "0.0.0.0:7878")])).is_err());
         assert!(Config::from_env(env(&[("VEXMAP_API_ADDR", "192.168.1.5:7878")])).is_err());
         assert!(Config::from_env(env(&[("VEXMAP_API_ADDR", "[::1]:7878")])).is_ok());
+        assert!(Config::from_env(env(&[("VEXMAP_FEED_ADDR", "0.0.0.0:7879")])).is_err());
     }
 
     #[test]

@@ -10,8 +10,13 @@ license.workspace = true
 # This exact source is also injected into Horizon as the `vexmap_link` module, see mods/vexmap/mixins/vexmap.
 path = "../../mods/vexmap/mixins/vexmap/sidecar_link.rs"
 
+[[bench]]
+name = "feed"
+harness = false
+
 [dev-dependencies]
 axum.workspace = true
+criterion = { version = "0.8.2", default-features = false }
 tempfile.workspace = true
 tokio.workspace = true
 uuid = { workspace = true, features = ["v4"] }
