@@ -96,7 +96,7 @@ def main():
         key_file.write_bytes(base64.b64decode(key))
         password = os.environ.get("MINISIGN_PASSWORD", "")
         command = ["minisign", "-S", "-s", str(key_file), "-m", str(sums), "-t", f"vexmap {version}"]
-        # minisign reads the password from stdin when it is not a terminal. Checked on the first real release.
+        # minisign 0.12 reads the password from stdin when it is not a terminal (checked with a throwaway key).
         result = subprocess.run(command, input=(password + "\n").encode(), capture_output=True)
         if result.returncode:
             sys.stderr.write(result.stderr.decode(errors="replace"))

@@ -26,3 +26,16 @@ python tools/dev/stage.py build mods/vexmap           # клиент с модо
 ```
 
 `stage.py` ждёт рядом `.deps/horizon-mixins` на ревизии из `compatibility.json`.
+
+## Проверка релиза
+
+Релизы подписаны [minisign](https://jedisct1.github.io/minisign/). Публичный ключ лежит в [vexmap.pub](vexmap.pub):
+
+```text
+RWSFNDOgqs3Sr6jDLI06gzKF/1NtoK6CV9S14KIx65gPS+KLqHTvWn5o
+```
+
+```sh
+minisign -Vm SHA256SUMS -p vexmap.pub
+sha256sum -c SHA256SUMS
+```
