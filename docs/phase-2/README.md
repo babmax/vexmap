@@ -76,6 +76,7 @@ PostgreSQL сейчас совпадают дословно и должны со
 | `GET /v1/players/{uuid}` | | Игрок |
 | `PUT /v1/players/{uuid}` | `name` | Записать вход. Только локальный мод |
 | `PUT /v1/players/{uuid}/role` | `role`, `categories`, `actor?` | Сменить роль. Игрока может ещё не быть |
+| `PUT /v1/players/{uuid}/country` | `country` (обязателен, `null` значит без страны), `actor?` | Членство в стране. Только админ, владелец и локальный мод |
 | `GET /v1/features?region=` | | Включённые модули и маска для `Hello.features` |
 | `PUT /v1/features/{module}` | `enabled`, `region?`, `actor?` | Выключатель. Флаг региона важнее глобального, не заданный модуль выключен |
 | `GET /v1/journal?after=&limit=` | | Записи по порядку, до 1000 за раз |

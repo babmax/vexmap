@@ -18,6 +18,11 @@ pub const MAX_S2C_FRAME: usize = 1_000_000;
 pub const MAX_PARTS: u16 = 4096;
 pub const MAX_MOD_VERSION: usize = 64;
 pub const MAX_REASON: usize = 512;
+/// The most markers one key frame carries. At about 47 bytes each it stays inside one `MAX_S2C_FRAME`.
+pub const MAX_MARKERS: usize = 8192;
+const MAX_MARKER_NAME: usize = 16;
+const MAX_DIMENSION: usize = 64;
+const MAX_DIMENSIONS: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -27,6 +32,8 @@ pub enum Kind {
     Ping = 4,
     Pong = 5,
     Probe = 6,
+    PositionKey = 7,
+    PositionDelta = 8,
 }
 
 impl Kind {
@@ -38,6 +45,8 @@ impl Kind {
             4 => Kind::Ping,
             5 => Kind::Pong,
             6 => Kind::Probe,
+            7 => Kind::PositionKey,
+            8 => Kind::PositionDelta,
             _ => return None,
         })
     }
@@ -116,6 +125,48 @@ pub enum Message {
     Ping(u64),
     Pong(u64),
     Probe,
+    PositionKey(PositionKey),
+    PositionDelta(PositionDelta),
+}
+
+/// A player on the map. Coordinates in 1/8 of a block, `yaw` in 1/256 of a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    pub uuid: u128,
+    pub name: String,
+    pub dimension: String,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub yaw: u8,
+}
+
+/// The whole channel. Replaces whatever the client held, so an empty one clears the map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionKey {
+    pub key: u32,
+    pub markers: Vec<Marker>,
+}
+
+/// One marker's change against its entry in the key frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkerMove {
+    pub index: u16,
+    pub dx: i32,
+    pub dy: i32,
+    pub dz: i32,
+    pub yaw: u8,
+}
+
+/// The channel now, as a difference from key frame `key`. Never from the previous delta: a lost or dropped delta costs
+/// nothing, because the next one is complete on its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PositionDelta {
+    pub key: u32,
+    pub seq: u32,
+    pub removed: Vec<u16>,
+    pub added: Vec<Marker>,
+    pub moved: Vec<MarkerMove>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +175,9 @@ pub enum DecodeError {
     Truncated,
     TrailingBytes,
     BadString,
+    BadIndex,
+    TooMany,
+    BadNumber,
 }
 
 impl Message {
@@ -135,6 +189,8 @@ impl Message {
             Message::Ping(_) => Kind::Ping,
             Message::Pong(_) => Kind::Pong,
             Message::Probe => Kind::Probe,
+            Message::PositionKey(_) => Kind::PositionKey,
+            Message::PositionDelta(_) => Kind::PositionDelta,
         }
     }
 
@@ -153,6 +209,27 @@ impl Message {
             Message::Reject { reason } => put_str(&mut out, reason, MAX_REASON),
             Message::Ping(stamp) | Message::Pong(stamp) => out.extend_from_slice(&stamp.to_le_bytes()),
             Message::Probe => {}
+            Message::PositionKey(frame) => {
+                out.extend_from_slice(&frame.key.to_le_bytes());
+                put_markers(&mut out, &frame.markers);
+            }
+            Message::PositionDelta(delta) => {
+                out.extend_from_slice(&delta.key.to_le_bytes());
+                out.extend_from_slice(&delta.seq.to_le_bytes());
+                out.extend_from_slice(&(delta.removed.len() as u16).to_le_bytes());
+                for index in &delta.removed {
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
+                put_markers(&mut out, &delta.added);
+                out.extend_from_slice(&(delta.moved.len() as u16).to_le_bytes());
+                for moved in &delta.moved {
+                    out.extend_from_slice(&moved.index.to_le_bytes());
+                    put_varint(&mut out, moved.dx);
+                    put_varint(&mut out, moved.dy);
+                    put_varint(&mut out, moved.dz);
+                    out.push(moved.yaw);
+                }
+            }
         }
         out
     }
@@ -170,6 +247,8 @@ impl Message {
             Kind::Ping => Message::Ping(reader.u64()?),
             Kind::Pong => Message::Pong(reader.u64()?),
             Kind::Probe => Message::Probe,
+            Kind::PositionKey => Message::PositionKey(PositionKey { key: reader.u32()?, markers: reader.markers()? }),
+            Kind::PositionDelta => Message::PositionDelta(reader.delta()?),
         };
         if !reader.bytes.is_empty() {
             return Err(DecodeError::TrailingBytes);
@@ -186,6 +265,58 @@ fn put_str(out: &mut Vec<u8>, text: &str, max: usize) {
     }
     out.extend_from_slice(&(end as u16).to_le_bytes());
     out.extend_from_slice(&text.as_bytes()[..end]);
+}
+
+fn put_short(out: &mut Vec<u8>, text: &str) {
+    out.push(text.len() as u8);
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// A table of dimensions, then the markers pointing into it. A marker this format cannot hold is left out.
+fn put_markers(out: &mut Vec<u8>, markers: &[Marker]) {
+    let mut dimensions: Vec<&str> = Vec::new();
+    let mut entries = Vec::with_capacity(markers.len().min(MAX_MARKERS) * 40);
+    let mut count: u16 = 0;
+    for marker in markers {
+        if usize::from(count) == MAX_MARKERS
+            || marker.name.len() > MAX_MARKER_NAME
+            || marker.dimension.len() > MAX_DIMENSION
+        {
+            continue;
+        }
+        let index = match dimensions.iter().position(|known| *known == marker.dimension) {
+            Some(index) => index,
+            None if dimensions.len() < MAX_DIMENSIONS => {
+                dimensions.push(&marker.dimension);
+                dimensions.len() - 1
+            }
+            None => continue,
+        };
+        entries.extend_from_slice(&marker.uuid.to_le_bytes());
+        put_short(&mut entries, &marker.name);
+        entries.push(index as u8);
+        entries.extend_from_slice(&marker.x.to_le_bytes());
+        entries.extend_from_slice(&marker.y.to_le_bytes());
+        entries.extend_from_slice(&marker.z.to_le_bytes());
+        entries.push(marker.yaw);
+        count += 1;
+    }
+    out.push(dimensions.len() as u8);
+    for dimension in &dimensions {
+        put_short(out, dimension);
+    }
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&entries);
+}
+
+/// Zigzag, seven bits a byte: a walking player's offset from the key frame takes one or two bytes.
+fn put_varint(out: &mut Vec<u8>, value: i32) {
+    let mut rest = ((value << 1) ^ (value >> 31)) as u32;
+    while rest >= 0x80 {
+        out.push(rest as u8 | 0x80);
+        rest >>= 7;
+    }
+    out.push(rest as u8);
 }
 
 struct Reader<'a> {
@@ -219,6 +350,196 @@ impl<'a> Reader<'a> {
             return Err(DecodeError::BadString);
         }
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn i32(&mut self) -> Result<i32, DecodeError> {
+        Ok(self.u32()? as i32)
+    }
+
+    fn short(&mut self, max: usize) -> Result<String, DecodeError> {
+        let len = usize::from(self.u8()?);
+        if len > max {
+            return Err(DecodeError::BadString);
+        }
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+
+    fn count(&mut self) -> Result<usize, DecodeError> {
+        let count = usize::from(self.u16()?);
+        if count > MAX_MARKERS {
+            return Err(DecodeError::TooMany);
+        }
+        Ok(count)
+    }
+
+    fn varint(&mut self) -> Result<i32, DecodeError> {
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.u8()?;
+            value |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok((value >> 1) as i32 ^ -((value & 1) as i32));
+            }
+        }
+        Err(DecodeError::BadNumber)
+    }
+
+    fn markers(&mut self) -> Result<Vec<Marker>, DecodeError> {
+        let mut dimensions = Vec::new();
+        for _ in 0..self.u8()? {
+            dimensions.push(self.short(MAX_DIMENSION)?);
+        }
+        let count = self.count()?;
+        let mut markers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut uuid = [0; 16];
+            uuid.copy_from_slice(self.take(16)?);
+            let name = self.short(MAX_MARKER_NAME)?;
+            let dimension = dimensions.get(usize::from(self.u8()?)).ok_or(DecodeError::BadIndex)?.clone();
+            let (x, y, z) = (self.i32()?, self.i32()?, self.i32()?);
+            markers.push(Marker { uuid: u128::from_le_bytes(uuid), name, dimension, x, y, z, yaw: self.u8()? });
+        }
+        Ok(markers)
+    }
+
+    fn delta(&mut self) -> Result<PositionDelta, DecodeError> {
+        let (key, seq) = (self.u32()?, self.u32()?);
+        let removed_count = self.count()?;
+        let mut removed = Vec::with_capacity(removed_count);
+        for _ in 0..removed_count {
+            removed.push(self.u16()?);
+        }
+        let added = self.markers()?;
+        let moved_count = self.count()?;
+        let mut moved = Vec::with_capacity(moved_count);
+        for _ in 0..moved_count {
+            let index = self.u16()?;
+            let (dx, dy, dz) = (self.varint()?, self.varint()?, self.varint()?);
+            moved.push(MarkerMove { index, dx, dy, dz, yaw: self.u8()? });
+        }
+        Ok(PositionDelta { key, seq, removed, added, moved })
+    }
+}
+
+/// The sidecar's half of a position channel: remembers the key frame and describes the present against it.
+// Used by the sidecar and tests, not by the game.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct ChannelEncoder {
+    key: u32,
+    seq: u32,
+    base: Vec<Marker>,
+    index: HashMap<u128, u16>,
+    last: Vec<Marker>,
+    delta: PositionDelta,
+}
+
+#[allow(dead_code)]
+impl ChannelEncoder {
+    /// `markers` becomes the new key frame, numbered `key`.
+    pub fn key_frame(&mut self, key: u32, mut markers: Vec<Marker>) -> PositionKey {
+        markers.truncate(MAX_MARKERS);
+        self.key = key;
+        self.seq = 0;
+        self.index = markers.iter().enumerate().map(|(index, marker)| (marker.uuid, index as u16)).collect();
+        self.base.clone_from(&markers);
+        self.last.clone_from(&markers);
+        self.delta = PositionDelta { key, ..PositionDelta::default() };
+        PositionKey { key, markers }
+    }
+
+    /// `markers` against the key frame, and whether anything changed since the previous call. An unchanged channel
+    /// repeats its latest delta, which a viewer joining now still needs after the key frame.
+    pub fn delta(&mut self, mut markers: Vec<Marker>) -> (&PositionDelta, bool) {
+        markers.truncate(MAX_MARKERS);
+        if markers == self.last {
+            return (&self.delta, false);
+        }
+        self.seq = self.seq.wrapping_add(1);
+        let mut delta = PositionDelta { key: self.key, seq: self.seq, ..PositionDelta::default() };
+        let mut kept = vec![false; self.base.len()];
+        for marker in &markers {
+            let known = self.index.get(&marker.uuid).map(|index| (*index, &self.base[usize::from(*index)]));
+            match known {
+                Some((index, base)) if base.dimension == marker.dimension && base.name == marker.name => {
+                    kept[usize::from(index)] = true;
+                    if (base.x, base.y, base.z, base.yaw) != (marker.x, marker.y, marker.z, marker.yaw) {
+                        delta.moved.push(MarkerMove {
+                            index,
+                            dx: marker.x.wrapping_sub(base.x),
+                            dy: marker.y.wrapping_sub(base.y),
+                            dz: marker.z.wrapping_sub(base.z),
+                            yaw: marker.yaw,
+                        });
+                    }
+                }
+                _ => delta.added.push(marker.clone()),
+            }
+        }
+        delta.removed = (0..self.base.len()).filter(|index| !kept[*index]).map(|index| index as u16).collect();
+        self.last = markers;
+        self.delta = delta;
+        (&self.delta, true)
+    }
+}
+
+/// The client's half of a position channel.
+#[derive(Default)]
+pub struct PositionTable {
+    key: Option<u32>,
+    seq: u32,
+    base: Vec<Marker>,
+    current: Vec<Marker>,
+}
+
+impl PositionTable {
+    pub fn markers(&self) -> &[Marker] {
+        &self.current
+    }
+
+    pub fn apply_key(&mut self, frame: PositionKey) {
+        self.key = Some(frame.key);
+        self.seq = 0;
+        self.current.clone_from(&frame.markers);
+        self.base = frame.markers;
+    }
+
+    /// `false` for a delta that does not apply: another key frame, older than what is shown, or malformed.
+    pub fn apply_delta(&mut self, delta: &PositionDelta) -> bool {
+        if self.key != Some(delta.key) || delta.seq <= self.seq {
+            return false;
+        }
+        let in_range = |index: u16| usize::from(index) < self.base.len();
+        if !delta.removed.iter().all(|index| in_range(*index)) || !delta.moved.iter().all(|m| in_range(m.index)) {
+            return false;
+        }
+        self.seq = delta.seq;
+        let mut next = self.base.clone();
+        for moved in &delta.moved {
+            let marker = &mut next[usize::from(moved.index)];
+            marker.x = marker.x.wrapping_add(moved.dx);
+            marker.y = marker.y.wrapping_add(moved.dy);
+            marker.z = marker.z.wrapping_add(moved.dz);
+            marker.yaw = moved.yaw;
+        }
+        let mut gone = vec![false; next.len()];
+        for index in &delta.removed {
+            gone[usize::from(*index)] = true;
+        }
+        let mut flags = gone.iter();
+        next.retain(|_| !flags.next().copied().unwrap_or(false));
+        next.extend_from_slice(&delta.added);
+        self.current = next;
+        true
     }
 }
 
@@ -540,6 +861,148 @@ mod tests {
         ] {
             assert_eq!(roundtrip(message.clone(), MAX_C2S_FRAME), message);
         }
+    }
+
+    fn marker(uuid: u128, x: i32) -> Marker {
+        Marker { uuid, name: format!("P{uuid}"), dimension: "minecraft:overworld".into(), x, y: 512, z: -x, yaw: 7 }
+    }
+
+    fn sorted(markers: &[Marker]) -> Vec<Marker> {
+        let mut out = markers.to_vec();
+        out.sort_by_key(|marker| marker.uuid);
+        out
+    }
+
+    #[test]
+    fn position_messages_roundtrip() {
+        let key = Message::PositionKey(PositionKey { key: 9, markers: vec![marker(1, -239_999_872), marker(2, 80)] });
+        assert_eq!(roundtrip(key.clone(), MAX_S2C_FRAME), key);
+        let delta = Message::PositionDelta(PositionDelta {
+            key: 9,
+            seq: 3,
+            removed: vec![1],
+            added: vec![marker(5, 1)],
+            moved: vec![
+                MarkerMove { index: 0, dx: -1, dy: 0, dz: 300, yaw: 200 },
+                MarkerMove { index: 2, dx: i32::MIN, dy: i32::MAX, dz: 63, yaw: 0 },
+            ],
+        });
+        assert_eq!(roundtrip(delta.clone(), MAX_S2C_FRAME), delta);
+    }
+
+    #[test]
+    fn a_walking_player_costs_a_handful_of_bytes() {
+        let mut encoder = ChannelEncoder::default();
+        encoder.key_frame(1, vec![marker(1, 0)]);
+        let mut moved = marker(1, 40);
+        moved.z = -40;
+        let (delta, changed) = encoder.delta(vec![moved]);
+        assert!(changed);
+        // key, seq, three empty counts and one empty dimension table, then index, three offsets and yaw.
+        assert_eq!(Message::PositionDelta(delta.clone()).body().len(), 4 + 4 + 2 + 1 + 2 + 2 + (2 + 1 + 1 + 1 + 1));
+    }
+
+    #[test]
+    fn every_truncation_of_a_position_message_is_an_error() {
+        let key = Message::PositionKey(PositionKey { key: 1, markers: vec![marker(1, 4)] });
+        let delta = Message::PositionDelta(PositionDelta {
+            key: 1,
+            seq: 1,
+            removed: vec![0],
+            added: vec![marker(2, 2)],
+            moved: vec![MarkerMove { index: 0, dx: 1000, dy: 1, dz: 1, yaw: 1 }],
+        });
+        for message in [key, delta] {
+            let body = message.body();
+            for cut in 0..body.len() {
+                assert!(Message::decode(message.kind() as u8, &body[..cut]).is_err(), "cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_position_messages_are_refused() {
+        let mut too_many = 1u32.to_le_bytes().to_vec();
+        too_many.extend_from_slice(&[0, 0xff, 0xff]);
+        assert_eq!(Message::decode(7, &too_many), Err(DecodeError::TooMany));
+
+        let mut overlong = vec![0; 8];
+        overlong.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0, 0]);
+        assert_eq!(Message::decode(8, &overlong), Err(DecodeError::BadNumber));
+    }
+
+    #[test]
+    fn key_plus_delta_is_always_the_truth() {
+        let mut encoder = ChannelEncoder::default();
+        let mut table = PositionTable::default();
+        let mut world: Vec<Marker> = (0..40).map(|id| marker(id, id as i32 * 8)).collect();
+        table.apply_key(encoder.key_frame(1, world.clone()));
+        let mut random = 0x2545_f491_u32;
+        for round in 0..200u128 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            for marker in &mut world {
+                marker.x += (random >> 8) as i32 % 50;
+                marker.yaw = marker.yaw.wrapping_add(random as u8);
+            }
+            if round % 7 == 0 {
+                world.remove(random as usize % world.len());
+            }
+            if round % 5 == 0 {
+                world.push(marker(1000 + round, 3));
+            }
+            if round % 11 == 0 {
+                let index = random as usize % world.len();
+                world[index].dimension = "minecraft:the_nether".into();
+            }
+            let (delta, changed) = encoder.delta(world.clone());
+            assert!(changed);
+            // Only every third delta arrives: each one must stand on its own.
+            if round % 3 == 0 {
+                assert!(table.apply_delta(delta));
+                assert_eq!(sorted(table.markers()), sorted(&world), "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unchanged_channel_says_so() {
+        let mut encoder = ChannelEncoder::default();
+        encoder.key_frame(1, vec![marker(1, 0)]);
+        assert!(!encoder.delta(vec![marker(1, 0)]).1);
+        assert!(encoder.delta(vec![marker(1, 8)]).1);
+        let (delta, changed) = encoder.delta(vec![marker(1, 8)]);
+        assert!(!changed);
+        assert_eq!((delta.seq, delta.moved.len()), (1, 1), "a late joiner still gets the latest delta");
+    }
+
+    #[test]
+    fn deltas_that_do_not_apply_change_nothing() {
+        let mut encoder = ChannelEncoder::default();
+        let mut table = PositionTable::default();
+        let (first, _) = encoder.delta(vec![]);
+        assert!(!table.apply_delta(first), "no key frame yet");
+
+        table.apply_key(encoder.key_frame(2, vec![marker(1, 0)]));
+        let shown = table.markers().to_vec();
+        let other_key = PositionDelta { key: 1, seq: 5, ..PositionDelta::default() };
+        assert!(!table.apply_delta(&other_key));
+        let bad_index = PositionDelta { key: 2, seq: 5, removed: vec![9], ..PositionDelta::default() };
+        assert!(!table.apply_delta(&bad_index));
+        assert_eq!(table.markers(), shown);
+
+        let newer = PositionDelta { key: 2, seq: 5, removed: vec![0], ..PositionDelta::default() };
+        assert!(table.apply_delta(&newer));
+        assert!(table.markers().is_empty());
+        let older = PositionDelta { key: 2, seq: 4, ..PositionDelta::default() };
+        assert!(!table.apply_delta(&older), "an older delta never undoes a newer one");
+    }
+
+    #[test]
+    fn an_empty_key_frame_clears_the_map() {
+        let mut table = PositionTable::default();
+        table.apply_key(PositionKey { key: 1, markers: vec![marker(1, 0)] });
+        table.apply_key(PositionKey { key: 2, markers: vec![] });
+        assert!(table.markers().is_empty());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::migrate::Migrator;
 use sqlx::{AnyPool, Row};
 
-pub use types::{Actor, Category, ClientName, CommandContext, Module, PlayerId, RegionId, RequestId, Role};
+pub use types::{Actor, Category, ClientName, CommandContext, CountryId, Module, PlayerId, RegionId, RequestId, Role};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
 static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("migrations/postgres");
@@ -62,15 +62,16 @@ pub struct Player {
     pub name: Option<String>,
     pub role: Role,
     pub categories: BTreeSet<Category>,
+    pub country: Option<CountryId>,
 }
 
 impl Player {
     fn new(id: PlayerId) -> Self {
-        Player { id, name: None, role: Role::Player, categories: BTreeSet::new() }
+        Player { id, name: None, role: Role::Player, categories: BTreeSet::new(), country: None }
     }
 
     fn to_json(&self) -> Value {
-        json!({ "name": self.name, "role": self.role, "categories": self.categories })
+        json!({ "name": self.name, "role": self.role, "categories": self.categories, "country": self.country })
     }
 }
 
@@ -164,7 +165,7 @@ impl Core {
     }
 
     pub async fn player(&self, id: PlayerId) -> Result<Option<Player>, CoreError> {
-        let row = sqlx::query("SELECT name, role, categories FROM players WHERE id = $1")
+        let row = sqlx::query("SELECT name, role, categories, country FROM players WHERE id = $1")
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -231,6 +232,36 @@ impl Core {
         store_player(&mut tx, &after, seq).await?;
         let change = Change {
             kind: "player.role_changed",
+            object_type: "player",
+            object_id: &target.to_string(),
+            before: before.as_ref().map(Player::to_json),
+            after: after.to_json(),
+        };
+        finish(tx, ctx, seq, change).await
+    }
+
+    /// Puts a player in a country, or in none. The player need not have joined yet.
+    pub async fn set_country(
+        &self,
+        ctx: &CommandContext,
+        target: PlayerId,
+        country: Option<CountryId>,
+    ) -> Result<Outcome, CoreError> {
+        let (mut tx, seq) = match self.begin_write(ctx).await? {
+            Write::Open { tx, seq } => (tx, seq),
+            Write::Replayed(seq) => return Ok(Outcome::Replayed { seq }),
+        };
+        access::check_set_country(actor_role(&mut tx, &ctx.actor).await?)?;
+        let before = load_player(&mut tx, target).await?;
+        if before.as_ref().map_or(country.is_none(), |player| player.country == country) {
+            tx.rollback().await?;
+            return Ok(Outcome::Unchanged);
+        }
+        let mut after = before.clone().unwrap_or_else(|| Player::new(target));
+        after.country = country;
+        store_player(&mut tx, &after, seq).await?;
+        let change = Change {
+            kind: "player.country_changed",
             object_type: "player",
             object_id: &target.to_string(),
             before: before.as_ref().map(Player::to_json),
@@ -344,11 +375,15 @@ fn player_from_row(id: PlayerId, row: &sqlx::any::AnyRow) -> Result<Player, Core
         name: row.try_get(0)?,
         role: Role::parse(row.try_get(1)?)?,
         categories: Category::from_bits(row.try_get(2)?),
+        country: row
+            .try_get::<Option<String>, _>(3)?
+            .map(|country| CountryId::new(&country).map_err(|_| CoreError::Corrupt(format!("country {country:?}"))))
+            .transpose()?,
     })
 }
 
 async fn load_player(tx: &mut Tx, id: PlayerId) -> Result<Option<Player>, CoreError> {
-    let row = sqlx::query("SELECT name, role, categories FROM players WHERE id = $1")
+    let row = sqlx::query("SELECT name, role, categories, country FROM players WHERE id = $1")
         .bind(id.to_string())
         .fetch_optional(&mut **tx)
         .await?;
@@ -357,14 +392,15 @@ async fn load_player(tx: &mut Tx, id: PlayerId) -> Result<Option<Player>, CoreEr
 
 async fn store_player(tx: &mut Tx, player: &Player, seq: i64) -> Result<(), CoreError> {
     sqlx::query(
-        "INSERT INTO players (id, name, role, categories, updated_seq) VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO players (id, name, role, categories, country, updated_seq) VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (id) DO UPDATE SET name = excluded.name, role = excluded.role, \
-         categories = excluded.categories, updated_seq = excluded.updated_seq",
+         categories = excluded.categories, country = excluded.country, updated_seq = excluded.updated_seq",
     )
     .bind(player.id.to_string())
     .bind(player.name.clone())
     .bind(player.role.as_str())
     .bind(Category::to_bits(&player.categories))
+    .bind(player.country.as_ref().map(|country| country.as_str().to_owned()))
     .bind(seq)
     .execute(&mut **tx)
     .await?;

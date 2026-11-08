@@ -15,8 +15,11 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
-use vexmap_core::{Actor, Category, ClientName, CommandContext, Core, CoreError, Module, RegionId, RequestId, Role};
+use vexmap_core::{
+    Actor, Category, ClientName, CommandContext, Core, CoreError, CountryId, Module, RegionId, RequestId, Role,
+};
 
+pub mod fanout;
 pub mod feed;
 
 pub use feed::PositionStore;
@@ -80,6 +83,7 @@ pub async fn run(config: Config) -> Result<(), String> {
     tracing::info!("VexMap API on http://{}, player feed on {}", config.addr, config.feed_addr);
     let positions = Arc::new(PositionStore::default());
     tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone()));
+    tokio::spawn(fanout::run(core.clone(), positions.clone()));
     axum::serve(listener, router(core, config.rate, positions))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -112,6 +116,7 @@ pub fn router(core: Core, rate: RateLimit, positions: Arc<PositionStore>) -> Rou
         .route("/positions", get(get_positions))
         .route("/players/{id}", get(get_player).put(put_player))
         .route("/players/{id}/role", put(put_role))
+        .route("/players/{id}/country", put(put_country))
         .route("/features", get(get_features))
         .route("/features/{module}", put(put_feature))
         .route("/journal", get(get_journal))
@@ -306,6 +311,26 @@ async fn put_role(
 ) -> ApiResult<impl IntoResponse> {
     let ctx = command_context(&headers, body.actor)?;
     Ok(Json(state.core.set_role(&ctx, parse_uuid(&id)?, body.role, body.categories).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutCountry {
+    /// Required, with `null` meaning no country: a forgotten field must not remove a player from their country.
+    #[serde(deserialize_with = "Option::deserialize")]
+    country: Option<String>,
+    actor: Option<Uuid>,
+}
+
+async fn put_country(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PutCountry>,
+) -> ApiResult<impl IntoResponse> {
+    let ctx = command_context(&headers, body.actor)?;
+    let country = body.country.as_deref().map(CountryId::new).transpose()?;
+    Ok(Json(state.core.set_country(&ctx, parse_uuid(&id)?, country).await?))
 }
 
 #[derive(Deserialize)]

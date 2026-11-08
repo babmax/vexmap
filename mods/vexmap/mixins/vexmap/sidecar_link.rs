@@ -130,6 +130,7 @@ const FEED_MAGIC: [u8; 2] = *b"VF";
 const FEED_VERSION: u8 = 1;
 const KIND_HELLO: u8 = 1;
 const KIND_BATCH: u8 = 2;
+const KIND_DELIVERIES: u8 = 3;
 const FLAG_POSITIONS: u8 = 1;
 
 /// One player as the tick saw them.
@@ -297,7 +298,6 @@ pub struct FeedBatch {
     pub players: Vec<FeedPlayer>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedError {
     Truncated,
@@ -308,12 +308,10 @@ pub enum FeedError {
     TooManyPlayers,
 }
 
-#[allow(dead_code)]
 struct FeedReader<'a> {
     bytes: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> FeedReader<'a> {
     fn take(&mut self, count: usize) -> Result<&'a [u8], FeedError> {
         if self.bytes.len() < count {
@@ -334,6 +332,7 @@ impl<'a> FeedReader<'a> {
         Ok(self.array::<1>()?[0])
     }
 
+    #[allow(dead_code)]
     fn short_str(&mut self, max: usize) -> Result<String, FeedError> {
         let length = usize::from(self.u8()?);
         if length > max {
@@ -411,20 +410,130 @@ impl FeedConfig {
     }
 }
 
-/// One connection, until the socket fails.
-fn pump(config: &FeedConfig, mailbox: &Mailbox, connected: &mut bool) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect_timeout(&config.addr, TIMEOUT)?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    let mut out = Vec::new();
-    encode_hello(&config.region, &mut out);
-    stream.write_all(&out)?;
-    if !*connected {
-        *connected = true;
-        eprintln!("[vexmap] player feed: connected to {} as region {}", config.addr, config.region);
+// ---------------------------------------------------------------- deliveries, sidecar to server
+//
+// The sidecar decides who sees what (rule 8) and hands over ready frames with their addressees. The mod reads none of it.
+
+/// Generous for a region's channels, and still a bound on what this thread will buffer.
+const MAX_DELIVERIES_MESSAGE: usize = 16 << 20;
+const MAX_DELIVERIES: usize = 4096;
+
+/// One ready frame and the players on this server who get it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub viewers: Vec<u128>,
+    pub frame: Vec<u8>,
+}
+
+/// One message deep, newest wins. A position frame replaced before the tick saw it is stale anyway: deltas stand alone.
+pub struct DeliveryBox {
+    slot: Mutex<Vec<Delivery>>,
+}
+
+impl DeliveryBox {
+    // `const` for the same reason as `Mailbox::new`.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        DeliveryBox { slot: Mutex::new(Vec::new()) }
     }
-    let mut batch = Vec::new();
+
+    pub fn put(&self, mut deliveries: Vec<Delivery>) {
+        if let Ok(mut slot) = self.slot.lock() {
+            std::mem::swap(&mut *slot, &mut deliveries);
+        }
+    }
+
+    /// For the tick: never waits. `false` when there is nothing new or the feed thread holds the slot for its swap.
+    pub fn try_take(&self, into: &mut Vec<Delivery>) -> bool {
+        let Ok(mut slot) = self.slot.try_lock() else { return false };
+        if slot.is_empty() {
+            return false;
+        }
+        std::mem::swap(&mut *slot, into);
+        true
+    }
+}
+
+/// With its length prefix. Addressees and frames past the format's limits are left out.
+#[allow(dead_code)]
+pub fn encode_deliveries(deliveries: &[Delivery], out: &mut Vec<u8>) {
+    let start = begin_message(out, KIND_DELIVERIES);
+    let count = deliveries.len().min(MAX_DELIVERIES);
+    out.extend_from_slice(&(count as u16).to_le_bytes());
+    for delivery in &deliveries[..count] {
+        let viewers = &delivery.viewers[..delivery.viewers.len().min(MAX_BATCH_PLAYERS)];
+        out.extend_from_slice(&(viewers.len() as u16).to_le_bytes());
+        for viewer in viewers {
+            out.extend_from_slice(&viewer.to_le_bytes());
+        }
+        out.extend_from_slice(&(delivery.frame.len() as u32).to_le_bytes());
+        out.extend_from_slice(&delivery.frame);
+    }
+    finish_message(out, start);
+}
+
+/// Without the length prefix. Bad bytes are an error, never a panic.
+pub fn decode_deliveries(body: &[u8]) -> Result<Vec<Delivery>, FeedError> {
+    let mut reader = FeedReader { bytes: body };
+    if reader.u8()? != KIND_DELIVERIES {
+        return Err(FeedError::BadHeader);
+    }
+    let count = usize::from(u16::from_le_bytes(reader.array()?));
+    if count > MAX_DELIVERIES {
+        return Err(FeedError::TooManyPlayers);
+    }
+    let mut deliveries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let viewer_count = usize::from(u16::from_le_bytes(reader.array()?));
+        if viewer_count > MAX_BATCH_PLAYERS {
+            return Err(FeedError::TooManyPlayers);
+        }
+        let mut viewers = Vec::with_capacity(viewer_count);
+        for _ in 0..viewer_count {
+            viewers.push(u128::from_le_bytes(reader.array()?));
+        }
+        let length = u32::from_le_bytes(reader.array()?) as usize;
+        deliveries.push(Delivery { viewers, frame: reader.take(length)?.to_vec() });
+    }
+    reader.end()?;
+    Ok(deliveries)
+}
+
+/// Reads until the socket ends or lies. A bad message ends the connection, so framing can never drift.
+fn read_deliveries(mut stream: &TcpStream, deliveries: &DeliveryBox) {
+    let mut body = Vec::new();
     loop {
-        if let Some((seq, positions)) = mailbox.take(&mut batch) {
+        let mut length = [0; 4];
+        if stream.read_exact(&mut length).is_err() {
+            return;
+        }
+        let length = u32::from_le_bytes(length) as usize;
+        if length > MAX_DELIVERIES_MESSAGE {
+            return;
+        }
+        body.resize(length, 0);
+        if stream.read_exact(&mut body).is_err() {
+            return;
+        }
+        match decode_deliveries(&body) {
+            Ok(decoded) => deliveries.put(decoded),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Where the feed thread leaves what it receives, and takes what it sends.
+#[derive(Clone, Copy)]
+pub struct FeedBoxes {
+    pub players: &'static Mailbox,
+    pub deliveries: &'static DeliveryBox,
+}
+
+fn write_batches(mut stream: &TcpStream, config: &FeedConfig, players: &Mailbox) -> std::io::Result<()> {
+    let mut batch = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        if let Some((seq, positions)) = players.take(&mut batch) {
             out.clear();
             encode_batch(seq, positions, &batch, &mut out);
             stream.write_all(&out)?;
@@ -433,13 +542,38 @@ fn pump(config: &FeedConfig, mailbox: &Mailbox, connected: &mut bool) -> std::io
     }
 }
 
-/// Starts the thread that carries `mailbox` to the sidecar. While the sidecar is away only the newest batch is held.
-pub fn start_feed(config: FeedConfig, mailbox: &'static Mailbox) -> std::io::Result<()> {
+/// One connection, until the socket fails in either direction.
+fn pump(config: &FeedConfig, boxes: FeedBoxes, connected: &mut bool) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&config.addr, TIMEOUT)?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    let mut hello = Vec::new();
+    encode_hello(&config.region, &mut hello);
+    stream.write_all(&hello)?;
+    if !*connected {
+        *connected = true;
+        eprintln!("[vexmap] player feed: connected to {} as region {}", config.addr, config.region);
+    }
+    let stream = &stream;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new().name("vexmap-feed-read".to_owned()).spawn_scoped(scope, move || {
+            read_deliveries(stream, boxes.deliveries);
+            // Wakes the writer: whichever direction fails first ends the connection.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        })?;
+        let result = write_batches(stream, config, boxes.players);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        result
+    })
+}
+
+/// Starts the thread that carries the player list to the sidecar and frames back. While the sidecar is away only the
+/// newest batch is held.
+pub fn start_feed(config: FeedConfig, boxes: FeedBoxes) -> std::io::Result<()> {
     std::thread::Builder::new().name("vexmap-feed".to_owned()).spawn(move || {
         let mut connected = false;
         let mut last_error = None;
         loop {
-            if let Err(error) = pump(&config, mailbox, &mut connected) {
+            if let Err(error) = pump(&config, boxes, &mut connected) {
                 let text = error.to_string();
                 if connected || last_error.as_ref() != Some(&text) {
                     eprintln!("[vexmap] player feed lost, retrying: {text}");

@@ -21,6 +21,14 @@ pub(crate) fn check_set_feature(actor: Option<Role>) -> Result<(), CoreError> {
     }
 }
 
+/// Rulers join these in Phase 7, when countries exist as objects.
+pub(crate) fn check_set_country(actor: Option<Role>) -> Result<(), CoreError> {
+    match actor {
+        None | Some(Role::Admin | Role::Owner) => Ok(()),
+        Some(_) => Err(CoreError::Forbidden("only admins and the owner can change a player's country")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,7 +60,10 @@ mod tests {
         for actor in [Role::Player, Role::Trusted, Role::Moderator] {
             assert!(check_set_role(Some(actor), Role::Player, Role::Player).is_err());
             assert!(check_set_feature(Some(actor)).is_err());
+            assert!(check_set_country(Some(actor)).is_err());
         }
         assert!(check_set_feature(Some(Role::Admin)).is_ok());
+        assert!(check_set_country(Some(Role::Admin)).is_ok());
+        assert!(check_set_country(None).is_ok());
     }
 }

@@ -12,15 +12,17 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 pub(super) const MOD_VERSION: &str = "0.1.0";
-/// Modules this client build implements, as bits of `Hello.features`. None yet: each arrives with its phase.
-pub(super) const FEATURES: u64 = 0;
+/// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
+const REALTIME: u64 = 1;
+/// Modules this client build implements, as bits of `Hello.features`. Each arrives with its phase.
+pub(super) const FEATURES: u64 = REALTIME;
 
 /// Modules switched on for this region, kept current by the sidecar link. All off until the sidecar first answers.
 static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
-/// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
-const REALTIME: u64 = 1;
 /// The newest list of this server's players, on its way to the sidecar.
 static PLAYER_FEED: link::Mailbox = link::Mailbox::new();
+/// The newest frames for this server's players, on their way from the sidecar.
+static DELIVERIES: link::DeliveryBox = link::DeliveryBox::new();
 
 const KICK_NO_MOD: &str = "VexMap: this server needs the VexMap client mod.\n\
 Этому серверу нужен клиентский мод VexMap.";
@@ -42,6 +44,7 @@ struct Server {
     outbox: proto::Outbox,
     next_sample_ms: u64,
     samples: Vec<link::PlayerSample>,
+    deliveries: Vec<link::Delivery>,
 }
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
@@ -56,6 +59,7 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             outbox: proto::Outbox::default(),
             next_sample_ms: 0,
             samples: Vec::new(),
+            deliveries: Vec::new(),
         }
     });
     Some(f(server))
@@ -77,7 +81,8 @@ fn start_sidecar_link() {
     }
     match link::FeedConfig::parse(feed_addr.as_deref(), region.as_deref()) {
         Ok(config) => {
-            if let Err(error) = link::start_feed(config, &PLAYER_FEED) {
+            let boxes = link::FeedBoxes { players: &PLAYER_FEED, deliveries: &DELIVERIES };
+            if let Err(error) = link::start_feed(config, boxes) {
                 log(format_args!("player feed did not start: {error}"));
             }
         }
@@ -137,6 +142,20 @@ fn kick(game: &mut crate::game::Game<'_>, outbox: &mut proto::Outbox, player: u1
     log(format_args!("kick {player:032x} {reason:?} queued={queued}"));
 }
 
+/// Forwards ready frames from the sidecar, which chose the addressees. Only to players whose client took `realtime`.
+fn send_deliveries(game: &mut crate::game::Game<'_>, server: &mut Server) {
+    if !DELIVERIES.try_take(&mut server.deliveries) {
+        return;
+    }
+    for delivery in server.deliveries.drain(..) {
+        for viewer in delivery.viewers {
+            if server.gate.features(viewer).is_some_and(|features| features & REALTIME != 0) {
+                let _ = game.native_send_custom_payload_to_player(viewer, proto::CHANNEL, &delivery.frame);
+            }
+        }
+    }
+}
+
 /// `player_logged_in`: start the admission clock and ask the client to introduce itself.
 pub(super) fn player_logged_in(game: &mut crate::game::Game<'_>, player: u128) {
     with_server(|server| {
@@ -168,6 +187,7 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
         if now >= server.next_sample_ms {
             sample_players(game, server, now);
         }
+        send_deliveries(game, server);
     });
 }
 
@@ -211,6 +231,8 @@ struct Client {
     handshake: proto::ClientHandshake,
     inbound: proto::Reassembler,
     outbox: proto::Outbox,
+    positions: proto::PositionTable,
+    reported_markers: Option<usize>,
 }
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
@@ -221,8 +243,19 @@ fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
         handshake: proto::ClientHandshake::default(),
         inbound: proto::Reassembler::new(proto::Limits::default()),
         outbox: proto::Outbox::default(),
+        positions: proto::PositionTable::default(),
+        reported_markers: None,
     });
     Some(f(client))
+}
+
+/// The map is not drawn yet, so the log is the only sign of the table. Only when the number of markers changes.
+fn report_markers(client: &mut Client) {
+    let count = client.positions.markers().len();
+    if client.reported_markers != Some(count) {
+        client.reported_markers = Some(count);
+        log(format_args!("positions: {count} markers"));
+    }
 }
 
 fn payload_packet(channel: &str, data: Vec<u8>) -> horizon_client::mod_api::ServerboundPlayPacket {
@@ -280,6 +313,15 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
             proto::Message::Reject { reason } => log(format_args!("rejected: {reason}")),
             proto::Message::Ping(stamp) => {
                 send_to_server(game, &mut client.outbox, &proto::Message::Pong(stamp));
+            }
+            proto::Message::PositionKey(frame) => {
+                client.positions.apply_key(frame);
+                report_markers(client);
+            }
+            proto::Message::PositionDelta(delta) => {
+                if client.positions.apply_delta(&delta) {
+                    report_markers(client);
+                }
             }
             _ => {}
         }

@@ -163,6 +163,28 @@ async fn positions_start_empty_and_check_the_region() {
 }
 
 #[tokio::test]
+async fn a_country_is_set_cleared_and_never_cleared_by_accident() {
+    let (core, _dir) = core().await;
+    let app = router(core, OPEN, Default::default());
+    let uri = format!("/v1/players/{}", Uuid::new_v4());
+    let country_uri = format!("{uri}/country");
+
+    let set = request("PUT", &country_uri, Some("c1"), Some(json!({"country": "north"})));
+    assert_eq!(send(&app, set).await.0, StatusCode::OK);
+    assert_eq!(send(&app, request("GET", &uri, None, None)).await.1["country"], "north");
+
+    let forgotten = request("PUT", &country_uri, Some("c2"), Some(json!({})));
+    assert_eq!(send(&app, forgotten).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let bad = request("PUT", &country_uri, Some("c3"), Some(json!({"country": "NOT VALID"})));
+    assert_eq!(send(&app, bad).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(send(&app, request("GET", &uri, None, None)).await.1["country"], "north");
+
+    let clear = request("PUT", &country_uri, Some("c4"), Some(json!({"country": null})));
+    assert_eq!(send(&app, clear).await.0, StatusCode::OK);
+    assert_eq!(send(&app, request("GET", &uri, None, None)).await.1["country"], Value::Null);
+}
+
+#[tokio::test]
 async fn a_flooding_client_gets_429() {
     let (core, _dir) = core().await;
     let app = router(core, RateLimit { per_second: 1, burst: 2 }, Default::default());

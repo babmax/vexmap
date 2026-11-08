@@ -8,12 +8,14 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use vexmap_core::Core;
+use vexmap_core::{Actor, ClientName, CommandContext, Core, CountryId, RegionId, RequestId, Role};
 use vexmap_link::{
-    FeedConfig, FeedError, FeedPosition, MAX_BATCH_PLAYERS, Mailbox, PlayerSample, decode_batch, decode_hello,
-    encode_batch, encode_hello, start_feed,
+    Delivery, DeliveryBox, FeedBoxes, FeedConfig, FeedError, FeedPosition, MAX_BATCH_PLAYERS, Mailbox, PlayerSample,
+    decode_batch, decode_deliveries, decode_hello, encode_batch, encode_deliveries, encode_hello, start_feed,
 };
+use vexmap_proto::{Message, parse_frame};
 use vexmap_sidecar::PositionStore;
+use vexmap_sidecar::fanout::run as run_fanout;
 use vexmap_sidecar::feed::serve;
 
 const OVERWORLD: &str = "minecraft:overworld";
@@ -165,6 +167,34 @@ fn settings_stay_on_loopback() {
     assert!(FeedConfig::parse(None, Some("a b")).is_err());
 }
 
+#[test]
+fn deliveries_survive_the_wire_and_refuse_garbage() {
+    let deliveries =
+        vec![Delivery { viewers: vec![1, 2], frame: vec![9, 8, 7] }, Delivery { viewers: vec![], frame: vec![] }];
+    let mut out = Vec::new();
+    encode_deliveries(&deliveries, &mut out);
+    let full = body(&out);
+    assert_eq!(decode_deliveries(full), Ok(deliveries));
+    for cut in 0..full.len() {
+        assert!(decode_deliveries(&full[..cut]).is_err(), "cut at {cut}");
+    }
+    assert_eq!(decode_deliveries(&[3, 0xff, 0xff]), Err(FeedError::TooManyPlayers));
+    assert_eq!(decode_deliveries(&[9]), Err(FeedError::BadHeader));
+}
+
+#[test]
+fn the_delivery_box_keeps_the_newest_and_hands_it_over_once() {
+    let deliveries = DeliveryBox::new();
+    let mut read = Vec::new();
+    assert!(!deliveries.try_take(&mut read));
+    deliveries.put(vec![Delivery { viewers: vec![1], frame: vec![1] }]);
+    deliveries.put(vec![Delivery { viewers: vec![2], frame: vec![2] }]);
+    assert!(deliveries.try_take(&mut read));
+    assert_eq!(read[0].viewers, [2]);
+    read.clear();
+    assert!(!deliveries.try_take(&mut read));
+}
+
 struct Sidecar {
     core: Core,
     store: Arc<PositionStore>,
@@ -180,6 +210,7 @@ async fn sidecar() -> Sidecar {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve(listener, core.clone(), store.clone()));
+    tokio::spawn(run_fanout(core.clone(), store.clone()));
     Sidecar { core, store, addr, _dir: dir }
 }
 
@@ -194,6 +225,10 @@ async fn eventually(what: &str, mut done: impl AsyncFnMut() -> bool) {
 fn feed_config(addr: SocketAddr, region: &str) -> FeedConfig {
     let parsed = FeedConfig::parse(Some(&addr.to_string()), Some(region)).unwrap();
     FeedConfig { retry: Duration::from_millis(20), poll: Duration::from_millis(5), ..parsed }
+}
+
+fn boxes(players: &'static Mailbox) -> FeedBoxes {
+    FeedBoxes { players, deliveries: Box::leak(Box::new(DeliveryBox::new())) }
 }
 
 fn leaked_mailbox() -> &'static Mailbox {
@@ -216,7 +251,7 @@ fn player_count(store: &PositionStore) -> usize {
 async fn the_thread_carries_positions_and_records_players() {
     let sidecar = sidecar().await;
     let mailbox = leaked_mailbox();
-    start_feed(feed_config(sidecar.addr, "eu-1"), mailbox).unwrap();
+    start_feed(feed_config(sidecar.addr, "eu-1"), boxes(mailbox)).unwrap();
     let uuid = Uuid::new_v4();
 
     let store = sidecar.store.clone();
@@ -331,6 +366,70 @@ async fn garbage_ends_the_connection_and_nothing_else() {
     assert!(sidecar.store.snapshot(None).is_empty());
 }
 
+fn system_context(request: &str) -> CommandContext {
+    CommandContext {
+        actor: Actor::System(ClientName::new("test").unwrap()),
+        region: RegionId::global(),
+        request_id: RequestId::new(request).unwrap(),
+    }
+}
+
+/// The newest `PositionKey` that reaches `viewer`, as a list of player ids, while the tick keeps publishing `players`.
+async fn next_key_for(
+    viewer: u128,
+    boxes: FeedBoxes,
+    players: &[PlayerSample],
+    wanted: impl Fn(&[u128]) -> bool,
+) -> Vec<u128> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < deadline, "no matching key frame reached the player");
+        boxes.players.publish(&mut players.to_vec(), true);
+        let mut read = Vec::new();
+        if boxes.deliveries.try_take(&mut read) {
+            for delivery in read.iter().filter(|delivery| delivery.viewers.contains(&viewer)) {
+                let (header, data) = parse_frame(&delivery.frame).unwrap();
+                if let Message::PositionKey(frame) = Message::decode(header.kind, data).unwrap() {
+                    let seen: Vec<u128> = frame.markers.iter().map(|marker| marker.uuid).collect();
+                    if wanted(&seen) {
+                        return seen;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_country_reaches_its_members_and_no_one_else() {
+    let sidecar = sidecar().await;
+    let boxes = FeedBoxes { players: leaked_mailbox(), deliveries: Box::leak(Box::new(DeliveryBox::new())) };
+    start_feed(feed_config(sidecar.addr, "a"), boxes).unwrap();
+    let (north_1, north_2, south, admin) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let north = CountryId::new("north").unwrap();
+    let core = &sidecar.core;
+    core.set_country(&system_context("1"), north_1, Some(north.clone())).await.unwrap();
+    core.set_country(&system_context("2"), north_2, Some(north.clone())).await.unwrap();
+    core.set_country(&system_context("3"), south, Some(CountryId::new("south").unwrap())).await.unwrap();
+    core.set_role(&system_context("4"), admin, Role::Admin, Default::default()).await.unwrap();
+    let players = [
+        sample(north_1.as_u128(), "A"),
+        sample(north_2.as_u128(), "B"),
+        sample(south.as_u128(), "C"),
+        sample(admin.as_u128(), "D"),
+    ];
+
+    let seen = next_key_for(north_1.as_u128(), boxes, &players, |seen| seen.len() >= 2).await;
+    assert!(seen.contains(&north_1.as_u128()) && seen.contains(&north_2.as_u128()));
+    assert_eq!(seen.len(), 2, "another country's member never reaches this frame");
+
+    // A role or country changed in the database applies without any reconnect, and clears what they saw.
+    core.set_country(&system_context("5"), north_1, None).await.unwrap();
+    let seen = next_key_for(north_1.as_u128(), boxes, &players, |seen| seen.is_empty()).await;
+    assert!(seen.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_thread_connects_once_the_sidecar_appears() {
     // Bind and drop: the port is free, and nothing listens yet.
@@ -339,7 +438,7 @@ async fn the_thread_connects_once_the_sidecar_appears() {
     drop(free);
 
     let mailbox = leaked_mailbox();
-    start_feed(feed_config(addr, "a"), mailbox).unwrap();
+    start_feed(feed_config(addr, "a"), boxes(mailbox)).unwrap();
     mailbox.publish(&mut vec![sample(1, "Alex")], true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 

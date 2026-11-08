@@ -16,8 +16,14 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 vexmap-core.workspace = true
 vexmap-link.workspace = true
+vexmap-proto.workspace = true
+
+[[bench]]
+name = "fanout"
+harness = false
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
 http-body-util.workspace = true
 tempfile.workspace = true
 tower.workspace = true

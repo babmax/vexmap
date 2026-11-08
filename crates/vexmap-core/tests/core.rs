@@ -7,7 +7,7 @@ use std::future::Future;
 use tempfile::TempDir;
 use uuid::Uuid;
 use vexmap_core::{
-    Actor, Category, ClientName, CommandContext, Core, CoreError, Module, Outcome, RegionId, RequestId, Role,
+    Actor, Category, ClientName, CommandContext, Core, CoreError, CountryId, Module, Outcome, RegionId, RequestId, Role,
 };
 
 /// Keeps a SQLite file alive for the test's duration.
@@ -236,6 +236,36 @@ async fn a_reader_pages_through_the_journal() {
         let page = core.journal(2, 2).await.unwrap();
         assert_eq!(page.iter().map(|entry| entry.seq).collect::<Vec<_>>(), [3, 4]);
         assert!(core.journal(5, 10).await.unwrap().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn country_membership_is_journaled_and_guarded() {
+    on_every_backend(|core| async move {
+        let id = Uuid::new_v4();
+        let north = CountryId::new("north").unwrap();
+        let set = core.set_country(&ctx(system(), "c1"), id, Some(north.clone())).await.unwrap();
+        assert!(matches!(set, Outcome::Applied { .. }));
+        assert_eq!(core.player(id).await.unwrap().unwrap().country, Some(north.clone()));
+        let again = core.set_country(&ctx(system(), "c2"), id, Some(north.clone())).await.unwrap();
+        assert_eq!(again, Outcome::Unchanged);
+
+        let moderator = make(&core, Role::Moderator, BTreeSet::from([Category::Wiki])).await;
+        let refused = core.set_country(&ctx(Actor::Player(moderator), "c3"), id, None).await;
+        assert!(matches!(refused, Err(CoreError::Forbidden(_))));
+
+        core.record_player(&ctx(system(), "c4"), id, "Alex").await.unwrap();
+        assert_eq!(core.player(id).await.unwrap().unwrap().country, Some(north), "a login keeps the country");
+
+        let admin = make(&core, Role::Admin, none()).await;
+        core.set_country(&ctx(Actor::Player(admin), "c5"), id, None).await.unwrap();
+        assert_eq!(core.player(id).await.unwrap().unwrap().country, None);
+        let last = core.journal(0, 100).await.unwrap().pop().unwrap();
+        assert_eq!(
+            (last.kind.as_str(), &last.after.unwrap()["country"]),
+            ("player.country_changed", &serde_json::Value::Null)
+        );
     })
     .await;
 }

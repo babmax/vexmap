@@ -1883,6 +1883,7 @@ dependencies = [
  "tokio",
  "uuid",
  "vexmap-core",
+ "vexmap-proto",
  "vexmap-sidecar",
 ]
 
@@ -1895,6 +1896,7 @@ name = "vexmap-sidecar"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "criterion",
  "http-body-util",
  "serde",
  "serde_json",
@@ -1906,6 +1908,7 @@ dependencies = [
  "uuid",
  "vexmap-core",
  "vexmap-link",
+ "vexmap-proto",
 ]
 
 [[package]]

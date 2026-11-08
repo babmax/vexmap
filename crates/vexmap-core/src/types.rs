@@ -43,6 +43,25 @@ impl RegionId {
     }
 }
 
+/// A country's identifier. Membership decides whose positions a player sees (Phase 3).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct CountryId(String);
+
+impl CountryId {
+    pub fn new(value: &str) -> Result<Self, CoreError> {
+        if is_slug(value, 32) {
+            Ok(CountryId(value.to_owned()))
+        } else {
+            Err(CoreError::Invalid("country must be 1-32 characters of a-z, 0-9, - and _".to_owned()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The name of a local mod calling the API.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientName(String);

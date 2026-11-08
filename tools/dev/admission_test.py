@@ -7,7 +7,7 @@
 3. Phase 3: each server takes its region's modules from the sidecar (tiles on in a, off in b), and when the sidecar dies
    a server keeps its last modules and still admits players.
 4. Phase 3: an admitted player reaches the sidecar: recorded in the database, located in the region they are on and
-   gone from the region they left.
+   gone from the region they left. Joining a country brings the client its markers, leaving clears them.
 
 Local only, everything under .deps/run/admission. Reuses the S5 harness (two servers, Velocity, horizon-ctl).
 
@@ -117,6 +117,19 @@ def check_feed(results):
     player = on_b[0]
     results["feed_position"] = {key: player[key] for key in ("dimension", "x", "y", "z", "yaw")}
     results["feed_recorded_name"] = api("GET", f"/v1/players/{player['uuid']}")["name"] == player["name"]
+    check_markers(results, player["uuid"])
+
+
+def check_markers(results, uuid):
+    """No country, no markers. Joining one brings the client its own marker, and leaving clears the map."""
+    time.sleep(2)
+    results["client_markers_without_country"] = len(lines(CLIENT_LOG, "positions: 1 markers")) > 0
+    one = len(lines(CLIENT_LOG, "positions: 1 markers"))
+    zero = len(lines(CLIENT_LOG, "positions: 0 markers"))
+    api("PUT", f"/v1/players/{uuid}/country", "bench-4", {"country": "north"})
+    results["client_marker_after_joining_country_s"] = wait_for(CLIENT_LOG, "positions: 1 markers", one, 10)
+    api("PUT", f"/v1/players/{uuid}/country", "bench-5", {"country": None})
+    results["client_cleared_after_leaving_country_s"] = wait_for(CLIENT_LOG, "positions: 0 markers", zero, 10)
 
 
 def launch(game):
@@ -228,7 +241,9 @@ def main():
                   and results.get("region_a_mask_without_sidecar") == REALTIME_BIT | TILES_BIT
                   and results.get("sidecar_loss_logged")
                   and results.get("feed_regions") == {"a": 0, "b": 1}
-                  and results.get("feed_recorded_name") is True)
+                  and results.get("feed_recorded_name") is True
+                  and results.get("client_marker_after_joining_country_s") is not None
+                  and results.get("client_cleared_after_leaving_country_s") is not None)
     results["passed"] = passed
     (s5.RUN / "results.json").write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(results, indent=1, ensure_ascii=False))

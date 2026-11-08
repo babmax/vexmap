@@ -9,15 +9,20 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 use vexmap_core::{Actor, ClientName, CommandContext, Core, RegionId, RequestId};
 use vexmap_link::{FeedBatch, FeedPlayer, MAX_FEED_MESSAGE, decode_batch, decode_hello};
+use vexmap_proto::Marker;
+
+use crate::fanout::Online;
 
 const MAX_CONNECTIONS: usize = 256;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A server sends every 500 ms even when empty, so this much silence means it has hung.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Batches closer together than this are dropped: the rate limit of this channel, four times the real rate.
@@ -47,7 +52,9 @@ struct Region {
     connection: u64,
     seq: u64,
     received: Instant,
-    players: Vec<PlayerPosition>,
+    players: Vec<FeedPlayer>,
+    /// Newest wins: a region that reads slowly loses stale frames instead of queueing them.
+    outbox: watch::Sender<Arc<Vec<u8>>>,
 }
 
 /// The newest list of each connected region. A region disappears when its server does.
@@ -57,16 +64,55 @@ pub struct PositionStore {
 }
 
 impl PositionStore {
-    /// `connection` now speaks for `region`, replacing an earlier connection after a restart.
-    fn claim(&self, region: &str, connection: u64) {
+    /// `connection` now speaks for `region`, replacing an earlier connection after a restart. Returns what to send it.
+    fn claim(&self, region: &str, connection: u64) -> watch::Receiver<Arc<Vec<u8>>> {
+        let (outbox, receiver) = watch::channel(Arc::new(Vec::new()));
         if let Ok(mut regions) = self.regions.write() {
-            let entry = Region { connection, seq: 0, received: Instant::now(), players: Vec::new() };
+            let entry = Region { connection, seq: 0, received: Instant::now(), players: Vec::new(), outbox };
             regions.insert(region.to_owned(), entry);
+        }
+        receiver
+    }
+
+    /// Hands an encoded message to the region's connection.
+    pub fn deliver(&self, region: &str, message: Vec<u8>) {
+        if let Ok(regions) = self.regions.read()
+            && let Some(entry) = regions.get(region)
+        {
+            entry.outbox.send_replace(Arc::new(message));
         }
     }
 
+    /// Everyone with a known position, sorted by player. Crossing between regions a player can be on two lists for one
+    /// batch, and the newer list wins.
+    pub fn online(&self) -> Vec<Online> {
+        let Ok(regions) = self.regions.read() else { return Vec::new() };
+        let mut newest: HashMap<u128, (Instant, Online)> = HashMap::new();
+        for (name, entry) in regions.iter() {
+            for player in &entry.players {
+                let Some(place) = &player.position else { continue };
+                if newest.get(&player.uuid).is_some_and(|(received, _)| *received >= entry.received) {
+                    continue;
+                }
+                let marker = Marker {
+                    uuid: player.uuid,
+                    name: player.name.clone(),
+                    dimension: place.dimension.clone(),
+                    x: place.x,
+                    y: place.y,
+                    z: place.z,
+                    yaw: place.yaw,
+                };
+                newest.insert(player.uuid, (entry.received, Online { region: name.clone(), marker }));
+            }
+        }
+        let mut online: Vec<Online> = newest.into_values().map(|(_, online)| online).collect();
+        online.sort_by_key(|player| player.marker.uuid);
+        online
+    }
+
     /// `false` when a newer connection has taken the region over.
-    fn update(&self, region: &str, connection: u64, seq: u64, players: Vec<PlayerPosition>) -> bool {
+    fn update(&self, region: &str, connection: u64, seq: u64, players: Vec<FeedPlayer>) -> bool {
         let Ok(mut regions) = self.regions.write() else { return false };
         match regions.get_mut(region) {
             Some(entry) if entry.connection == connection => {
@@ -97,7 +143,7 @@ impl PositionStore {
                 region: name.clone(),
                 seq: entry.seq,
                 age_ms: entry.received.elapsed().as_millis() as u64,
-                players: entry.players.clone(),
+                players: entry.players.iter().filter_map(position_of).collect(),
             })
             .collect();
         out.sort_by(|a, b| a.region.cmp(&b.region));
@@ -146,7 +192,7 @@ pub async fn serve(listener: TcpListener, core: Core, store: Arc<PositionStore>)
     }
 }
 
-async fn read_message(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<(), String> {
+async fn read_message(stream: &mut (impl AsyncRead + Unpin), buffer: &mut Vec<u8>) -> Result<(), String> {
     let length = timeout(READ_TIMEOUT, stream.read_u32_le())
         .await
         .map_err(|_| "silent for too long".to_owned())?
@@ -162,18 +208,31 @@ async fn read_message(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<()
     Ok(())
 }
 
-async fn handle(mut stream: TcpStream, connection: u64, core: Core, store: Arc<PositionStore>) {
+/// A write that times out may have stopped mid-message, so it ends the connection rather than corrupting the framing.
+async fn write_deliveries(mut stream: OwnedWriteHalf, mut outbox: watch::Receiver<Arc<Vec<u8>>>) {
+    while outbox.changed().await.is_ok() {
+        let message = outbox.borrow_and_update().clone();
+        if !matches!(timeout(WRITE_TIMEOUT, stream.write_all(&message)).await, Ok(Ok(()))) {
+            return;
+        }
+    }
+}
+
+async fn handle(stream: TcpStream, connection: u64, core: Core, store: Arc<PositionStore>) {
+    let (mut reader, writer) = stream.into_split();
     let mut buffer = Vec::new();
-    let region = match read_message(&mut stream, &mut buffer).await.and_then(|()| hello_region(&buffer)) {
+    let region = match read_message(&mut reader, &mut buffer).await.and_then(|()| hello_region(&buffer)) {
         Ok(region) => region,
         Err(error) => {
             tracing::warn!("feed: refused a connection: {error}");
             return;
         }
     };
-    store.claim(region.as_str(), connection);
+    let outbox = store.claim(region.as_str(), connection);
+    let writing = tokio::spawn(write_deliveries(writer, outbox));
     tracing::info!(region = region.as_str(), "feed: region connected");
-    let reason = run_connection(&mut stream, &region, connection, &core, &store, &mut buffer).await;
+    let reason = run_connection(&mut reader, &region, connection, &core, &store, &mut buffer).await;
+    writing.abort();
     store.release(region.as_str(), connection);
     tracing::info!(region = region.as_str(), "feed: region gone: {reason}");
 }
@@ -185,7 +244,7 @@ fn hello_region(body: &[u8]) -> Result<RegionId, String> {
 
 /// Returns why the connection ended.
 async fn run_connection(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     region: &RegionId,
     connection: u64,
     core: &Core,
@@ -207,7 +266,7 @@ async fn run_connection(
             continue;
         }
         last = Some(now);
-        let players = batch.players.iter().filter_map(position_of).collect();
+        let players = batch.players.iter().filter(|player| player.position.is_some()).cloned().collect();
         if !store.update(region.as_str(), connection, batch.seq, players) {
             return "replaced by a newer connection".to_owned();
         }
