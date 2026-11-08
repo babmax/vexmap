@@ -131,6 +131,8 @@ const FEED_VERSION: u8 = 1;
 const KIND_HELLO: u8 = 1;
 const KIND_BATCH: u8 = 2;
 const KIND_DELIVERIES: u8 = 3;
+const KIND_TILE_REQUESTS: u8 = 4;
+const KIND_TILE_DELIVERIES: u8 = 5;
 const FLAG_POSITIONS: u8 = 1;
 
 /// One player as the tick saw them.
@@ -454,10 +456,151 @@ impl DeliveryBox {
     }
 }
 
+// ---------------------------------------------------------------- tiles
+//
+// Unlike positions, a tile cannot stand in for another, so these are queues and not "newest wins". Both are bounded:
+// past the bound a request or a tile is dropped and the client, which never saw an answer, asks again.
+
+/// How many requests wait for the feed thread. A tick adds at most one per player per 100 ms.
+const MAX_QUEUED_TILE_REQUESTS: usize = 512;
+/// How many bytes of tiles wait for the tick.
+const MAX_QUEUED_TILE_BYTES: usize = 8 << 20;
+const MAX_TILE_REQUEST_BODY: usize = 1024;
+
+/// A client's raw `TileWants`. The mod does not read it: the sidecar validates untrusted input in one place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileRequest {
+    pub viewer: u128,
+    pub body: Vec<u8>,
+}
+
+pub struct TileRequestBox {
+    queue: Mutex<Vec<TileRequest>>,
+}
+
+impl TileRequestBox {
+    // `const` for the same reason as `Mailbox::new`.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        TileRequestBox { queue: Mutex::new(Vec::new()) }
+    }
+
+    /// For the tick: never waits. `false` means the request was dropped, and the client will repeat it.
+    pub fn try_push(&self, request: TileRequest) -> bool {
+        if request.body.len() > MAX_TILE_REQUEST_BODY {
+            return false;
+        }
+        let Ok(mut queue) = self.queue.try_lock() else { return false };
+        if queue.len() >= MAX_QUEUED_TILE_REQUESTS {
+            return false;
+        }
+        queue.push(request);
+        true
+    }
+
+    fn take(&self, into: &mut Vec<TileRequest>) {
+        into.clear();
+        if let Ok(mut queue) = self.queue.lock() {
+            std::mem::swap(&mut *queue, into);
+        }
+    }
+}
+
+pub struct TileDeliveryBox {
+    queue: Mutex<(std::collections::VecDeque<Delivery>, usize)>,
+}
+
+impl TileDeliveryBox {
+    // `const` for the same reason as `Mailbox::new`.
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        TileDeliveryBox { queue: Mutex::new((std::collections::VecDeque::new(), 0)) }
+    }
+
+    pub fn put(&self, deliveries: Vec<Delivery>) {
+        let Ok(mut guard) = self.queue.lock() else { return };
+        let (queue, bytes) = &mut *guard;
+        for delivery in deliveries {
+            if *bytes + delivery.frame.len() <= MAX_QUEUED_TILE_BYTES {
+                *bytes += delivery.frame.len();
+                queue.push_back(delivery);
+            }
+        }
+    }
+
+    /// For the tick: never waits, and hands over at most about `max_bytes`, so a burst is spread over several ticks.
+    pub fn try_take(&self, into: &mut Vec<Delivery>, max_bytes: usize) -> bool {
+        let Ok(mut guard) = self.queue.try_lock() else { return false };
+        let (queue, bytes) = &mut *guard;
+        let mut taken = 0;
+        while taken < max_bytes {
+            let Some(delivery) = queue.pop_front() else { break };
+            taken += delivery.frame.len();
+            *bytes -= delivery.frame.len();
+            into.push(delivery);
+        }
+        taken > 0
+    }
+}
+
+/// With its length prefix. Oversized requests are left out.
+pub fn encode_tile_requests(requests: &[TileRequest], out: &mut Vec<u8>) {
+    let start = begin_message(out, KIND_TILE_REQUESTS);
+    let requests = &requests[..requests.len().min(MAX_QUEUED_TILE_REQUESTS)];
+    out.extend_from_slice(&(requests.len() as u16).to_le_bytes());
+    for request in requests {
+        out.extend_from_slice(&request.viewer.to_le_bytes());
+        let body = request.body.get(..MAX_TILE_REQUEST_BODY).unwrap_or(&request.body);
+        out.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        out.extend_from_slice(body);
+    }
+    finish_message(out, start);
+}
+
+/// Without the length prefix. Bad bytes are an error, never a panic.
+#[allow(dead_code)]
+pub fn decode_tile_requests(body: &[u8]) -> Result<Vec<TileRequest>, FeedError> {
+    let mut reader = FeedReader { bytes: body };
+    if reader.u8()? != KIND_TILE_REQUESTS {
+        return Err(FeedError::BadHeader);
+    }
+    let count = usize::from(u16::from_le_bytes(reader.array()?));
+    if count > MAX_QUEUED_TILE_REQUESTS {
+        return Err(FeedError::TooManyPlayers);
+    }
+    let mut requests = Vec::with_capacity(count);
+    for _ in 0..count {
+        let viewer = u128::from_le_bytes(reader.array()?);
+        let length = usize::from(u16::from_le_bytes(reader.array()?));
+        if length > MAX_TILE_REQUEST_BODY {
+            return Err(FeedError::BadString);
+        }
+        requests.push(TileRequest { viewer, body: reader.take(length)?.to_vec() });
+    }
+    reader.end()?;
+    Ok(requests)
+}
+
+/// Whether a message read from the feed (without its length prefix) is a list of tile requests.
+#[allow(dead_code)]
+pub fn is_tile_requests(body: &[u8]) -> bool {
+    body.first() == Some(&KIND_TILE_REQUESTS)
+}
+
+/// Tile frames for the region, with their length prefix.
+#[allow(dead_code)]
+pub fn encode_tile_deliveries(deliveries: &[Delivery], out: &mut Vec<u8>) {
+    encode_deliveries_as(KIND_TILE_DELIVERIES, deliveries, out);
+}
+
 /// With its length prefix. Addressees and frames past the format's limits are left out.
 #[allow(dead_code)]
 pub fn encode_deliveries(deliveries: &[Delivery], out: &mut Vec<u8>) {
-    let start = begin_message(out, KIND_DELIVERIES);
+    encode_deliveries_as(KIND_DELIVERIES, deliveries, out);
+}
+
+fn encode_deliveries_as(kind: u8, deliveries: &[Delivery], out: &mut Vec<u8>) {
+    let start = begin_message(out, kind);
     let count = deliveries.len().min(MAX_DELIVERIES);
     out.extend_from_slice(&(count as u16).to_le_bytes());
     for delivery in &deliveries[..count] {
@@ -475,7 +618,7 @@ pub fn encode_deliveries(deliveries: &[Delivery], out: &mut Vec<u8>) {
 /// Without the length prefix. Bad bytes are an error, never a panic.
 pub fn decode_deliveries(body: &[u8]) -> Result<Vec<Delivery>, FeedError> {
     let mut reader = FeedReader { bytes: body };
-    if reader.u8()? != KIND_DELIVERIES {
+    if !matches!(reader.u8()?, KIND_DELIVERIES | KIND_TILE_DELIVERIES) {
         return Err(FeedError::BadHeader);
     }
     let count = usize::from(u16::from_le_bytes(reader.array()?));
@@ -500,7 +643,7 @@ pub fn decode_deliveries(body: &[u8]) -> Result<Vec<Delivery>, FeedError> {
 }
 
 /// Reads until the socket ends or lies. A bad message ends the connection, so framing can never drift.
-fn read_deliveries(mut stream: &TcpStream, deliveries: &DeliveryBox) {
+fn read_deliveries(mut stream: &TcpStream, deliveries: &DeliveryBox, tiles: &TileDeliveryBox) {
     let mut body = Vec::new();
     loop {
         let mut length = [0; 4];
@@ -516,6 +659,7 @@ fn read_deliveries(mut stream: &TcpStream, deliveries: &DeliveryBox) {
             return;
         }
         match decode_deliveries(&body) {
+            Ok(decoded) if body.first() == Some(&KIND_TILE_DELIVERIES) => tiles.put(decoded),
             Ok(decoded) => deliveries.put(decoded),
             Err(_) => return,
         }
@@ -527,15 +671,24 @@ fn read_deliveries(mut stream: &TcpStream, deliveries: &DeliveryBox) {
 pub struct FeedBoxes {
     pub players: &'static Mailbox,
     pub deliveries: &'static DeliveryBox,
+    pub tile_requests: &'static TileRequestBox,
+    pub tiles: &'static TileDeliveryBox,
 }
 
-fn write_batches(mut stream: &TcpStream, config: &FeedConfig, players: &Mailbox) -> std::io::Result<()> {
+fn write_batches(mut stream: &TcpStream, config: &FeedConfig, boxes: FeedBoxes) -> std::io::Result<()> {
     let mut batch = Vec::new();
+    let mut requests = Vec::new();
     let mut out = Vec::new();
     loop {
-        if let Some((seq, positions)) = players.take(&mut batch) {
+        if let Some((seq, positions)) = boxes.players.take(&mut batch) {
             out.clear();
             encode_batch(seq, positions, &batch, &mut out);
+            stream.write_all(&out)?;
+        }
+        boxes.tile_requests.take(&mut requests);
+        if !requests.is_empty() {
+            out.clear();
+            encode_tile_requests(&requests, &mut out);
             stream.write_all(&out)?;
         }
         std::thread::sleep(config.poll);
@@ -556,11 +709,11 @@ fn pump(config: &FeedConfig, boxes: FeedBoxes, connected: &mut bool) -> std::io:
     let stream = &stream;
     std::thread::scope(|scope| {
         std::thread::Builder::new().name("vexmap-feed-read".to_owned()).spawn_scoped(scope, move || {
-            read_deliveries(stream, boxes.deliveries);
+            read_deliveries(stream, boxes.deliveries, boxes.tiles);
             // Wakes the writer: whichever direction fails first ends the connection.
             let _ = stream.shutdown(std::net::Shutdown::Both);
         })?;
-        let result = write_batches(stream, config, boxes.players);
+        let result = write_batches(stream, config, boxes);
         let _ = stream.shutdown(std::net::Shutdown::Both);
         result
     })

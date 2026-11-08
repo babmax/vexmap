@@ -1,0 +1,20 @@
+[package]
+name = "vexmap-tiler"
+description = "VexMap's tiler: reads Horizon's region files and renders the schematic map's tile pyramid."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The same revision as mods/vexmap/compatibility.json (ADR-004). Bump them together.
+horizon-world = { git = "https://github.com/horizon-rust/horizon", rev = "6560641ba51a452f6bc2407baa4eb1b3be517ca8" }
+vexmap-proto.workspace = true
+
+[[bench]]
+name = "tiler"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+tempfile.workspace = true

@@ -11,12 +11,15 @@ use uuid::Uuid;
 use vexmap_core::{Actor, ClientName, CommandContext, Core, CountryId, RegionId, RequestId, Role};
 use vexmap_link::{
     Delivery, DeliveryBox, FeedBoxes, FeedConfig, FeedError, FeedPosition, MAX_BATCH_PLAYERS, Mailbox, PlayerSample,
-    decode_batch, decode_deliveries, decode_hello, encode_batch, encode_deliveries, encode_hello, start_feed,
+    TileDeliveryBox, TileRequest, TileRequestBox, decode_batch, decode_deliveries, decode_hello, decode_tile_requests,
+    encode_batch, encode_deliveries, encode_hello, encode_tile_requests, is_tile_requests, start_feed,
 };
-use vexmap_proto::{Message, parse_frame};
+use vexmap_proto::{Message, TILE_AREA, TileId, TileWant, decode_tile, parse_frame};
 use vexmap_sidecar::PositionStore;
 use vexmap_sidecar::fanout::run as run_fanout;
 use vexmap_sidecar::feed::serve;
+use vexmap_sidecar::tiles::{TileConfig, start as start_tiles};
+use vexmap_tiler::store::TileStore;
 
 const OVERWORLD: &str = "minecraft:overworld";
 
@@ -209,7 +212,7 @@ async fn sidecar() -> Sidecar {
     let store = Arc::new(PositionStore::default());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, core.clone(), store.clone()));
+    tokio::spawn(serve(listener, core.clone(), store.clone(), tokio::sync::mpsc::channel(1).0));
     tokio::spawn(run_fanout(core.clone(), store.clone()));
     Sidecar { core, store, addr, _dir: dir }
 }
@@ -228,7 +231,12 @@ fn feed_config(addr: SocketAddr, region: &str) -> FeedConfig {
 }
 
 fn boxes(players: &'static Mailbox) -> FeedBoxes {
-    FeedBoxes { players, deliveries: Box::leak(Box::new(DeliveryBox::new())) }
+    FeedBoxes {
+        players,
+        deliveries: Box::leak(Box::new(DeliveryBox::new())),
+        tile_requests: Box::leak(Box::new(TileRequestBox::new())),
+        tiles: Box::leak(Box::new(TileDeliveryBox::new())),
+    }
 }
 
 fn leaked_mailbox() -> &'static Mailbox {
@@ -406,7 +414,7 @@ async fn next_key_for(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_country_reaches_its_members_and_no_one_else() {
     let sidecar = sidecar().await;
-    let boxes = FeedBoxes { players: leaked_mailbox(), deliveries: Box::leak(Box::new(DeliveryBox::new())) };
+    let boxes = boxes(leaked_mailbox());
     start_feed(feed_config(sidecar.addr, "a"), boxes).unwrap();
     let (north_1, north_2, south, admin) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let north = CountryId::new("north").unwrap();
@@ -433,6 +441,71 @@ async fn a_country_reaches_its_members_and_no_one_else() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_tile_request_crosses_the_real_socket_and_the_tile_comes_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display()).replace('\\', "/");
+    let core = Core::connect(&url).await.unwrap();
+    let store = Arc::new(PositionStore::default());
+    let id = TileId { level: 0, x: 3, z: -1 };
+    let mut pixels = Box::new([0_u8; TILE_AREA]);
+    pixels.fill(0x82);
+    TileStore::new(dir.path().join("tiles")).write(OVERWORLD, id, 11, &pixels).unwrap();
+    let config = TileConfig { worlds: Vec::new(), store: dir.path().join("tiles") };
+    let requests = start_tiles(config, store.clone()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, core.clone(), store.clone(), requests));
+    let boxes = boxes(leaked_mailbox());
+    start_feed(feed_config(addr, "a"), boxes).unwrap();
+    eventually("the region connected", async || !store.snapshot(None).is_empty()).await;
+
+    let viewer = 77_u128;
+    let body = Message::TileWants { dimension: OVERWORLD.into(), wants: vec![TileWant { id, version: 0 }] }.body();
+    assert!(boxes.tile_requests.try_push(TileRequest { viewer, body }));
+
+    let mut received = Vec::new();
+    eventually("the tile arrived", async || boxes.tiles.try_take(&mut received, 1 << 20)).await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].viewers, vec![viewer]);
+    let (header, body) = parse_frame(&received[0].frame).unwrap();
+    let Message::Tile { id: got, version, pixels: encoded, .. } = Message::decode(header.kind, body).unwrap() else {
+        panic!("a tile");
+    };
+    assert_eq!((got, version), (id, 11));
+    let mut decoded = Box::new([0_u8; TILE_AREA]);
+    decode_tile(&encoded, &mut decoded).unwrap();
+    assert_eq!(decoded, pixels);
+}
+
+#[test]
+fn the_tile_queues_are_bounded_and_hand_out_a_tick_at_a_time() {
+    let tiles = TileDeliveryBox::new();
+    let delivery = |size| Delivery { viewers: vec![1], frame: vec![0; size] };
+    tiles.put((0..10).map(|_| delivery(1 << 20)).collect());
+    let mut out = Vec::new();
+    assert!(tiles.try_take(&mut out, 1 << 20));
+    assert_eq!(out.len(), 1);
+    out.clear();
+    assert!(tiles.try_take(&mut out, usize::MAX));
+    assert_eq!(out.len(), 7, "8 MiB is the bound: the two tiles past it were dropped");
+    let requests = TileRequestBox::new();
+    let request = TileRequest { viewer: 1, body: vec![0; 10] };
+    assert!((0..512).all(|_| requests.try_push(request.clone())));
+    assert!(!requests.try_push(request), "a full queue drops instead of growing");
+    assert!(!requests.try_push(TileRequest { viewer: 1, body: vec![0; 2000] }), "nor does it take an oversized body");
+}
+
+#[test]
+fn tile_requests_survive_the_wire_and_garbage_does_not() {
+    let requests = vec![TileRequest { viewer: 5, body: vec![1, 2, 3] }, TileRequest { viewer: 6, body: Vec::new() }];
+    let mut bytes = Vec::new();
+    encode_tile_requests(&requests, &mut bytes);
+    assert!(is_tile_requests(&bytes[4..]));
+    assert_eq!(decode_tile_requests(&bytes[4..]).unwrap(), requests);
+    assert_eq!(decode_tile_requests(&bytes[4..bytes.len() - 1]), Err(FeedError::Truncated));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_thread_connects_once_the_sidecar_appears() {
     // Bind and drop: the port is free, and nothing listens yet.
     let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -449,7 +522,7 @@ async fn the_thread_connects_once_the_sidecar_appears() {
     let core = Core::connect(&url).await.unwrap();
     let store = Arc::new(PositionStore::default());
     let listener = TcpListener::bind(addr).await.unwrap();
-    tokio::spawn(serve(listener, core, store.clone()));
+    tokio::spawn(serve(listener, core, store.clone(), tokio::sync::mpsc::channel(1).0));
 
     eventually("the newest batch arrives", async || player_count(&store) == 1).await;
 }

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 pub const CHANNEL: &str = "vexmap:main";
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 pub const FRAME_VERSION: u8 = 1;
 pub const MAGIC: [u8; 2] = *b"VM";
 pub const HEADER_LEN: usize = 12;
@@ -25,6 +25,15 @@ const MAX_DIMENSION: usize = 64;
 const MAX_DIMENSIONS: usize = 255;
 /// A client reads a handful of streams, so this only bounds what a confused server could make it hold.
 pub const MAX_STREAMS: usize = 64;
+/// A tile is this many pixels on a side.
+pub const TILE_SIZE: usize = 256;
+pub const TILE_AREA: usize = TILE_SIZE * TILE_SIZE;
+/// At level 12 one tile spans 1 048 576 blocks, past any map radius we accept.
+pub const MAX_TILE_LEVEL: u8 = 12;
+/// How many tiles one request may name. The client keeps few in flight, so more is a confused or hostile client.
+pub const MAX_TILE_WANTS: usize = 32;
+/// PackBits on noise grows by 1/128, so a real tile cannot pass this. A bound for the decoder.
+pub const MAX_ENCODED_TILE: usize = TILE_AREA + TILE_AREA / 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -39,6 +48,9 @@ pub enum Kind {
     PositionStreams = 9,
     PositionClusters = 10,
     OpenMap = 11,
+    TileWants = 12,
+    Tile = 13,
+    WorldDisc = 14,
 }
 
 impl Kind {
@@ -55,6 +67,9 @@ impl Kind {
             9 => Kind::PositionStreams,
             10 => Kind::PositionClusters,
             11 => Kind::OpenMap,
+            12 => Kind::TileWants,
+            13 => Kind::Tile,
+            14 => Kind::WorldDisc,
             _ => return None,
         })
     }
@@ -152,6 +167,127 @@ pub enum Message {
     PositionClusters(Vec<Cluster>),
     /// The player ran `/map`. Commands live on the server, the screen on the client.
     OpenMap,
+    /// Client to server: tiles the view needs, with the version the client already holds.
+    TileWants {
+        dimension: String,
+        wants: Vec<TileWant>,
+    },
+    /// Server to client. Version 0 with no pixels: nothing has been generated there, stop asking.
+    Tile {
+        dimension: String,
+        id: TileId,
+        version: u32,
+        pixels: Vec<u8>,
+    },
+    /// The circle the map is cut to in one dimension, in blocks.
+    WorldDisc {
+        dimension: String,
+        center_x: i32,
+        center_z: i32,
+        radius: u32,
+    },
+}
+
+/// A square of the world in the tile quadtree: `256 << level` blocks on a side, at `(x, z)` times that. Tiles live in
+/// world coordinates, so moving the world border never redraws one (the projection is applied when drawing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TileId {
+    pub level: u8,
+    pub x: i32,
+    pub z: i32,
+}
+
+impl TileId {
+    /// The tile's side in blocks.
+    pub fn span(self) -> i64 {
+        (TILE_SIZE as i64) << self.level
+    }
+
+    pub fn containing(level: u8, world_x: f64, world_z: f64) -> TileId {
+        let span = ((TILE_SIZE as i64) << level) as f64;
+        TileId { level, x: (world_x / span).floor() as i32, z: (world_z / span).floor() as i32 }
+    }
+
+    /// `None` at the top of the pyramid.
+    pub fn parent(self) -> Option<TileId> {
+        (self.level < MAX_TILE_LEVEL).then(|| TileId { level: self.level + 1, x: self.x >> 1, z: self.z >> 1 })
+    }
+
+    pub fn children(self) -> Option<[TileId; 4]> {
+        let level = self.level.checked_sub(1)?;
+        let (x, z) = (self.x.checked_mul(2)?, self.z.checked_mul(2)?);
+        Some([(x, z), (x + 1, z), (x, z + 1), (x + 1, z + 1)].map(|(x, z)| TileId { level, x, z }))
+    }
+
+    /// Whether the numbers can be a tile at all: untrusted input goes through this first.
+    pub fn is_valid(self) -> bool {
+        if self.level > MAX_TILE_LEVEL {
+            return false;
+        }
+        let limit = 1_i32 << (MAX_TILE_LEVEL + 4 - self.level);
+        (-limit..limit).contains(&self.x) && (-limit..limit).contains(&self.z)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileWant {
+    pub id: TileId,
+    /// 0 when the client holds nothing.
+    pub version: u32,
+}
+
+/// PackBits over a tile's pixels. Control byte `n`: `0..=127` is `n + 1` literal bytes, `128..=255` is `n - 125` repeats
+/// of the next byte. Our own code, because the mod cannot add a codec to Horizon's lockfile.
+pub fn encode_tile(pixels: &[u8], out: &mut Vec<u8>) {
+    fn flush(pixels: &[u8], at: usize, literals: &mut usize, out: &mut Vec<u8>) {
+        let mut start = at - *literals;
+        while start < at {
+            let count = (at - start).min(128);
+            out.push((count - 1) as u8);
+            out.extend_from_slice(&pixels[start..start + count]);
+            start += count;
+        }
+        *literals = 0;
+    }
+    let mut at = 0;
+    let mut literals = 0;
+    while at < pixels.len() {
+        let value = pixels[at];
+        let run = pixels[at..].iter().take(130).take_while(|pixel| **pixel == value).count();
+        if run >= 3 {
+            flush(pixels, at, &mut literals, out);
+            out.push((run + 125) as u8);
+            out.push(value);
+            at += run;
+        } else {
+            at += 1;
+            literals += 1;
+        }
+    }
+    flush(pixels, at, &mut literals, out);
+}
+
+/// Exactly `TILE_AREA` pixels into `out`, or an error. Runs on untrusted bytes, so it can neither panic nor grow.
+pub fn decode_tile(encoded: &[u8], out: &mut [u8; TILE_AREA]) -> Result<(), DecodeError> {
+    let (mut read, mut write) = (0, 0);
+    while read < encoded.len() {
+        let control = encoded[read];
+        read += 1;
+        if control < 128 {
+            let count = usize::from(control) + 1;
+            let source = encoded.get(read..read + count).ok_or(DecodeError::Truncated)?;
+            out.get_mut(write..write + count).ok_or(DecodeError::TooMany)?.copy_from_slice(source);
+            read += count;
+            write += count;
+        } else {
+            let count = usize::from(control) - 125;
+            let value = *encoded.get(read).ok_or(DecodeError::Truncated)?;
+            out.get_mut(write..write + count).ok_or(DecodeError::TooMany)?.fill(value);
+            read += 1;
+            write += count;
+        }
+    }
+    if write == TILE_AREA { Ok(()) } else { Err(DecodeError::Truncated) }
 }
 
 /// A player on the map. Coordinates in 1/8 of a block, `yaw` in 1/256 of a turn.
@@ -230,6 +366,9 @@ impl Message {
             Message::PositionStreams(_) => Kind::PositionStreams,
             Message::PositionClusters(_) => Kind::PositionClusters,
             Message::OpenMap => Kind::OpenMap,
+            Message::TileWants { .. } => Kind::TileWants,
+            Message::Tile { .. } => Kind::Tile,
+            Message::WorldDisc { .. } => Kind::WorldDisc,
         }
     }
 
@@ -249,6 +388,26 @@ impl Message {
             Message::Reject { reason } => put_str(&mut out, reason, MAX_REASON),
             Message::Ping(stamp) | Message::Pong(stamp) => out.extend_from_slice(&stamp.to_le_bytes()),
             Message::Probe | Message::OpenMap => {}
+            Message::TileWants { dimension, wants } => {
+                put_short(&mut out, truncate_dimension(dimension));
+                out.push(wants.len().min(MAX_TILE_WANTS) as u8);
+                for want in wants.iter().take(MAX_TILE_WANTS) {
+                    put_tile_id(&mut out, want.id);
+                    out.extend_from_slice(&want.version.to_le_bytes());
+                }
+            }
+            Message::Tile { dimension, id, version, pixels } => {
+                put_short(&mut out, truncate_dimension(dimension));
+                put_tile_id(&mut out, *id);
+                out.extend_from_slice(&version.to_le_bytes());
+                out.extend_from_slice(pixels);
+            }
+            Message::WorldDisc { dimension, center_x, center_z, radius } => {
+                put_short(&mut out, truncate_dimension(dimension));
+                out.extend_from_slice(&center_x.to_le_bytes());
+                out.extend_from_slice(&center_z.to_le_bytes());
+                out.extend_from_slice(&radius.to_le_bytes());
+            }
             Message::PositionKey(frame) => {
                 out.extend_from_slice(&frame.stream.to_le_bytes());
                 out.extend_from_slice(&frame.key.to_le_bytes());
@@ -299,6 +458,32 @@ impl Message {
             Kind::Pong => Message::Pong(reader.u64()?),
             Kind::Probe => Message::Probe,
             Kind::OpenMap => Message::OpenMap,
+            Kind::TileWants => {
+                let dimension = reader.short(MAX_DIMENSION)?;
+                let count = usize::from(reader.u8()?);
+                if count > MAX_TILE_WANTS {
+                    return Err(DecodeError::TooMany);
+                }
+                let mut wants = Vec::with_capacity(count);
+                for _ in 0..count {
+                    wants.push(TileWant { id: reader.tile_id()?, version: reader.u32()? });
+                }
+                Message::TileWants { dimension, wants }
+            }
+            Kind::Tile => {
+                let (dimension, id, version) = (reader.short(MAX_DIMENSION)?, reader.tile_id()?, reader.u32()?);
+                if reader.bytes.len() > MAX_ENCODED_TILE {
+                    return Err(DecodeError::TooMany);
+                }
+                let pixels = std::mem::take(&mut reader.bytes).to_vec();
+                Message::Tile { dimension, id, version, pixels }
+            }
+            Kind::WorldDisc => Message::WorldDisc {
+                dimension: reader.short(MAX_DIMENSION)?,
+                center_x: reader.u32()? as i32,
+                center_z: reader.u32()? as i32,
+                radius: reader.u32()?,
+            },
             Kind::PositionKey => Message::PositionKey(PositionKey {
                 stream: reader.u32()?,
                 key: reader.u32()?,
@@ -323,6 +508,20 @@ fn put_str(out: &mut Vec<u8>, text: &str, max: usize) {
     }
     out.extend_from_slice(&(end as u16).to_le_bytes());
     out.extend_from_slice(&text.as_bytes()[..end]);
+}
+
+fn truncate_dimension(text: &str) -> &str {
+    let mut end = text.len().min(MAX_DIMENSION);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn put_tile_id(out: &mut Vec<u8>, id: TileId) {
+    out.push(id.level);
+    out.extend_from_slice(&id.x.to_le_bytes());
+    out.extend_from_slice(&id.z.to_le_bytes());
 }
 
 fn put_short(out: &mut Vec<u8>, text: &str) {
@@ -439,6 +638,12 @@ impl<'a> Reader<'a> {
             return Err(DecodeError::BadString);
         }
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+
+    fn tile_id(&mut self) -> Result<TileId, DecodeError> {
+        let level = self.u8()?;
+        let id = TileId { level, x: self.u32()? as i32, z: self.u32()? as i32 };
+        if id.is_valid() { Ok(id) } else { Err(DecodeError::BadNumber) }
     }
 
     fn u8(&mut self) -> Result<u8, DecodeError> {
@@ -1624,5 +1829,86 @@ mod tests {
         let report = meter.record(1_000_000).unwrap();
         assert_eq!(report, TickReport { ticks: 100, p50_us: 51, p99_us: 99, max_us: 1000 });
         assert_eq!(meter.record(5), None);
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    fn round_trip(pixels: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encode_tile(pixels, &mut encoded);
+        let mut out = Box::new([0; TILE_AREA]);
+        decode_tile(&encoded, &mut out).unwrap();
+        assert_eq!(&out[..], pixels);
+        encoded
+    }
+
+    #[test]
+    fn tiles_survive_the_codec() {
+        assert!(round_trip(&[7; TILE_AREA]).len() < 1200);
+        let noise: Vec<u8> = (0..TILE_AREA).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        assert!(round_trip(&noise).len() <= MAX_ENCODED_TILE);
+        let mut mixed = vec![3; TILE_AREA];
+        for (i, pixel) in mixed.iter_mut().enumerate() {
+            if i % 7 < 2 {
+                *pixel = (i % 251) as u8;
+            }
+        }
+        round_trip(&mixed);
+    }
+
+    #[test]
+    fn a_bad_tile_is_an_error_and_never_a_panic() {
+        let mut out = Box::new([0; TILE_AREA]);
+        assert_eq!(decode_tile(&[], &mut out), Err(DecodeError::Truncated));
+        assert_eq!(decode_tile(&[5, 1], &mut out), Err(DecodeError::Truncated));
+        assert_eq!(decode_tile(&[200], &mut out), Err(DecodeError::Truncated));
+        assert_eq!(decode_tile(&[255, 1].repeat(TILE_AREA), &mut out), Err(DecodeError::TooMany));
+        let mut seed = 7_u32;
+        for length in 0..600 {
+            let bytes: Vec<u8> = (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let _ = decode_tile(&bytes, &mut out);
+        }
+    }
+
+    #[test]
+    fn tile_messages_round_trip() {
+        let id = TileId { level: 3, x: -4, z: 9 };
+        let messages = [
+            Message::TileWants { dimension: "minecraft:overworld".into(), wants: vec![TileWant { id, version: 8 }] },
+            Message::Tile { dimension: "minecraft:the_end".into(), id, version: 2, pixels: vec![1, 2, 3] },
+            Message::WorldDisc { dimension: "minecraft:overworld".into(), center_x: -5, center_z: 6, radius: 7000 },
+        ];
+        for message in messages {
+            assert_eq!(Message::decode(message.kind() as u8, &message.body()).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn tile_requests_are_bounded() {
+        let mut body = vec![1, b'a', (MAX_TILE_WANTS + 1) as u8];
+        body.extend_from_slice(&[0; 13 * 40]);
+        assert_eq!(Message::decode(Kind::TileWants as u8, &body), Err(DecodeError::TooMany));
+        assert!(!TileId { level: 200, x: 0, z: 0 }.is_valid());
+        assert!(!TileId { level: 0, x: i32::MAX, z: 0 }.is_valid());
+    }
+
+    #[test]
+    fn the_quadtree_is_consistent_for_negative_coordinates() {
+        let id = TileId::containing(0, -1.0, 256.5);
+        assert_eq!((id.x, id.z), (-1, 1));
+        assert_eq!(id.parent(), Some(TileId { level: 1, x: -1, z: 0 }));
+        for child in id.parent().unwrap().children().unwrap() {
+            assert_eq!(child.parent(), id.parent());
+        }
+        assert_eq!(TileId { level: 0, x: 0, z: 0 }.children(), None);
+        assert_eq!(TileId { level: 5, x: 0, z: 0 }.span(), 8192);
     }
 }

@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use vexmap_ui::{Group, Pin, Player, Settings, Ui};
+use vexmap_ui::{Disc, Group, Pin, Player, Settings, TileCache, TileKey, TileView, Ui};
 
 const RECT: [f32; 2] = [960.0, 540.0];
 
@@ -43,5 +43,22 @@ fn benches(c: &mut Criterion) {
     });
 }
 
-criterion_group!(group, benches);
+fn tiles(c: &mut Criterion) {
+    let mut cache = TileCache::default();
+    let view = TileView {
+        center: [3000.0, -2000.0],
+        blocks_per_pixel: 2.0,
+        half_extent: [1300.0, 750.0],
+        disc: Disc::default(),
+        whole_world: true,
+    };
+    for x in -16..48 {
+        for z in -16..16 {
+            cache.answered(TileKey { level: 1, x: x + 5, z: z - 4 }, 1, true, 0);
+        }
+    }
+    c.bench_function("tile_plan_page_tables", |b| b.iter(|| cache.plan(std::hint::black_box(&view), 1)));
+}
+
+criterion_group!(group, benches, tiles);
 criterion_main!(group);

@@ -16,8 +16,10 @@ use std::time::Instant;
 pub(super) const MOD_VERSION: &str = "0.1.0";
 /// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
 const REALTIME: u64 = 1;
+/// `Module::Tiles`.
+const TILES: u64 = 2;
 /// Modules this client build implements, as bits of `Hello.features`. Each arrives with its phase.
-pub(super) const FEATURES: u64 = REALTIME;
+pub(super) const FEATURES: u64 = REALTIME | TILES;
 
 /// Modules switched on for this region, kept current by the sidecar link. All off until the sidecar first answers.
 static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +27,16 @@ static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
 static PLAYER_FEED: link::Mailbox = link::Mailbox::new();
 /// The newest frames for this server's players, on their way from the sidecar.
 static DELIVERIES: link::DeliveryBox = link::DeliveryBox::new();
+static TILE_REQUESTS: link::TileRequestBox = link::TileRequestBox::new();
+static TILE_DELIVERIES: link::TileDeliveryBox = link::TileDeliveryBox::new();
+/// Tile bytes one tick may forward: 3 MB/s for a server of up to 50 players, spread out instead of in one tick.
+const MAX_TILE_BYTES_PER_TICK: usize = 150 * 1024;
+const MIN_TILE_REQUEST_GAP_MS: u64 = 100;
+const DISC_EVERY_MS: u64 = 10_000;
+/// Past this a border is the vanilla "no border": the map uses `VEXMAP_MAP_RADIUS` instead.
+const NO_BORDER_HALF_SIZE: f64 = 1_000_000.0;
+const DEFAULT_MAP_RADIUS: u32 = 16_384;
+const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
 
 const KICK_NO_MOD: &str = "VexMap: this server needs the VexMap client mod.\n\
 Этому серверу нужен клиентский мод VexMap.";
@@ -52,6 +64,12 @@ struct Server {
     outbox: proto::Outbox,
     next_sample_ms: u64,
     samples: Vec<link::PlayerSample>,
+    /// Who was admitted at the last sample.
+    samples_admitted: Vec<u128>,
+    tile_out: Vec<link::Delivery>,
+    next_tile_request: HashMap<u128, u64>,
+    next_disc_ms: u64,
+    map_radius: u32,
     deliveries: Vec<link::Delivery>,
     pack: Option<PackOffer>,
     packs: proto::PackGate,
@@ -115,6 +133,15 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             outbox: proto::Outbox::default(),
             next_sample_ms: 0,
             samples: Vec::new(),
+            samples_admitted: Vec::new(),
+            tile_out: Vec::new(),
+            next_tile_request: HashMap::new(),
+            next_disc_ms: 0,
+            map_radius: std::env::var("VEXMAP_MAP_RADIUS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|radius| *radius > 0)
+                .unwrap_or(DEFAULT_MAP_RADIUS),
             deliveries: Vec::new(),
             pack: load_pack_offer(),
             packs: proto::PackGate::default(),
@@ -141,7 +168,12 @@ fn start_sidecar_link() {
     }
     match link::FeedConfig::parse(feed_addr.as_deref(), region.as_deref()) {
         Ok(config) => {
-            let boxes = link::FeedBoxes { players: &PLAYER_FEED, deliveries: &DELIVERIES };
+            let boxes = link::FeedBoxes {
+                players: &PLAYER_FEED,
+                deliveries: &DELIVERIES,
+                tile_requests: &TILE_REQUESTS,
+                tiles: &TILE_DELIVERIES,
+            };
             if let Err(error) = link::start_feed(config, boxes) {
                 log(format_args!("player feed did not start: {error}"));
             }
@@ -155,8 +187,10 @@ fn start_sidecar_link() {
 fn sample_players(game: &crate::game::Game<'_>, server: &mut Server, now: u64) {
     server.next_sample_ms = now + link::SAMPLE_EVERY_MS;
     server.samples.clear();
+    server.samples_admitted.clear();
     for player in game.native_server_players() {
         if server.gate.features(player.uuid).is_some() {
+            server.samples_admitted.push(player.uuid);
             server.samples.push(link::PlayerSample {
                 uuid: player.uuid,
                 name: player.name,
@@ -244,9 +278,65 @@ pub(super) fn player_logged_in(game: &mut crate::game::Game<'_>, player: u128) {
     });
 }
 
+/// The circle of a dimension from its border: inscribed in the square (ADR-006), or the configured radius when the
+/// world has no real border.
+fn world_disc(bounds: [f64; 4], configured: u32) -> (i32, i32, u32) {
+    let [min_x, min_z, max_x, max_z] = bounds;
+    let half = ((max_x - min_x).min(max_z - min_z) / 2.0).max(1.0);
+    if half >= NO_BORDER_HALF_SIZE {
+        return (0, 0, configured);
+    }
+    (((min_x + max_x) / 2.0) as i32, ((min_z + max_z) / 2.0) as i32, half as u32)
+}
+
+fn send_discs(game: &mut crate::game::Game<'_>, server: &mut Server, player: u128) {
+    for dimension in DIMENSIONS {
+        let Some(bounds) = game.native_world_border(dimension) else { continue };
+        let (center_x, center_z, radius) = world_disc(bounds, server.map_radius);
+        let message = proto::Message::WorldDisc { dimension: dimension.to_owned(), center_x, center_z, radius };
+        send_to_player(game, &mut server.outbox, player, &message);
+    }
+}
+
+/// Plugin channels may lose a message and the border may move, so everyone hears the circles again now and then.
+fn repeat_discs(game: &mut crate::game::Game<'_>, server: &mut Server, now: u64) {
+    server.next_disc_ms = now + DISC_EVERY_MS;
+    let players: Vec<u128> = server.samples_admitted.clone();
+    for player in players {
+        send_discs(game, server, player);
+    }
+}
+
+fn send_tiles(game: &mut crate::game::Game<'_>, server: &mut Server) {
+    if !TILE_DELIVERIES.try_take(&mut server.tile_out, MAX_TILE_BYTES_PER_TICK) {
+        return;
+    }
+    for delivery in server.tile_out.drain(..) {
+        for viewer in delivery.viewers {
+            if server.gate.features(viewer).is_some_and(|features| features & TILES != 0) {
+                let _ = game.native_send_custom_payload_to_player(viewer, proto::CHANNEL, &delivery.frame);
+            }
+        }
+    }
+}
+
+/// Hands a client's request to the feed thread without reading it. Untrusted: the sidecar validates it.
+fn forward_tile_wants(server: &mut Server, player: u128, body: Vec<u8>, now: u64) {
+    if server.gate.features(player).is_none_or(|features| features & TILES == 0) {
+        return;
+    }
+    let next = server.next_tile_request.entry(player).or_insert(0);
+    if now < *next {
+        return;
+    }
+    *next = now + MIN_TILE_REQUEST_GAP_MS;
+    TILE_REQUESTS.try_push(link::TileRequest { viewer: player, body });
+}
+
 /// `player_logged_out`: forget everything about the player.
 pub(super) fn player_logged_out(player: u128) {
     with_server(|server| {
+        server.next_tile_request.remove(&player);
         server.gate.leave(player);
         server.packs.leave(player);
         server.inbound.remove(&player);
@@ -273,6 +363,10 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
             kick(game, &mut server.outbox, player, proto::KickReason::Pack(proto::PackFailure::TimedOut));
         }
         send_deliveries(game, server);
+        send_tiles(game, server);
+        if now >= server.next_disc_ms {
+            repeat_discs(game, server, now);
+        }
         if let Some(report) = server.tick_meter.record(started.elapsed().as_nanos() as u64) {
             log(format_args!(
                 "tick us: n={} p50={} p99={} max={}",
@@ -334,6 +428,10 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
         let reassembler =
             server.inbound.entry(player).or_insert_with(|| proto::Reassembler::new(proto::Limits::default()));
         let proto::Feed::Complete { kind, body } = reassembler.feed(data, now) else { return };
+        if kind == proto::Kind::TileWants as u8 {
+            forward_tile_wants(server, player, body, now);
+            return;
+        }
         let Ok(message) = proto::Message::decode(kind, &body) else { return };
         match message {
             proto::Message::Hello { protocol, features, mod_version } => {
@@ -346,6 +444,7 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
                         ));
                         let welcome = proto::Message::Welcome { protocol: proto::PROTOCOL, features, player };
                         send_to_player(game, &mut server.outbox, player, &welcome);
+                        send_discs(game, server, player);
                         offer_pack(game, server, player, now);
                     }
                     proto::HelloOutcome::Reject(reason) => kick(game, &mut server.outbox, player, reason),
@@ -376,6 +475,14 @@ pub(super) struct Client {
     pub(super) open_requested: bool,
     pub(super) close_requested: bool,
     pub(super) scratch: Vec<ui::Op>,
+    pub(super) tiles: ui::TileCache,
+    pub(super) discs: HashMap<String, ui::Disc>,
+    /// The dimension the tile cache belongs to.
+    pub(super) tiles_dimension: String,
+    pub(super) diagnostics: bool,
+    pub(super) next_fps_report_ms: u64,
+    pub(super) gpu_epoch: u64,
+    pub(super) sent_generation: u64,
 }
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
@@ -416,6 +523,13 @@ pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
             open_requested: false,
             close_requested: false,
             scratch: Vec::new(),
+            tiles: ui::TileCache::default(),
+            discs: HashMap::new(),
+            tiles_dimension: String::new(),
+            diagnostics: std::env::var_os("VEXMAP_DIAG").is_some(),
+            next_fps_report_ms: 0,
+            gpu_epoch: 0,
+            sent_generation: 0,
         }
     });
     Some(f(client))
@@ -439,6 +553,10 @@ fn payload_packet(channel: &str, data: Vec<u8>) -> horizon_client::mod_api::Serv
 fn send_to_server(game: &mut crate::game::Game<'_>, outbox: &mut proto::Outbox, message: &proto::Message) -> bool {
     let Ok(frames) = outbox.frames(message, proto::MAX_C2S_FRAME) else { return false };
     frames.into_iter().all(|frame| game.native_send_packet(payload_packet(proto::CHANNEL, frame)).is_ok())
+}
+
+pub(super) fn send_message(game: &mut crate::game::Game<'_>, client: &mut Client, message: &proto::Message) {
+    send_to_server(game, &mut client.outbox, message);
 }
 
 /// A proxy forwards a plugin channel only once the client registered it, so `register` goes before every `Hello`.
@@ -483,6 +601,13 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
                 client.handshake.welcomed();
                 client.me = Some(player);
                 log(format_args!("welcomed: protocol {protocol}, features {features:#x}"));
+            }
+            proto::Message::WorldDisc { dimension, center_x, center_z, radius } if radius > 0 => {
+                let disc = ui::Disc { center: [f64::from(center_x), f64::from(center_z)], radius: f64::from(radius) };
+                client.discs.insert(dimension, disc);
+            }
+            proto::Message::Tile { dimension, id, version, pixels } => {
+                screen::tile_arrived(client, &dimension, id, version, &pixels, now);
             }
             proto::Message::OpenMap => screen::open_from_server(game, client),
             proto::Message::Reject { reason } => log(format_args!("rejected: {reason}")),

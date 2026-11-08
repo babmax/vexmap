@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show
       - run: cargo fmt --all --check
-      - run: rustfmt --edition 2024 --check mods/vexmap/mixins/vexmap/runtime.rs mods/vexmap/mixins/vexmap/map_screen.rs mods/vexmap/mixins/vexmap/hooks/*.rs
+      - run: rustfmt --edition 2024 --check mods/vexmap/mixins/vexmap/runtime.rs mods/vexmap/mixins/vexmap/map_screen.rs mods/vexmap/mixins/vexmap/render.rs mods/vexmap/mixins/vexmap/hooks/*.rs
         shell: bash
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

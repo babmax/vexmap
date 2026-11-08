@@ -21,6 +21,7 @@ use vexmap_core::{
 
 pub mod fanout;
 pub mod feed;
+pub mod tiles;
 
 pub use feed::PositionStore;
 
@@ -34,6 +35,7 @@ pub struct Config {
     pub feed_addr: SocketAddr,
     pub owner: Option<Uuid>,
     pub rate: RateLimit,
+    pub tiles: tiles::TileConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +69,8 @@ impl Config {
             },
         };
         let rate = RateLimit { per_second: number("VEXMAP_API_RATE", 500)?, burst: number("VEXMAP_API_BURST", 1000)? };
-        Ok(Config { database_url, addr, feed_addr, owner, rate })
+        let tiles = tiles::TileConfig::from_env(&var);
+        Ok(Config { database_url, addr, feed_addr, owner, rate, tiles })
     }
 }
 
@@ -82,7 +85,9 @@ pub async fn run(config: Config) -> Result<(), String> {
         tokio::net::TcpListener::bind(config.feed_addr).await.map_err(|error| format!("bind feed: {error}"))?;
     tracing::info!("VexMap API on http://{}, player feed on {}", config.addr, config.feed_addr);
     let positions = Arc::new(PositionStore::default());
-    tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone()));
+    let tile_requests =
+        tiles::start(config.tiles.clone(), positions.clone()).map_err(|error| format!("tiles: {error}"))?;
+    tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone(), tile_requests));
     tokio::spawn(fanout::run(core.clone(), positions.clone()));
     axum::serve(listener, router(core, config.rate, positions))
         .with_graceful_shutdown(async {

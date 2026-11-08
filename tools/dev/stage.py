@@ -19,7 +19,8 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
-DEPS = ROOT / ".deps"
+# A git worktree shares the main checkout's build tree through this variable: `.deps` is gigabytes.
+DEPS = Path(os.environ.get("VEXMAP_DEPS", ROOT / ".deps"))
 MIXINS = DEPS / "horizon-mixins"
 USER_AGENT = "vexmap-dev"
 

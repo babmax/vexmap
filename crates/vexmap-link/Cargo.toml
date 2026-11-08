@@ -23,3 +23,4 @@ uuid = { workspace = true, features = ["v4"] }
 vexmap-core.workspace = true
 vexmap-proto.workspace = true
 vexmap-sidecar = { path = "../vexmap-sidecar" }
+vexmap-tiler.workspace = true

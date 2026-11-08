@@ -23,7 +23,7 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DEPS = ROOT / ".deps"
+DEPS = Path(os.environ.get("VEXMAP_DEPS", ROOT / ".deps"))
 BIN = DEPS / "target" / "fast"
 VERSION = Path(os.environ["APPDATA"]) / "horizon-launcher" / "versions" / "nightly-2026-11-07-6560641"
 RESOURCES = VERSION / ".local" / "horizon-client" / "26.3"

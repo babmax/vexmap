@@ -40,6 +40,22 @@ file = "crates/horizon-client/src/game.rs"
 name = "vexmap"
 source = "runtime.rs"
 
+# The GPU pass of the map. Its own crate: the renderer lives in horizon-client-render.
+[[module]]
+id = "render"
+file = "crates/horizon-client-render/src/gfx.rs"
+name = "vexmap_render"
+source = "render.rs"
+visibility = "pub"
+
+[[injection]]
+id = "hand-drawn"
+hook = "hand_drawn"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/hand_drawn.rs"
+bindings = [{ name = "hand", ty = "&mut crate::gfx::native_render::HandDrawn<'_>", value = "&mut *hand" }]
+
 # ---- server
 
 [[injection]]

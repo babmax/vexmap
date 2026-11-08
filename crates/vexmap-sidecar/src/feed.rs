@@ -12,14 +12,18 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 use vexmap_core::{Actor, ClientName, CommandContext, Core, RegionId, RequestId};
-use vexmap_link::{FeedBatch, FeedPlayer, MAX_FEED_MESSAGE, decode_batch, decode_hello};
+use vexmap_link::{
+    FeedBatch, FeedPlayer, MAX_FEED_MESSAGE, TileRequest, decode_batch, decode_hello, decode_tile_requests,
+    is_tile_requests,
+};
 use vexmap_proto::Marker;
 
 use crate::fanout::Online;
+use crate::tiles::RegionRequest;
 
 const MAX_CONNECTIONS: usize = 256;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +31,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Batches closer together than this are dropped: the rate limit of this channel, four times the real rate.
 const MIN_BATCH_GAP: Duration = Duration::from_millis(50);
+/// Messages of finished tiles waiting for one region. Past this the service drops them, and clients ask again.
+const TILE_QUEUE: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlayerPosition {
@@ -55,6 +61,8 @@ struct Region {
     players: Vec<FeedPlayer>,
     /// Newest wins: a region that reads slowly loses stale frames instead of queueing them.
     outbox: watch::Sender<Arc<Vec<u8>>>,
+    /// Tiles are not interchangeable, so these queue instead.
+    tiles: mpsc::Sender<Vec<u8>>,
 }
 
 /// The newest list of each connected region. A region disappears when its server does.
@@ -65,13 +73,20 @@ pub struct PositionStore {
 
 impl PositionStore {
     /// `connection` now speaks for `region`, replacing an earlier connection after a restart. Returns what to send it.
-    fn claim(&self, region: &str, connection: u64) -> watch::Receiver<Arc<Vec<u8>>> {
+    fn claim(&self, region: &str, connection: u64) -> (watch::Receiver<Arc<Vec<u8>>>, mpsc::Receiver<Vec<u8>>) {
         let (outbox, receiver) = watch::channel(Arc::new(Vec::new()));
+        let (tiles, tile_receiver) = mpsc::channel(TILE_QUEUE);
         if let Ok(mut regions) = self.regions.write() {
-            let entry = Region { connection, seq: 0, received: Instant::now(), players: Vec::new(), outbox };
+            let entry = Region { connection, seq: 0, received: Instant::now(), players: Vec::new(), outbox, tiles };
             regions.insert(region.to_owned(), entry);
         }
-        receiver
+        (receiver, tile_receiver)
+    }
+
+    /// Hands finished tiles to the region's connection. `false` when they were dropped.
+    pub fn deliver_tiles(&self, region: &str, message: Vec<u8>) -> bool {
+        let Ok(regions) = self.regions.read() else { return false };
+        regions.get(region).is_some_and(|entry| entry.tiles.try_send(message).is_ok())
     }
 
     /// Hands an encoded message to the region's connection.
@@ -166,7 +181,12 @@ fn position_of(player: &FeedPlayer) -> Option<PlayerPosition> {
 
 /// Accepts region servers until the listener fails. Connection ids start from the clock, so the request ids built from
 /// them are not replays of an earlier run of the sidecar.
-pub async fn serve(listener: TcpListener, core: Core, store: Arc<PositionStore>) {
+pub async fn serve(
+    listener: TcpListener,
+    core: Core,
+    store: Arc<PositionStore>,
+    tile_requests: mpsc::Sender<RegionRequest>,
+) {
     let start = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as u64);
     let connections = AtomicU64::new(start);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -184,10 +204,10 @@ pub async fn serve(listener: TcpListener, core: Core, store: Arc<PositionStore>)
             continue;
         };
         let connection = connections.fetch_add(1, Ordering::Relaxed);
-        let (core, store) = (core.clone(), store.clone());
+        let (core, store, tile_requests) = (core.clone(), store.clone(), tile_requests.clone());
         tokio::spawn(async move {
             let _slot = slot;
-            handle(stream, connection, core, store).await;
+            handle(stream, connection, core, store, tile_requests).await;
         });
     }
 }
@@ -209,16 +229,39 @@ async fn read_message(stream: &mut (impl AsyncRead + Unpin), buffer: &mut Vec<u8
 }
 
 /// A write that times out may have stopped mid-message, so it ends the connection rather than corrupting the framing.
-async fn write_deliveries(mut stream: OwnedWriteHalf, mut outbox: watch::Receiver<Arc<Vec<u8>>>) {
-    while outbox.changed().await.is_ok() {
-        let message = outbox.borrow_and_update().clone();
+async fn write_deliveries(
+    mut stream: OwnedWriteHalf,
+    mut outbox: watch::Receiver<Arc<Vec<u8>>>,
+    mut tiles: mpsc::Receiver<Vec<u8>>,
+) {
+    loop {
+        // Positions first: a tile may wait a moment, a marker's whole point is being current.
+        let message = tokio::select! {
+            biased;
+            changed = outbox.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                outbox.borrow_and_update().clone()
+            }
+            tile = tiles.recv() => match tile {
+                Some(tile) => Arc::new(tile),
+                None => return,
+            },
+        };
         if !matches!(timeout(WRITE_TIMEOUT, stream.write_all(&message)).await, Ok(Ok(()))) {
             return;
         }
     }
 }
 
-async fn handle(stream: TcpStream, connection: u64, core: Core, store: Arc<PositionStore>) {
+async fn handle(
+    stream: TcpStream,
+    connection: u64,
+    core: Core,
+    store: Arc<PositionStore>,
+    tile_requests: mpsc::Sender<RegionRequest>,
+) {
     let (mut reader, writer) = stream.into_split();
     let mut buffer = Vec::new();
     let region = match read_message(&mut reader, &mut buffer).await.and_then(|()| hello_region(&buffer)) {
@@ -228,10 +271,10 @@ async fn handle(stream: TcpStream, connection: u64, core: Core, store: Arc<Posit
             return;
         }
     };
-    let outbox = store.claim(region.as_str(), connection);
-    let writing = tokio::spawn(write_deliveries(writer, outbox));
+    let (outbox, tiles) = store.claim(region.as_str(), connection);
+    let writing = tokio::spawn(write_deliveries(writer, outbox, tiles));
     tracing::info!(region = region.as_str(), "feed: region connected");
-    let reason = run_connection(&mut reader, &region, connection, &core, &store, &mut buffer).await;
+    let reason = run_connection(&mut reader, &region, connection, &core, &store, &tile_requests, &mut buffer).await;
     writing.abort();
     store.release(region.as_str(), connection);
     tracing::info!(region = region.as_str(), "feed: region gone: {reason}");
@@ -249,6 +292,7 @@ async fn run_connection(
     connection: u64,
     core: &Core,
     store: &PositionStore,
+    tile_requests: &mpsc::Sender<RegionRequest>,
     buffer: &mut Vec<u8>,
 ) -> String {
     let mut recorded = HashMap::new();
@@ -256,6 +300,13 @@ async fn run_connection(
     loop {
         if let Err(error) = read_message(stream, buffer).await {
             return error;
+        }
+        if is_tile_requests(buffer) {
+            match decode_tile_requests(buffer) {
+                Ok(requests) => forward_tile_requests(region, requests, tile_requests),
+                Err(error) => return format!("bad tile requests: {error:?}"),
+            }
+            continue;
         }
         let batch = match decode_batch(buffer) {
             Ok(batch) => batch,
@@ -271,6 +322,13 @@ async fn run_connection(
             return "replaced by a newer connection".to_owned();
         }
         recorded = record_new_players(core, region, connection, &batch, recorded).await;
+    }
+}
+
+/// Never waits: a full queue drops the request, and the client asks again.
+fn forward_tile_requests(region: &RegionId, requests: Vec<TileRequest>, queue: &mpsc::Sender<RegionRequest>) {
+    for request in requests {
+        let _ = queue.try_send(RegionRequest { region: region.as_str().to_owned(), request });
     }
 }
 

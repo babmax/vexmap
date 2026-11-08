@@ -98,6 +98,122 @@ fn open(game: &mut crate::game::Game<'_>, client: &mut runtime::Client) {
     }
 }
 
+fn to_key(id: proto::TileId) -> ui::TileKey {
+    ui::TileKey { level: id.level, x: id.x, z: id.z }
+}
+
+/// A tile from the server. Anything malformed is dropped, and the map keeps what it has.
+pub(super) fn tile_arrived(
+    client: &mut runtime::Client,
+    dimension: &str,
+    id: proto::TileId,
+    version: u32,
+    encoded: &[u8],
+    now_ms: u64,
+) {
+    if dimension != client.tiles_dimension {
+        return;
+    }
+    let mut pixels = Box::new([0_u8; proto::TILE_AREA]);
+    if !encoded.is_empty() && proto::decode_tile(encoded, &mut pixels).is_err() {
+        return;
+    }
+    if let Some(slot) = client.tiles.answered(to_key(id), version, !encoded.is_empty(), now_ms) {
+        horizon_client_render::gfx::vexmap_render::queue_tile(slot, pixels);
+    }
+}
+
+fn ask_for_tiles(game: &mut crate::game::Game<'_>, client: &mut runtime::Client, wants: &[(ui::TileKey, u32)]) {
+    if wants.is_empty() {
+        return;
+    }
+    let wants = wants
+        .iter()
+        .map(|(key, version)| proto::TileWant {
+            id: proto::TileId { level: key.level, x: key.x, z: key.z },
+            version: *version,
+        })
+        .collect();
+    let message = proto::Message::TileWants { dimension: client.tiles_dimension.clone(), wants };
+    runtime::send_message(game, client, &message);
+}
+
+/// Keeps the tiles, the page tables and the GPU pass in step with the view. Once per frame while the map is up.
+fn update_ground(game: &mut crate::game::Game<'_>, client: &mut runtime::Client, now_ms: u64) {
+    use horizon_client_render::gfx::vexmap_render as render;
+    let open = is_open(game);
+    let minimap_up = !open
+        && game.native_mod_screen().is_none()
+        && client.ui.settings.minimap.enabled
+        && game.native_corner_shown(corner_of(client.ui.settings.minimap.corner));
+    let map_up = open && client.ui.page == ui::Page::Map;
+    let player = local_player(game);
+    client.ui.ground_drawn = false;
+    client.ui.minimap_ground_drawn = false;
+    let (Some(player), true, true) = (player, map_up || minimap_up, client.gui_size[0] > 0.0) else {
+        render::set_scene(None);
+        return;
+    };
+    if client.tiles_dimension != player.dimension {
+        client.tiles.clear();
+        client.tiles_dimension.clone_from(&player.dimension);
+    }
+    let epoch = render::gpu_epoch();
+    if client.gpu_epoch != epoch {
+        // A new device has none of the tiles the cache remembers.
+        client.gpu_epoch = epoch;
+        client.tiles.clear();
+    }
+    if let Some(disc) = client.discs.get(&player.dimension).copied() {
+        client.ui.set_world(disc);
+    }
+    let night = ui::night_amount(game.native_day_time());
+    client.ui.night = night;
+    let view = if map_up { client.ui.tile_view(client.gui_size) } else { client.ui.minimap_view(&player) };
+    if let Some(wants) = client.tiles.plan_if_due(&view, now_ms) {
+        ask_for_tiles(game, client, &wants);
+    }
+    let scene = if map_up {
+        client.ui.scene(client.gui_size, night)
+    } else {
+        client.ui.minimap_scene(client.gui_size, &player, night)
+    };
+    let pages_changed = client.sent_generation != client.tiles.generation;
+    client.sent_generation = client.tiles.generation;
+    render::set_scene(Some(render_scene(&scene, &client.tiles, pages_changed)));
+    client.ui.ground_drawn = map_up;
+    client.ui.minimap_ground_drawn = minimap_up;
+}
+
+fn render_scene(
+    scene: &ui::MapScene,
+    tiles: &ui::TileCache,
+    pages_changed: bool,
+) -> horizon_client_render::gfx::vexmap_render::Scene {
+    let [fine, coarse] = tiles.tables;
+    horizon_client_render::gfx::vexmap_render::Scene {
+        rect: scene.rect,
+        mode: match scene.mode {
+            ui::MapMode::Globe => 0,
+            ui::MapMode::Round => 1,
+            ui::MapMode::Flat => 2,
+        },
+        center: scene.center.map(|value| value as f32),
+        half_extent: scene.half_extent.map(|value| value as f32),
+        camera: [scene.globe.yaw as f32, scene.globe.pitch as f32, scene.globe.distance as f32],
+        theta_max: ui::THETA_MAX as f32,
+        disc: [scene.disc.center[0] as f32, scene.disc.center[1] as f32, scene.disc.radius as f32],
+        night: scene.night,
+        fine,
+        coarse,
+        palette: ui::palette(scene.night),
+        turn: scene.turn,
+        opacity: scene.opacity,
+        cut_out: scene.cut_out,
+        pages: pages_changed.then(|| tiles.pages.clone()),
+    }
+}
+
 /// `/map` from the server.
 pub(super) fn open_from_server(game: &mut crate::game::Game<'_>, client: &mut runtime::Client) {
     if game.native_playing() {
@@ -119,13 +235,25 @@ fn save(path: std::path::PathBuf, text: String) {
     }
 }
 
+/// With `VEXMAP_DIAG` set, the frame rate every 5 s, for the bench test. Off for players.
+fn report_frame_rate(game: &crate::game::Game<'_>, client: &mut runtime::Client, now_ms: u64) {
+    if !client.diagnostics || now_ms < client.next_fps_report_ms {
+        return;
+    }
+    client.next_fps_report_ms = now_ms + 5_000;
+    let (fps, _, _) = game.native_frame_rate();
+    eprintln!("[vexmap] fps map={} {fps}", if is_open(game) { "open" } else { "closed" });
+}
+
 /// Every frame, on the window's game, from `runtime::frame`.
 pub(super) fn frame(game: &mut crate::game::Game<'_>, client: &mut runtime::Client, now_ms: u64) {
     apply_requests(game, client);
+    report_frame_rate(game, client, now_ms);
     if is_open(game) {
         let (fps, _, _) = game.native_frame_rate();
         client.ui.feed_frame_rate(now_ms, fps);
     }
+    update_ground(game, client, now_ms);
     if let Some(text) = client.ui.save_due(now_ms)
         && let Some(path) = &client.settings_path
     {
@@ -204,6 +332,7 @@ pub(super) fn hud(game: &crate::game::Game<'_>, batch: &mut HudBatch) {
     let now = runtime::now_ms();
     let size = gui_size(batch);
     runtime::with_client(|client| {
+        client.gui_size = size;
         if !client.ui.settings.minimap.enabled
             || !game.native_corner_shown(corner_of(client.ui.settings.minimap.corner))
         {

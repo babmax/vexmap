@@ -2,9 +2,9 @@
 // Only `std`, so it is also the `vexmap-ui` crate and is tested and measured without building Horizon. `map_screen.rs`
 // replays the lists through Horizon's GUI helpers.
 //
-// The map is schematic for now: land, grid and players. Tiles, theme and the globe replace the land in Phase 5.
+// The minimap is still schematic: land, grid and players. The map screen draws its ground through the GPU pass in render.rs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Until Phase 5 reads the world border.
 pub const WORLD_RADIUS: f64 = 16_384.0;
@@ -83,6 +83,7 @@ choice!(Corner {
     BottomRight = "bottom_right", "Bottom right", "Справа снизу";
 });
 choice!(Shape { Circle = "circle", "Circle", "Круг"; Square = "square", "Square", "Квадрат" });
+choice!(MapMode { Globe = "globe", "Globe", "Глобус"; Round = "round", "Round", "Круг"; Flat = "flat", "Flat", "Плоская" });
 choice!(WindowMode { Fullscreen = "fullscreen", "Full screen", "Весь экран"; Windowed = "windowed", "Window", "Окно" });
 
 impl Language {
@@ -134,6 +135,7 @@ pub struct Settings {
     pub layers: u32,
     pub minimap: Minimap,
     pub window_mode: WindowMode,
+    pub map_mode: MapMode,
     /// `[x, y, w, h]` of the windowed map in GUI pixels.
     pub window: [f32; 4],
     pub key_map: String,
@@ -163,6 +165,7 @@ impl Default for Settings {
                 layers: layer::MINIMAP_ALL,
             },
             window_mode: WindowMode::Fullscreen,
+            map_mode: MapMode::Globe,
             window: [40.0, 30.0, 400.0, 260.0],
             key_map: "key.keyboard.m".to_owned(),
             key_minimap: "key.keyboard.n".to_owned(),
@@ -245,6 +248,7 @@ impl Settings {
             "minimap.opacity" => self.minimap.opacity = value.parse().ok()?,
             "minimap.layers" => self.minimap.layers = value.parse().ok()?,
             "window_mode" => self.window_mode = WindowMode::parse(value)?,
+            "map_mode" => self.map_mode = MapMode::parse(value)?,
             "window" => {
                 let mut parts = value.split(',').map(|part| part.trim().parse::<f32>().ok());
                 let mut window = [0.0; 4];
@@ -280,7 +284,7 @@ impl Settings {
         format!(
             "language={}\npreset={}\nquality={}\nbuildings_3d={}\neffects={}\nlabels={}\nupdate_hz={}\nlayers={}\n\
              minimap.enabled={}\nminimap.corner={}\nminimap.size={}\nminimap.shape={}\nminimap.zoom={}\n\
-             minimap.rotate_with_look={}\nminimap.opacity={}\nminimap.layers={}\nwindow_mode={}\nwindow={x},{y},{w},{h}\n\
+             minimap.rotate_with_look={}\nminimap.opacity={}\nminimap.layers={}\nwindow_mode={}\nmap_mode={}\nwindow={x},{y},{w},{h}\n\
              key_map={}\nkey_minimap={}\nautotuned={}\n",
             self.language.text(),
             self.preset.text(),
@@ -299,6 +303,7 @@ impl Settings {
             minimap.opacity,
             minimap.layers,
             self.window_mode.text(),
+            self.map_mode.text(),
             self.key_map,
             self.key_minimap,
             self.autotuned,
@@ -369,11 +374,13 @@ pub struct Player {
 pub struct MapView {
     pub center: [f64; 2],
     pub blocks_per_pixel: f64,
+    /// The circle the world is cut to, from the server.
+    pub disc: Disc,
 }
 
 impl Default for MapView {
     fn default() -> Self {
-        MapView { center: [0.0, 0.0], blocks_per_pixel: 2.0 }
+        MapView { center: [0.0, 0.0], blocks_per_pixel: 2.0, disc: Disc::default() }
     }
 }
 
@@ -399,10 +406,11 @@ impl MapView {
     }
 
     fn clamp_center(&mut self) {
-        let distance = self.center[0].hypot(self.center[1]);
-        if distance > WORLD_RADIUS {
-            let scale = WORLD_RADIUS / distance;
-            self.center = [self.center[0] * scale, self.center[1] * scale];
+        let (x, z) = (self.center[0] - self.disc.center[0], self.center[1] - self.disc.center[1]);
+        let distance = x.hypot(z);
+        if distance > self.disc.radius {
+            let scale = self.disc.radius / distance;
+            self.center = [self.disc.center[0] + x * scale, self.disc.center[1] + z * scale];
         }
     }
 
@@ -882,6 +890,17 @@ pub struct Ui {
     pub settings: Settings,
     pub page: Page,
     pub view: MapView,
+    pub globe: Globe,
+    /// The circle of the world the player is in.
+    pub world: Disc,
+    /// The GPU pass is drawing the ground, so the land and ocean fills would only cover it.
+    pub ground_drawn: bool,
+    /// The same for the minimap.
+    pub minimap_ground_drawn: bool,
+    /// 0 by day, 1 by night.
+    pub night: f32,
+    /// Where globe and flat were looking before "round" took over the view.
+    saved_view: Option<([f64; 2], f64)>,
     grab: Option<Grab>,
     rebinding: Option<Row>,
     settings_scroll: f32,
@@ -902,6 +921,12 @@ impl Ui {
             settings,
             page: Page::Map,
             view: MapView::default(),
+            globe: Globe::default(),
+            world: Disc::default(),
+            ground_drawn: false,
+            minimap_ground_drawn: false,
+            night: 0.0,
+            saved_view: None,
             grab: None,
             rebinding: None,
             settings_scroll: 0.0,
@@ -923,10 +948,127 @@ impl Ui {
         self.grab = None;
         self.rebinding = None;
         self.map_stale = true;
+        self.view.disc = self.world;
         if let Some(player) = player {
             self.view.center = [player.x, player.z];
             self.view.clamp_center();
+            let world = self.world;
+            self.globe.look_at(&world, [player.x, player.z]);
         }
+    }
+
+    /// The world's circle changed: the server said so, or the player changed dimension.
+    pub fn set_world(&mut self, disc: Disc) {
+        if self.world != disc {
+            self.world = disc;
+            self.view.disc = disc;
+            self.view.clamp_center();
+            self.map_stale = true;
+        }
+    }
+
+    /// What the tile cache must cover in this frame.
+    pub fn tile_view(&self, size: [f32; 2]) -> TileView {
+        let rect = self.map_rect(size);
+        if self.settings.map_mode == MapMode::Globe {
+            let bpp = self.globe.blocks_per_pixel(&self.world, f64::from(rect[3]));
+            let half = bpp * f64::from(rect[2].max(rect[3])) * 0.75;
+            return TileView {
+                center: self.globe.looking_at(&self.world),
+                blocks_per_pixel: bpp,
+                half_extent: [half, half],
+                disc: self.world,
+                whole_world: true,
+            };
+        }
+        let bpp = self.view.blocks_per_pixel;
+        TileView {
+            center: self.view.center,
+            blocks_per_pixel: bpp,
+            half_extent: [f64::from(rect[2]) / 2.0 * bpp, f64::from(rect[3]) / 2.0 * bpp],
+            disc: self.world,
+            whole_world: true,
+        }
+    }
+
+    pub fn minimap_view(&self, player: &Player) -> TileView {
+        let minimap = &self.settings.minimap;
+        let zoom = f64::from(minimap.zoom);
+        // A turning square shows its corners along any axis.
+        let reach = f64::from(minimap.size) / 2.0 * zoom * std::f64::consts::SQRT_2;
+        TileView {
+            center: [player.x, player.z],
+            blocks_per_pixel: zoom,
+            half_extent: [reach, reach],
+            disc: self.world,
+            whole_world: false,
+        }
+    }
+
+    pub fn minimap_scene(&self, size: [f32; 2], player: &Player, night: f32) -> MapScene {
+        let minimap = &self.settings.minimap;
+        let rect = self.minimap_rect(size);
+        let half = f64::from(rect[2]) / 2.0 * f64::from(minimap.zoom);
+        let turn = if minimap.rotate_with_look {
+            let (sin, cos) = player.yaw.to_radians().sin_cos();
+            [-cos, sin, -sin, -cos]
+        } else {
+            [1.0, 0.0, 0.0, 1.0]
+        };
+        MapScene {
+            rect: [rect[0] / size[0], rect[1] / size[1], rect[2] / size[0], rect[3] / size[1]],
+            mode: if minimap.shape == Shape::Circle { MapMode::Round } else { MapMode::Flat },
+            center: [player.x, player.z],
+            half_extent: [half, half],
+            globe: self.globe,
+            disc: self.world,
+            night,
+            turn,
+            opacity: f32::from(minimap.opacity) / 100.0,
+            cut_out: true,
+        }
+    }
+
+    pub fn scene(&self, size: [f32; 2], night: f32) -> MapScene {
+        let rect = self.map_rect(size);
+        let view = self.tile_view(size);
+        MapScene {
+            rect: [rect[0] / size[0], rect[1] / size[1], rect[2] / size[0], rect[3] / size[1]],
+            mode: self.settings.map_mode,
+            center: view.center,
+            half_extent: view.half_extent,
+            globe: self.globe,
+            disc: self.world,
+            night,
+            turn: [1.0, 0.0, 0.0, 1.0],
+            opacity: 1.0,
+            cut_out: false,
+        }
+    }
+
+    /// Where a world point shows on the map, or `None` on the far side of the globe.
+    fn to_screen(&self, rect: [f32; 4], world: [f64; 2]) -> Option<[f32; 2]> {
+        if self.settings.map_mode != MapMode::Globe {
+            return Some(self.view.world_to_screen(rect, world));
+        }
+        let aspect = f64::from(rect[2] / rect[3].max(1.0));
+        let uv = self.globe.project(self.world.to_sphere(world), aspect)?;
+        let center = rect_center(rect);
+        Some([center[0] + uv[0] as f32 * rect[2] / 2.0, center[1] - uv[1] as f32 * rect[3] / 2.0])
+    }
+
+    fn to_world(&self, rect: [f32; 4], screen: [f32; 2]) -> Option<[f64; 2]> {
+        if self.settings.map_mode != MapMode::Globe {
+            return Some(self.view.screen_to_world(rect, screen));
+        }
+        let center = rect_center(rect);
+        let uv = [
+            f64::from((screen[0] - center[0]) / (rect[2] / 2.0)),
+            f64::from((center[1] - screen[1]) / (rect[3] / 2.0)),
+        ];
+        let world = self.world.from_sphere(self.globe.ray(uv, f64::from(rect[2] / rect[3].max(1.0)))?);
+        let inside = (world[0] - self.world.center[0]).hypot(world[1] - self.world.center[1]) <= self.world.radius;
+        inside.then_some(world)
     }
 
     pub fn map_ops(&self) -> &[Op] {
@@ -993,6 +1135,11 @@ impl Ui {
         [[right - 148.0, top, 90.0, 14.0], [right - 54.0, top, 32.0, 14.0], [right - 18.0, top, 14.0, 14.0]]
     }
 
+    /// The button that switches globe, round and flat.
+    fn view_button(&self, rect: [f32; 4]) -> [f32; 4] {
+        [rect[0] + rect[2] - 148.0, rect[1] + 22.0, 90.0, 14.0]
+    }
+
     fn autotune_buttons(&self, rect: [f32; 4]) -> [[f32; 4]; 2] {
         let [cx, _] = rect_center(rect);
         let y = rect[1] + 42.0;
@@ -1029,16 +1176,24 @@ impl Ui {
         let rect = self.map_rect(size);
         let mut ops = std::mem::take(&mut self.map_ops);
         ops.clear();
-        ops.push(Op::Fill { rect, argb: OCEAN });
         let (view, settings) = (self.view, &self.settings);
+        let globe = settings.map_mode == MapMode::Globe;
+        if !self.ground_drawn {
+            ops.push(Op::Fill { rect, argb: OCEAN });
+        }
         let language = settings.language;
         let clip = [Clip::Rect(rect)];
-        let center = view.world_to_screen(rect, [0.0, 0.0]);
-        let radius = (WORLD_RADIUS / view.blocks_per_pixel) as f32;
+        let center = view.world_to_screen(rect, view.disc.center);
+        let radius = (view.disc.radius / view.blocks_per_pixel) as f32;
         // Whole-screen land is one rectangle: cheaper, and clipped wedges leave pinholes where their edges meet.
         let [rx, ry, rw, rh] = rect;
         let circle = Clip::Circle(center, radius);
-        if [[rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]].iter().all(|corner| circle.contains(*corner)) {
+        if self.ground_drawn {
+            // Drawn by the GPU pass.
+        } else if [[rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]]
+            .iter()
+            .all(|corner| circle.contains(*corner))
+        {
             ops.push(Op::Fill { rect, argb: LAND });
         } else {
             disc(&mut ops, center, radius, Some(rect), LAND);
@@ -1046,7 +1201,7 @@ impl Ui {
         let clips = [Clip::Rect(rect), Clip::Circle(center, radius)];
 
         let step = grid_step(view.blocks_per_pixel);
-        if settings.layers & layer::GRID != 0 {
+        if settings.layers & layer::GRID != 0 && !globe {
             let first = view.screen_to_world(rect, [rect[0], rect[1]]);
             let last = view.screen_to_world(rect, [rect[0] + rect[2], rect[1] + rect[3]]);
             let mut x = (first[0] / step).floor() * step;
@@ -1064,12 +1219,14 @@ impl Ui {
                 z += step;
             }
         }
-        ring(&mut ops, &clip, center, radius, 2.0, RIM);
+        if !globe {
+            ring(&mut ops, &clip, center, radius, 2.0, RIM);
+        }
 
         let dimension = player.map_or("minecraft:overworld", |player| player.dimension.as_str());
         if settings.layers & layer::CLUSTERS != 0 {
             for group in groups.iter().filter(|group| group.dimension == dimension) {
-                let at = view.world_to_screen(rect, [group.x, group.z]);
+                let Some(at) = self.to_screen(rect, [group.x, group.z]) else { continue };
                 if inside(rect, at) {
                     marker(&mut ops, at, 9.0, GROUP);
                     ops.push(Op::TextCentered { text: group.count.to_string(), at: [at[0], at[1] + 7.0], rgb: WHITE });
@@ -1082,7 +1239,7 @@ impl Ui {
             taken.clear();
             let visible = pins.iter().filter(|pin| pin.dimension == dimension && Some(pin.uuid) != me);
             for pin in visible.take(MAX_PINS) {
-                let at = view.world_to_screen(rect, [pin.x, pin.z]);
+                let Some(at) = self.to_screen(rect, [pin.x, pin.z]) else { continue };
                 if !inside(rect, at) {
                     continue;
                 }
@@ -1095,11 +1252,11 @@ impl Ui {
             }
             self.labels_taken = taken;
         }
-        if let Some(player) = player.filter(|player| player.dimension == dimension) {
-            let at = view.world_to_screen(rect, [player.x, player.z]);
-            if inside(rect, at) {
-                arrow(&mut ops, at, yaw_vector(player.yaw), 7.0, SELF_PLAYER);
-            }
+        if let Some(player) = player.filter(|player| player.dimension == dimension)
+            && let Some(at) = self.to_screen(rect, [player.x, player.z])
+            && inside(rect, at)
+        {
+            arrow(&mut ops, at, yaw_vector(player.yaw), 7.0, SELF_PLAYER);
         }
 
         let bottom = rect[1] + rect[3] - 12.0;
@@ -1110,14 +1267,21 @@ impl Ui {
                 rgb: WHITE,
             });
         }
-        ops.push(Op::Text { text: format_distance(language, step), at: [rect[0] + 6.0, bottom - 11.0], rgb: MUTED });
+        if !globe {
+            ops.push(Op::Text {
+                text: format_distance(language, step),
+                at: [rect[0] + 6.0, bottom - 11.0],
+                rgb: MUTED,
+            });
+        }
         ops.push(Op::Text {
             text: language.pick(("N", "С")).to_owned(),
             at: [rect[0] + rect[2] / 2.0 - 3.0, rect[1] + 6.0],
             rgb: WHITE,
         });
-        if inside(rect, mouse) {
-            let world = view.screen_to_world(rect, mouse);
+        if inside(rect, mouse)
+            && let Some(world) = self.to_world(rect, mouse)
+        {
             ops.push(Op::Text {
                 text: format!("{:.0}, {:.0}", world[0], world[1]),
                 at: [rect[0] + 6.0, rect[1] + 6.0],
@@ -1135,6 +1299,7 @@ impl Ui {
         }
         let [gear, mode, close] = self.toolbar(rect);
         button(&mut ops, gear, language.pick(("Settings", "Настройки")), mouse);
+        button(&mut ops, self.view_button(rect), language.pick(settings.map_mode.label()), mouse);
         let mode_label = match settings.window_mode {
             WindowMode::Fullscreen => language.pick(("Win", "Окно")),
             WindowMode::Windowed => language.pick(("Full", "Экран")),
@@ -1197,15 +1362,20 @@ impl Ui {
         let half = rect[2] / 2.0;
         let opacity = minimap.opacity;
         let zoom = f64::from(minimap.zoom);
+        let land = land_color(self.night);
         let mut ops = std::mem::take(&mut self.minimap_ops);
         ops.clear();
         let clip = match minimap.shape {
             Shape::Circle => {
-                disc(&mut ops, center, half, None, with_alpha(LAND, opacity));
+                if !self.minimap_ground_drawn {
+                    disc(&mut ops, center, half, None, with_alpha(land, opacity));
+                }
                 Clip::Circle(center, half)
             }
             Shape::Square => {
-                ops.push(Op::Fill { rect, argb: with_alpha(LAND, opacity) });
+                if !self.minimap_ground_drawn {
+                    ops.push(Op::Fill { rect, argb: with_alpha(land, opacity) });
+                }
                 Clip::Rect(rect)
             }
         };
@@ -1366,6 +1536,26 @@ impl Ui {
             self.page = Page::Settings;
             return Press::Taken;
         }
+        if inside(self.view_button(rect), mouse) {
+            self.settings.map_mode = self.settings.map_mode.next();
+            if self.settings.map_mode == MapMode::Globe {
+                let (world, center) = (self.world, self.view.center);
+                self.globe.look_at(&world, center);
+            } else if self.settings.map_mode == MapMode::Round {
+                // The round map is the whole disc in the window, like a globe flattened. Zooming in works from there.
+                let bpp = self.globe.blocks_per_pixel(&self.world, f64::from(rect[3]));
+                self.saved_view = Some((self.globe.looking_at(&self.world), bpp));
+                self.view.center = self.world.center;
+                self.view.blocks_per_pixel = (self.world.radius * 2.0 / f64::from(rect[2].min(rect[3])))
+                    .clamp(MIN_BLOCKS_PER_PIXEL, MAX_BLOCKS_PER_PIXEL);
+            } else if let Some((center, bpp)) = self.saved_view.take() {
+                self.view.center = center;
+                self.view.blocks_per_pixel = bpp.clamp(MIN_BLOCKS_PER_PIXEL, MAX_BLOCKS_PER_PIXEL);
+                self.view.clamp_center();
+            }
+            self.touched(now_ms);
+            return Press::Taken;
+        }
         if inside(mode, mouse) {
             self.settings.window_mode = self.settings.window_mode.next();
             self.touched(now_ms);
@@ -1417,7 +1607,11 @@ impl Ui {
         let Some(grab) = self.grab else { return false };
         match grab {
             Grab::Pan => {
-                self.view.pan(delta);
+                if self.settings.map_mode == MapMode::Globe {
+                    self.globe.drag(delta);
+                } else {
+                    self.view.pan(delta);
+                }
                 self.map_stale = true;
             }
             Grab::Move | Grab::Resize => {
@@ -1440,7 +1634,11 @@ impl Ui {
         match self.page {
             Page::Map => {
                 let rect = self.map_rect(size);
-                self.view.zoom_at(rect, mouse, steps);
+                if self.settings.map_mode == MapMode::Globe {
+                    self.globe.zoom(steps);
+                } else {
+                    self.view.zoom_at(rect, mouse, steps);
+                }
                 self.map_stale = true;
             }
             Page::Settings => {
@@ -1475,6 +1673,753 @@ impl Ui {
     }
 }
 
+// ---------------------------------------------------------------- the round world (ADR-006)
+//
+// The world is a disc. `Disc::to_sphere` wraps it over a spherical cap by the azimuthal equidistant projection: radius is
+// kept, the centre is the smooth pole, and there is no seam. World coordinates stay the truth; only drawing uses this.
+
+/// The polar angle the disc's rim reaches on the sphere: 120 degrees.
+pub const THETA_MAX: f64 = 2.094_395_102_393_195_5;
+/// Focal length of the globe's camera. The same number as `FOCAL` in the shader.
+const FOCAL: f64 = 2.2;
+const MIN_GLOBE_DISTANCE: f64 = 1.02;
+const MAX_GLOBE_DISTANCE: f64 = 6.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Disc {
+    pub center: [f64; 2],
+    pub radius: f64,
+}
+
+impl Default for Disc {
+    fn default() -> Self {
+        Disc { center: [0.0, 0.0], radius: WORLD_RADIUS }
+    }
+}
+
+impl Disc {
+    /// The unit vector of a world point. +Y is the world's centre.
+    pub fn to_sphere(&self, world: [f64; 2]) -> [f64; 3] {
+        let (dx, dz) = (world[0] - self.center[0], world[1] - self.center[1]);
+        let distance = dx.hypot(dz);
+        let theta = distance / self.radius * THETA_MAX;
+        let (sin, cos) = theta.sin_cos();
+        if distance < 1e-9 {
+            return [0.0, 1.0, 0.0];
+        }
+        [sin * dx / distance, cos, sin * dz / distance]
+    }
+
+    /// The world point of a unit vector, past the rim too (that part of the sphere is drawn as ocean).
+    pub fn from_sphere(&self, normal: [f64; 3]) -> [f64; 2] {
+        let theta = normal[1].clamp(-1.0, 1.0).acos();
+        let around = normal[0].hypot(normal[2]);
+        if around < 1e-12 {
+            return self.center;
+        }
+        let distance = theta / THETA_MAX * self.radius;
+        [self.center[0] + distance * normal[0] / around, self.center[1] + distance * normal[2] / around]
+    }
+}
+
+/// The orbiting camera of the globe. The camera stays put on -Z and the sphere turns under it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Globe {
+    pub yaw: f64,
+    pub pitch: f64,
+    pub distance: f64,
+}
+
+impl Default for Globe {
+    fn default() -> Self {
+        Globe { yaw: 0.0, pitch: 1.2, distance: 2.6 }
+    }
+}
+
+impl Globe {
+    /// Sphere as the camera sees it, to the sphere's own axes.
+    fn turn(&self, hit: [f64; 3]) -> [f64; 3] {
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+        let v = [hit[0], cp * hit[1] - sp * hit[2], sp * hit[1] + cp * hit[2]];
+        [cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2]]
+    }
+
+    fn unturn(&self, normal: [f64; 3]) -> [f64; 3] {
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+        let v = [cy * normal[0] - sy * normal[2], normal[1], sy * normal[0] + cy * normal[2]];
+        [v[0], cp * v[1] + sp * v[2], -sp * v[1] + cp * v[2]]
+    }
+
+    /// Points the camera at a world point.
+    pub fn look_at(&mut self, disc: &Disc, world: [f64; 2]) {
+        let normal = disc.to_sphere(world);
+        self.pitch = normal[1].clamp(-1.0, 1.0).asin();
+        self.yaw = (-normal[0]).atan2(-normal[2]);
+    }
+
+    /// The sphere's point at `uv` (-1..1, +y up), or `None` where the ray misses it.
+    pub fn ray(&self, uv: [f64; 2], aspect: f64) -> Option<[f64; 3]> {
+        let direction = [uv[0] * aspect, uv[1], FOCAL];
+        let length = (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]).sqrt();
+        let direction = direction.map(|value| value / length);
+        let along = -self.distance * direction[2];
+        let square = along * along - (self.distance * self.distance - 1.0);
+        if square <= 0.0 {
+            return None;
+        }
+        let travel = -along - square.sqrt();
+        Some(self.turn([direction[0] * travel, direction[1] * travel, -self.distance + direction[2] * travel]))
+    }
+
+    /// Where a point of the sphere shows, as uv. `None` on the far side: the back of the planet draws nothing.
+    pub fn project(&self, normal: [f64; 3], aspect: f64) -> Option<[f64; 2]> {
+        let hit = self.unturn(normal);
+        if hit[2] >= -1.0 / self.distance {
+            return None;
+        }
+        let depth = hit[2] + self.distance;
+        Some([hit[0] / depth * FOCAL / aspect, hit[1] / depth * FOCAL])
+    }
+
+    /// Blocks under one GUI pixel at the point the camera looks at.
+    fn blocks_per_pixel(&self, disc: &Disc, height: f64) -> f64 {
+        disc.radius / THETA_MAX * (self.distance - 1.0) * 2.0 / (FOCAL * height.max(1.0))
+    }
+
+    fn looking_at(&self, disc: &Disc) -> [f64; 2] {
+        disc.from_sphere(self.turn([0.0, 0.0, -1.0]))
+    }
+
+    fn drag(&mut self, delta: [f32; 2]) {
+        let speed = 0.005 * (self.distance - 1.0).clamp(0.02, 2.0);
+        self.yaw -= f64::from(delta[0]) * speed;
+        self.pitch =
+            (self.pitch + f64::from(delta[1]) * speed).clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+    }
+
+    fn zoom(&mut self, steps: f64) {
+        self.distance =
+            (1.0 + (self.distance - 1.0) * 0.9_f64.powf(steps)).clamp(MIN_GLOBE_DISTANCE, MAX_GLOBE_DISTANCE);
+    }
+}
+
+// ---------------------------------------------------------------- theme
+
+/// 0 by day, 1 by night, from the game's clock. Dusk and dawn are smooth ramps, so the map never jumps.
+pub fn night_amount(day_time: i64) -> f32 {
+    const DUSK: (i64, i64) = (12_000, 13_500);
+    const DAWN: (i64, i64) = (22_500, 24_000);
+    let time = day_time.rem_euclid(24_000);
+    let ramp = |from: i64, to: i64| {
+        let t = (time - from) as f32 / (to - from) as f32;
+        t * t * (3.0 - 2.0 * t)
+    };
+    if time < DUSK.0 {
+        0.0
+    } else if time < DUSK.1 {
+        ramp(DUSK.0, DUSK.1)
+    } else if time < DAWN.0 {
+        1.0
+    } else {
+        1.0 - ramp(DAWN.0, DAWN.1)
+    }
+}
+
+/// `vexmap_tiler::Material` numbers to colours. Original, flat, chosen for this map.
+const DAY_PALETTE: [u32; 16] = [
+    0xE8E4DA, 0x7FB6E6, 0xCFE3B4, 0xA3CC94, 0xF2E5BC, 0xCFCBC2, 0xF7F8F9, 0xCDE7F2, 0xD9C8A9, 0xE0DAD0, 0xFFFFFF,
+    0xF08A4B, 0xB57B73, 0xA65E72, 0xE9E5B8, 0xB69CC9,
+];
+const NIGHT_PALETTE: [u32; 16] = [
+    0x20262E, 0x14304F, 0x2E4436, 0x24392E, 0x4A4636, 0x3B4048, 0x6A7480, 0x3F5D70, 0x3D362C, 0x4E5560, 0x79818C,
+    0xC85B26, 0x5B3A38, 0x543242, 0x5C5A40, 0x4E4160,
+];
+
+/// The minimap's land when no tiles are drawn under it.
+fn land_color(night: f32) -> u32 {
+    const NIGHT_LAND: u32 = 0xFF2E_4436;
+    let mix = |shift: u32| {
+        let channel = |color: u32| ((color >> shift) & 0xFF) as f32;
+        (channel(LAND) * (1.0 - night) + channel(NIGHT_LAND) * night) as u32
+    };
+    0xFF00_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// The sixteen material colours at this time of day, in linear-free 0..1 RGB as the shader multiplies them.
+pub fn palette(night: f32) -> [[f32; 4]; 16] {
+    let channel = |color: u32, shift: u32| ((color >> shift) & 0xFF) as f32 / 255.0;
+    std::array::from_fn(|index| {
+        let (day, dark) = (DAY_PALETTE[index], NIGHT_PALETTE[index]);
+        let mix = |shift| channel(day, shift) * (1.0 - night) + channel(dark, shift) * night;
+        [mix(16), mix(8), mix(0), 1.0]
+    })
+}
+
+// ---------------------------------------------------------------- tiles on the client
+
+pub const TILE_SIZE: f64 = 256.0;
+/// Layers of the GPU's tile array: 256 is what every wgpu backend guarantees, and at 64 KiB each it is 16 MiB.
+pub const TILE_SLOTS: usize = 256;
+/// A page table is this many tiles wide.
+pub const PAGE_SIZE: usize = 64;
+/// Two page tables of RGBA8: the view's level, and the coarse one that always covers the whole world.
+pub const PAGE_BYTES: usize = 2 * PAGE_SIZE * PAGE_SIZE * 4;
+const MAX_LEVEL: u8 = 12;
+const MAX_IN_FLIGHT: usize = 8;
+const ANSWER_TIMEOUT_MS: u64 = 2_000;
+const RECHECK_MS: u64 = 60_000;
+const PLAN_MIN_GAP_MS: u64 = 33;
+const PLAN_IDLE_MS: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TileKey {
+    pub level: u8,
+    pub x: i32,
+    pub z: i32,
+}
+
+impl TileKey {
+    fn parent(self) -> TileKey {
+        TileKey { level: self.level + 1, x: self.x >> 1, z: self.z >> 1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    /// `None`: the server has nothing there.
+    slot: Option<u16>,
+    version: u32,
+    checked_ms: u64,
+    used_ms: u64,
+}
+
+/// What the view needs of the tile pyramid this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileView {
+    pub center: [f64; 2],
+    /// Blocks under one GUI pixel.
+    pub blocks_per_pixel: f64,
+    /// Half the view, in blocks. For a globe, as far as the fine table reaches.
+    pub half_extent: [f64; 2],
+    pub disc: Disc,
+    /// Also keep the coarse table of the whole world. The minimap sees a few hundred blocks and does not need it.
+    pub whole_world: bool,
+}
+
+impl TileView {
+    /// What the page tables depend on: the level and the tiles at the view's corners. The picture moves smoothly in the
+    /// shader, so the tables only change when the view crosses a tile.
+    fn footprint(&self) -> (u8, [i32; 6], [u64; 3], bool) {
+        let level = level_for(self.blocks_per_pixel);
+        let span = TILE_SIZE * f64::from(1_u32 << level);
+        let cell = |value: f64| (value / span).floor() as i32;
+        let [cx, cz] = self.center;
+        let [hx, hz] = self.half_extent;
+        let cells = [cell(cx), cell(cz), cell(cx - hx), cell(cz - hz), cell(cx + hx), cell(cz + hz)];
+        let disc = [self.disc.center[0].to_bits(), self.disc.center[1].to_bits(), self.disc.radius.to_bits()];
+        (level, cells, disc, self.whole_world)
+    }
+}
+
+fn level_for(blocks_per_pixel: f64) -> u8 {
+    blocks_per_pixel.max(1.0).log2().floor().clamp(0.0, f64::from(MAX_LEVEL)) as u8
+}
+
+/// The coarsest level still fine enough, at which the whole world fits in a page table.
+fn coarse_level(disc: &Disc) -> u8 {
+    let tiles_wide = 2.0 * disc.radius / TILE_SIZE / (PAGE_SIZE as f64 - 4.0);
+    tiles_wide.max(1.0).log2().ceil().clamp(0.0, f64::from(MAX_LEVEL)) as u8
+}
+
+/// The client's tiles: which GPU slot each lives in, and what to ask the server next.
+pub struct TileCache {
+    entries: HashMap<TileKey, Entry>,
+    free: Vec<u16>,
+    in_flight: HashMap<TileKey, u64>,
+    pub pages: Box<[u8; PAGE_BYTES]>,
+    /// `[level, origin x, origin z]` of the fine table, then of the coarse one.
+    pub tables: [[i32; 3]; 2],
+    wants: Vec<(TileKey, u32)>,
+    /// Counts the rewrites of `pages`, so the GPU copy happens only after one.
+    pub generation: u64,
+    planned: Option<(u8, [i32; 6], [u64; 3], bool)>,
+    changed: bool,
+    next_plan_ms: u64,
+}
+
+impl Default for TileCache {
+    fn default() -> Self {
+        TileCache {
+            entries: HashMap::new(),
+            free: (0..TILE_SLOTS as u16).rev().collect(),
+            in_flight: HashMap::new(),
+            pages: Box::new([0; PAGE_BYTES]),
+            tables: [[0; 3]; 2],
+            wants: Vec::new(),
+            generation: 0,
+            planned: None,
+            changed: true,
+            next_plan_ms: 0,
+        }
+    }
+}
+
+impl TileCache {
+    /// Another dimension: none of this applies any more. The GPU's slots are simply overwritten.
+    pub fn clear(&mut self) {
+        let generation = self.generation;
+        *self = TileCache { generation, ..TileCache::default() };
+    }
+
+    /// The server's answer. Returns the slot to upload `pixels` into, when there are any.
+    pub fn answered(&mut self, key: TileKey, version: u32, has_pixels: bool, now_ms: u64) -> Option<u16> {
+        self.in_flight.remove(&key);
+        self.changed = true;
+        if version == 0 {
+            if let Some(entry) = self.entries.remove(&key)
+                && let Some(slot) = entry.slot
+            {
+                self.free.push(slot);
+            }
+            self.entries.insert(key, Entry { slot: None, version: 0, checked_ms: now_ms, used_ms: now_ms });
+            return None;
+        }
+        if !has_pixels {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.checked_ms = now_ms;
+            }
+            return None;
+        }
+        let slot = match self.entries.get(&key).and_then(|entry| entry.slot) {
+            Some(slot) => slot,
+            None => self.take_slot()?,
+        };
+        self.entries.insert(key, Entry { slot: Some(slot), version, checked_ms: now_ms, used_ms: now_ms });
+        Some(slot)
+    }
+
+    /// A free slot, or the one used longest ago.
+    fn take_slot(&mut self) -> Option<u16> {
+        if let Some(slot) = self.free.pop() {
+            return Some(slot);
+        }
+        let oldest = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.slot.is_some())
+            .min_by_key(|(_, entry)| entry.used_ms)
+            .map(|(key, _)| *key)?;
+        self.entries.remove(&oldest).and_then(|entry| entry.slot)
+    }
+
+    /// The nearest tile that is on hand, as `[slot low, slot high, levels up, 1]`.
+    fn page_entry(&mut self, mut key: TileKey, now_ms: u64) -> [u8; 4] {
+        let mut up = 0;
+        loop {
+            if let Some(entry) = self.entries.get_mut(&key)
+                && let Some(slot) = entry.slot
+            {
+                entry.used_ms = now_ms;
+                return [slot as u8, (slot >> 8) as u8, up, 1];
+            }
+            if key.level >= MAX_LEVEL || up == u8::MAX {
+                return [0; 4];
+            }
+            key = key.parent();
+            up += 1;
+        }
+    }
+
+    fn fill_table(&mut self, table: usize, level: u8, center: [f64; 2], half: [f64; 2], now_ms: u64) {
+        let span = TILE_SIZE * f64::from(1_u32 << level);
+        let cell = |value: f64| (value / span).floor() as i32;
+        let origin = [cell(center[0]) - PAGE_SIZE as i32 / 2, cell(center[1]) - PAGE_SIZE as i32 / 2];
+        self.tables[table] = [i32::from(level), origin[0], origin[1]];
+        let start = table * PAGE_SIZE * PAGE_SIZE * 4;
+        self.pages[start..start + PAGE_SIZE * PAGE_SIZE * 4].fill(0);
+        let range = |low: f64, high: f64, origin: i32| {
+            ((cell(low) - origin).max(0), (cell(high) - origin).min(PAGE_SIZE as i32 - 1))
+        };
+        let (left, right) = range(center[0] - half[0], center[0] + half[0], origin[0]);
+        let (top, bottom) = range(center[1] - half[1], center[1] + half[1], origin[1]);
+        for z in top..=bottom {
+            for x in left..=right {
+                let key = TileKey { level, x: origin[0] + x, z: origin[1] + z };
+                let entry = self.page_entry(key, now_ms);
+                let at = start + (z as usize * PAGE_SIZE + x as usize) * 4;
+                self.pages[at..at + 4].copy_from_slice(&entry);
+                self.want(key, now_ms);
+            }
+        }
+    }
+
+    fn want(&mut self, key: TileKey, now_ms: u64) {
+        let due = match self.entries.get(&key) {
+            None => true,
+            Some(entry) => now_ms.saturating_sub(entry.checked_ms) >= RECHECK_MS,
+        };
+        if due && !self.in_flight.contains_key(&key) {
+            self.wants.push((key, self.entries.get(&key).map_or(0, |entry| entry.version)));
+        }
+    }
+
+    /// `plan`, when there is a reason to: it costs most of a millisecond on the game's thread (see the bench), so at most
+    /// `PLAN_MIN_GAP_MS` apart while the view moves, and `PLAN_IDLE_MS` apart while nothing does.
+    pub fn plan_if_due(&mut self, view: &TileView, now_ms: u64) -> Option<Vec<(TileKey, u32)>> {
+        let footprint = view.footprint();
+        let moved = self.changed || self.planned != Some(footprint);
+        let wait = if moved { PLAN_MIN_GAP_MS } else { PLAN_IDLE_MS };
+        if now_ms < self.next_plan_ms.saturating_add(wait) && self.planned.is_some() {
+            return None;
+        }
+        self.next_plan_ms = now_ms;
+        self.changed = false;
+        self.planned = Some(footprint);
+        Some(self.plan(view, now_ms))
+    }
+
+    /// Rewrites the page tables for this view and returns the tiles to ask for now, nearest first.
+    pub fn plan(&mut self, view: &TileView, now_ms: u64) -> Vec<(TileKey, u32)> {
+        self.generation += 1;
+        self.in_flight.retain(|_, sent| now_ms.saturating_sub(*sent) < ANSWER_TIMEOUT_MS);
+        self.wants.clear();
+        let coarse = coarse_level(&view.disc);
+        let level = level_for(view.blocks_per_pixel).min(coarse);
+        let bytes = PAGE_SIZE * PAGE_SIZE * 4;
+        if view.whole_world {
+            self.fill_table(1, coarse, view.disc.center, [view.disc.radius; 2], now_ms);
+        } else {
+            self.pages[bytes..2 * bytes].fill(0);
+        }
+        let coarse_wants = self.wants.len();
+        if level < coarse || !view.whole_world {
+            self.fill_table(0, level, view.center, view.half_extent, now_ms);
+        } else {
+            self.tables[0] = self.tables[1];
+            self.pages.copy_within(bytes..2 * bytes, 0);
+        }
+        // Whole-world tiles first: they give the first picture of everything.
+        let (first, fine) = self.wants.split_at_mut(coarse_wants);
+        let distance = |key: &TileKey| {
+            let span = TILE_SIZE * f64::from(1_u32 << key.level);
+            ((f64::from(key.x) + 0.5) * span - view.center[0]).hypot((f64::from(key.z) + 0.5) * span - view.center[1])
+        };
+        let by_distance = |a: &(TileKey, u32), b: &(TileKey, u32)| distance(&a.0).total_cmp(&distance(&b.0));
+        first.sort_by(by_distance);
+        fine.sort_by(by_distance);
+        let room = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
+        let chosen: Vec<_> = self.wants.iter().take(room).copied().collect();
+        for (key, _) in &chosen {
+            self.in_flight.insert(*key, now_ms);
+        }
+        chosen
+    }
+}
+
+/// What the GPU pass needs for one frame of the map, all in plain numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapScene {
+    /// `[x, y, w, h]` as fractions of the frame.
+    pub rect: [f32; 4],
+    pub mode: MapMode,
+    pub center: [f64; 2],
+    /// Half the rectangle, in blocks.
+    pub half_extent: [f64; 2],
+    pub globe: Globe,
+    pub disc: Disc,
+    pub night: f32,
+    /// Screen offset to world offset, `[xx, xy, zx, zy]`, screen y down. The identity unless the minimap turns.
+    pub turn: [f32; 4],
+    pub opacity: f32,
+    /// Leave what is outside the circle untouched (the minimap), instead of painting space (the map).
+    pub cut_out: bool,
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    fn close(a: [f64; 2], b: [f64; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6
+    }
+
+    #[test]
+    fn the_projection_is_reversible_everywhere_on_the_disc() {
+        let disc = Disc { center: [120.0, -77.0], radius: 9000.0 };
+        for ring in 0..=40 {
+            for step in 0..64 {
+                let (radius, angle) =
+                    (f64::from(ring) / 40.0 * disc.radius, f64::from(step) / 64.0 * std::f64::consts::TAU);
+                let world = [disc.center[0] + radius * angle.cos(), disc.center[1] + radius * angle.sin()];
+                assert!(close(disc.from_sphere(disc.to_sphere(world)), world), "{world:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_centre_is_the_pole_and_the_rim_is_at_theta_max() {
+        let disc = Disc::default();
+        assert_eq!(disc.to_sphere(disc.center), [0.0, 1.0, 0.0]);
+        let rim = disc.to_sphere([disc.radius, 0.0]);
+        assert!((rim[1] - THETA_MAX.cos()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn looking_at_a_point_puts_it_in_the_middle_of_the_globe() {
+        let disc = Disc::default();
+        for world in [[0.0, 0.0], [5000.0, -3000.0], [-9000.0, 1200.0], [100.0, 12000.0]] {
+            let mut globe = Globe { distance: 2.0, ..Globe::default() };
+            globe.look_at(&disc, world);
+            assert!(
+                close(
+                    globe.looking_at(&disc).map(|v| (v * 1e3).round() / 1e3),
+                    world.map(|v: f64| (v * 1e3).round() / 1e3)
+                ),
+                "{world:?}"
+            );
+            let uv = globe.project(disc.to_sphere(world), 1.5).unwrap();
+            assert!(uv[0].abs() < 1e-6 && uv[1].abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn ray_and_project_agree() {
+        let disc = Disc::default();
+        let mut globe = Globe { distance: 2.5, ..Globe::default() };
+        globe.look_at(&disc, [3000.0, 4000.0]);
+        for uv in [[0.2, 0.1], [-0.4, 0.3], [0.05, -0.5]] {
+            let normal = globe.ray(uv, 1.6).unwrap();
+            let back = globe.project(normal, 1.6).unwrap();
+            assert!((back[0] - uv[0]).abs() < 1e-9 && (back[1] - uv[1]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_far_side_of_the_planet_does_not_show() {
+        let disc = Disc::default();
+        let mut globe = Globe::default();
+        globe.look_at(&disc, [disc.radius * 0.1, 0.0]);
+        assert!(globe.project(disc.to_sphere([-disc.radius, 0.0]), 1.0).is_none());
+    }
+
+    #[test]
+    fn a_ray_that_misses_the_planet_finds_nothing() {
+        assert_eq!(Globe { distance: 2.0, ..Globe::default() }.ray([1.0, 1.0], 2.0), None);
+    }
+
+    #[test]
+    fn night_comes_and_goes_smoothly() {
+        assert_eq!(night_amount(6000), 0.0);
+        assert_eq!(night_amount(18000), 1.0);
+        let mut last = night_amount(11_900);
+        for time in (11_950..13_600).step_by(50) {
+            let now = night_amount(time);
+            assert!(now >= last && now - last < 0.08, "{time}");
+            last = now;
+        }
+        assert!((night_amount(24_000) - night_amount(0)).abs() < 1e-6);
+        assert_eq!(night_amount(6000 + 24000 * 5), 0.0);
+    }
+
+    #[test]
+    fn the_palette_turns_from_light_to_dark() {
+        let brightness = |c: [f32; 4]| c[0] + c[1] + c[2];
+        assert!(brightness(palette(0.0)[2]) > brightness(palette(1.0)[2]) * 2.0);
+    }
+
+    fn view() -> TileView {
+        TileView {
+            center: [0.0, 0.0],
+            blocks_per_pixel: 1.0,
+            half_extent: [300.0, 200.0],
+            disc: Disc::default(),
+            whole_world: true,
+        }
+    }
+
+    #[test]
+    fn the_world_comes_first_then_what_is_near() {
+        let mut cache = TileCache::default();
+        let wants = cache.plan(&view(), 0);
+        assert_eq!(wants.len(), MAX_IN_FLIGHT);
+        assert!(wants.iter().all(|(key, version)| key.level == coarse_level(&view().disc) && *version == 0));
+    }
+
+    #[test]
+    fn nothing_is_asked_twice_until_the_answer_is_late() {
+        let mut cache = TileCache::default();
+        let first = cache.plan(&view(), 0);
+        let second = cache.plan(&view(), 100);
+        assert!(second.iter().all(|want| !first.contains(want)));
+        assert!(cache.plan(&view(), ANSWER_TIMEOUT_MS + 1).iter().any(|want| first.contains(want)));
+    }
+
+    #[test]
+    fn a_missing_tile_falls_back_to_its_parent_and_records_how_far() {
+        let mut cache = TileCache::default();
+        let parent = TileKey { level: 1, x: 0, z: 0 };
+        let slot = cache.answered(parent, 3, true, 0).unwrap();
+        let entry = cache.page_entry(TileKey { level: 0, x: 1, z: 1 }, 5);
+        assert_eq!(entry, [slot as u8, (slot >> 8) as u8, 1, 1]);
+        assert_eq!(cache.page_entry(TileKey { level: 0, x: 900, z: 900 }, 5), [0; 4]);
+    }
+
+    #[test]
+    fn an_up_to_date_answer_keeps_the_slot_and_nothing_is_reuploaded() {
+        let mut cache = TileCache::default();
+        let key = TileKey { level: 0, x: 0, z: 0 };
+        let slot = cache.answered(key, 3, true, 0);
+        assert_eq!(cache.answered(key, 3, false, 10), None);
+        assert_eq!(cache.answered(key, 4, true, 20), slot);
+    }
+
+    #[test]
+    fn the_slot_used_longest_ago_is_the_one_replaced() {
+        let mut cache = TileCache::default();
+        for x in 0..TILE_SLOTS as i32 {
+            cache.answered(TileKey { level: 0, x, z: 0 }, 1, true, x as u64 + 1).unwrap();
+        }
+        cache.page_entry(TileKey { level: 0, x: 0, z: 0 }, 10_000);
+        let reused = cache.answered(TileKey { level: 0, x: 5000, z: 0 }, 1, true, 10_001).unwrap();
+        assert!(cache.entries.contains_key(&TileKey { level: 0, x: 0, z: 0 }));
+        assert!(!cache.entries.contains_key(&TileKey { level: 0, x: 1, z: 0 }));
+        assert_eq!(reused, 1);
+    }
+
+    #[test]
+    fn levels_follow_the_zoom_and_the_whole_world_fits_the_coarse_table() {
+        assert_eq!(level_for(0.25), 0);
+        assert_eq!(level_for(1.0), 0);
+        assert_eq!(level_for(5.0), 2);
+        let disc = Disc { center: [0.0, 0.0], radius: 16_384.0 };
+        let span = TILE_SIZE * f64::from(1_u32 << coarse_level(&disc));
+        assert!(disc.radius * 2.0 / span <= PAGE_SIZE as f64 - 2.0);
+    }
+
+    #[test]
+    fn a_tile_at_negative_coordinates_lands_in_the_table() {
+        let mut cache = TileCache::default();
+        let level = coarse_level(&Disc::default());
+        let slot = cache.answered(TileKey { level, x: -1, z: -1 }, 1, true, 0).unwrap();
+        cache.plan(&view(), 0);
+        let [_, ox, oz] = cache.tables[1];
+        let at = PAGE_SIZE * PAGE_SIZE * 4 + (((-1 - oz) as usize) * PAGE_SIZE + (-1 - ox) as usize) * 4;
+        assert_eq!(cache.pages[at], slot as u8);
+        assert_eq!(cache.pages[at + 3], 1);
+    }
+
+    #[test]
+    fn the_tables_are_rewritten_only_when_something_changed() {
+        let mut cache = TileCache::default();
+        assert!(cache.plan_if_due(&view(), 1000).is_some());
+        let generation = cache.generation;
+        assert!(cache.plan_if_due(&view(), 1010).is_none(), "nothing changed, and it is too soon");
+        assert_eq!(cache.generation, generation);
+        let moved = TileView { center: [300.0, 0.0], ..view() };
+        assert!(cache.plan_if_due(&moved, 1020).is_none(), "the view moved, but 30 times a second is enough");
+        assert!(cache.plan_if_due(&moved, 1040).is_some());
+        assert!(cache.plan_if_due(&moved, 1050).is_none());
+        assert!(cache.plan_if_due(&moved, 1040 + PLAN_IDLE_MS).is_some(), "still asks for tiles when idle");
+        cache.answered(TileKey { level: 9, x: 0, z: 0 }, 1, true, 1300);
+        assert!(cache.plan_if_due(&moved, 1040 + PLAN_IDLE_MS + PLAN_MIN_GAP_MS).is_some(), "a new tile shows soon");
+    }
+
+    #[test]
+    fn moving_inside_a_tile_does_not_rewrite_the_tables() {
+        let mut cache = TileCache::default();
+        assert!(cache.plan_if_due(&view(), 1000).is_some());
+        let nudged = TileView { center: [3.0, 2.0], ..view() };
+        assert!(cache.plan_if_due(&nudged, 1100).is_none());
+    }
+
+    #[test]
+    fn the_minimap_never_asks_for_the_whole_world() {
+        let mut ui = Ui::new(Settings::default(), false);
+        ui.world = Disc { center: [0.0, 0.0], radius: 16_384.0 };
+        let player = Player { x: 900.0, y: 64.0, z: 900.0, yaw: 0.0, dimension: "minecraft:overworld".to_owned() };
+        let mut cache = TileCache::default();
+        let view = ui.minimap_view(&player);
+        for (key, _) in cache.plan(&view, 0) {
+            assert_eq!(key.level, level_for(view.blocks_per_pixel));
+            let span = TILE_SIZE * f64::from(1_u32 << key.level);
+            assert!((f64::from(key.x) * span - 900.0).abs() < 1000.0);
+        }
+    }
+
+    /// `turn` in the scene must be the inverse of the projection the minimap's markers use.
+    #[test]
+    fn the_turning_minimap_ground_agrees_with_its_markers() {
+        let mut settings = Settings::default();
+        settings.minimap.rotate_with_look = true;
+        let ui = Ui::new(settings, false);
+        for yaw in [0.0_f32, 37.0, 90.0, 200.0, -45.0] {
+            let player = Player { x: 0.0, y: 64.0, z: 0.0, yaw, dimension: String::new() };
+            let [xx, xy, zx, zy] = ui.minimap_scene([640.0, 360.0], &player, 0.0).turn;
+            let (sin, cos) = player.yaw.to_radians().sin_cos();
+            let (dx, dz) = (12.0_f32, -7.0_f32);
+            let (sx, sy) = (-dx * cos - dz * sin, dx * sin - dz * cos);
+            assert!((xx * sx + xy * sy - dx).abs() < 1e-4 && (zx * sx + zy * sy - dz).abs() < 1e-4, "{yaw}");
+        }
+    }
+
+    #[test]
+    fn with_tiles_under_it_the_minimap_draws_no_land_of_its_own() {
+        let player = Player { x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, dimension: "minecraft:overworld".to_owned() };
+        let quads = |drawn: bool| {
+            let mut ui = Ui::new(Settings::default(), false);
+            ui.minimap_ground_drawn = drawn;
+            ui.rebuild_minimap([640.0, 360.0], &player, None, &[], &[]);
+            ui.minimap_ops().len()
+        };
+        assert!(quads(true) < quads(false));
+    }
+
+    #[test]
+    fn the_round_map_shows_the_whole_world_and_flat_comes_back_to_the_same_place() {
+        let mut ui = Ui::new(Settings::default(), false);
+        let size = [640.0, 360.0];
+        ui.world = Disc { center: [100.0, -50.0], radius: 3600.0 };
+        ui.view.disc = ui.world;
+        ui.globe.look_at(&ui.world.clone(), [1000.0, 500.0]);
+        let rect = ui.map_rect(size);
+        let button = ui.view_button(rect);
+        let at = [button[0] + 2.0, button[1] + 2.0];
+        ui.press(size, at, 0);
+        assert_eq!(ui.settings.map_mode, MapMode::Round);
+        assert_eq!(ui.view.center, ui.world.center);
+        assert!((ui.view.blocks_per_pixel - 20.0).abs() < 1e-9, "the disc exactly fills the window's height");
+        ui.press(size, at, 1);
+        assert_eq!(ui.settings.map_mode, MapMode::Flat);
+        assert!((ui.view.center[0] - 1000.0).abs() < 1e-3 && (ui.view.center[1] - 500.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_settings_keep_the_map_mode() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.map_mode, MapMode::Globe);
+        settings.map_mode = MapMode::Flat;
+        assert_eq!(Settings::parse(&settings.to_text()).map_mode, MapMode::Flat);
+    }
+
+    #[test]
+    fn the_view_button_cycles_and_markers_show_on_the_globe() {
+        let mut ui = Ui::new(Settings::default(), false);
+        let size = [640.0, 360.0];
+        ui.world = Disc::default();
+        ui.opened(Some(&Player { x: 100.0, y: 64.0, z: 100.0, yaw: 0.0, dimension: "minecraft:overworld".to_owned() }));
+        let player = Player { x: 100.0, y: 64.0, z: 100.0, yaw: 0.0, dimension: "minecraft:overworld".to_owned() };
+        ui.rebuild_map(size, [0.0, 0.0], Some(&player), None, &[], &[]);
+        // The player is at the middle of the globe, so the arrow is drawn around the middle of the screen.
+        let near_middle = ui.map_ops().iter().any(|op| match op {
+            Op::Quad { points, .. } => (points[0][0] - 320.0).abs() < 12.0 && (points[0][1] - 180.0).abs() < 12.0,
+            _ => false,
+        });
+        assert!(near_middle);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)] // A test reads best as the default plus what it changes.
 mod tests {
@@ -1493,7 +2438,7 @@ mod tests {
 
     #[test]
     fn world_and_screen_round_trip() {
-        let view = MapView { center: [123.5, -77.25], blocks_per_pixel: 3.5 };
+        let view = MapView { center: [123.5, -77.25], blocks_per_pixel: 3.5, disc: Disc::default() };
         let world = view.screen_to_world(FULL, [17.0, 203.0]);
         let back = view.world_to_screen(FULL, world);
         assert!((back[0] - 17.0).abs() < 1e-3 && (back[1] - 203.0).abs() < 1e-3);
@@ -1510,7 +2455,7 @@ mod tests {
 
     #[test]
     fn zoom_keeps_the_point_under_the_cursor() {
-        let mut view = MapView { center: [50.0, 50.0], blocks_per_pixel: 8.0 };
+        let mut view = MapView { center: [50.0, 50.0], blocks_per_pixel: 8.0, disc: Disc::default() };
         let cursor = [500.0, 90.0];
         let before = view.screen_to_world(FULL, cursor);
         view.zoom_at(FULL, cursor, 3.0);
@@ -1671,6 +2616,7 @@ mod tests {
     fn a_view_inside_the_world_is_one_fill_and_the_rim_is_drawn_as_a_disc() {
         let quads = |ui: &Ui| ui.map_ops().iter().filter(|op| matches!(op, Op::Quad { .. })).count();
         let mut ui = Ui::new(Settings::default(), false);
+        ui.settings.map_mode = MapMode::Flat;
         ui.settings.layers = 0;
         ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
         assert_eq!(ui.map_ops()[1], Op::Fill { rect: FULL, argb: LAND });
@@ -1756,6 +2702,7 @@ mod tests {
     #[test]
     fn dragging_pans_the_map() {
         let mut ui = Ui::new(Settings::default(), false);
+        ui.settings.map_mode = MapMode::Flat;
         assert!(!ui.drag(SIZE, [5.0, 0.0], 0));
         assert_eq!(ui.press(SIZE, [200.0, 200.0], 0), Press::Taken);
         let before = ui.view.center;
