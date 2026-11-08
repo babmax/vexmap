@@ -23,6 +23,8 @@ pub const MAX_MARKERS: usize = 8192;
 const MAX_MARKER_NAME: usize = 16;
 const MAX_DIMENSION: usize = 64;
 const MAX_DIMENSIONS: usize = 255;
+/// A client reads a handful of streams, so this only bounds what a confused server could make it hold.
+pub const MAX_STREAMS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -34,6 +36,8 @@ pub enum Kind {
     Probe = 6,
     PositionKey = 7,
     PositionDelta = 8,
+    PositionStreams = 9,
+    PositionClusters = 10,
 }
 
 impl Kind {
@@ -47,6 +51,8 @@ impl Kind {
             6 => Kind::Probe,
             7 => Kind::PositionKey,
             8 => Kind::PositionDelta,
+            9 => Kind::PositionStreams,
+            10 => Kind::PositionClusters,
             _ => return None,
         })
     }
@@ -119,14 +125,27 @@ pub fn parse_frame(bytes: &[u8]) -> Result<(Header, &[u8]), FrameError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    Hello { protocol: u16, features: u64, mod_version: String },
-    Welcome { protocol: u16, features: u64 },
-    Reject { reason: String },
+    Hello {
+        protocol: u16,
+        features: u64,
+        mod_version: String,
+    },
+    Welcome {
+        protocol: u16,
+        features: u64,
+    },
+    Reject {
+        reason: String,
+    },
     Ping(u64),
     Pong(u64),
     Probe,
     PositionKey(PositionKey),
     PositionDelta(PositionDelta),
+    /// The streams this client should hold. Any other is dropped, so an empty list clears the markers.
+    PositionStreams(Vec<u32>),
+    /// Everything the client has no markers for, summed up. Replaces the previous list.
+    PositionClusters(Vec<Cluster>),
 }
 
 /// A player on the map. Coordinates in 1/8 of a block, `yaw` in 1/256 of a turn.
@@ -141,9 +160,19 @@ pub struct Marker {
     pub yaw: u8,
 }
 
-/// The whole channel. Replaces whatever the client held, so an empty one clears the map.
+/// A group of players too far away or too many to show one by one. `x` and `z` are their centre, in 1/8 of a block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cluster {
+    pub dimension: String,
+    pub x: i32,
+    pub z: i32,
+    pub count: u16,
+}
+
+/// A whole stream. Replaces what the client held for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionKey {
+    pub stream: u32,
     pub key: u32,
     pub markers: Vec<Marker>,
 }
@@ -162,6 +191,7 @@ pub struct MarkerMove {
 /// nothing, because the next one is complete on its own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PositionDelta {
+    pub stream: u32,
     pub key: u32,
     pub seq: u32,
     pub removed: Vec<u16>,
@@ -191,6 +221,8 @@ impl Message {
             Message::Probe => Kind::Probe,
             Message::PositionKey(_) => Kind::PositionKey,
             Message::PositionDelta(_) => Kind::PositionDelta,
+            Message::PositionStreams(_) => Kind::PositionStreams,
+            Message::PositionClusters(_) => Kind::PositionClusters,
         }
     }
 
@@ -210,10 +242,19 @@ impl Message {
             Message::Ping(stamp) | Message::Pong(stamp) => out.extend_from_slice(&stamp.to_le_bytes()),
             Message::Probe => {}
             Message::PositionKey(frame) => {
+                out.extend_from_slice(&frame.stream.to_le_bytes());
                 out.extend_from_slice(&frame.key.to_le_bytes());
                 put_markers(&mut out, &frame.markers);
             }
+            Message::PositionStreams(streams) => {
+                out.extend_from_slice(&(streams.len().min(MAX_STREAMS) as u16).to_le_bytes());
+                for stream in streams.iter().take(MAX_STREAMS) {
+                    out.extend_from_slice(&stream.to_le_bytes());
+                }
+            }
+            Message::PositionClusters(clusters) => put_clusters(&mut out, clusters),
             Message::PositionDelta(delta) => {
+                out.extend_from_slice(&delta.stream.to_le_bytes());
                 out.extend_from_slice(&delta.key.to_le_bytes());
                 out.extend_from_slice(&delta.seq.to_le_bytes());
                 out.extend_from_slice(&(delta.removed.len() as u16).to_le_bytes());
@@ -247,7 +288,13 @@ impl Message {
             Kind::Ping => Message::Ping(reader.u64()?),
             Kind::Pong => Message::Pong(reader.u64()?),
             Kind::Probe => Message::Probe,
-            Kind::PositionKey => Message::PositionKey(PositionKey { key: reader.u32()?, markers: reader.markers()? }),
+            Kind::PositionKey => Message::PositionKey(PositionKey {
+                stream: reader.u32()?,
+                key: reader.u32()?,
+                markers: reader.markers()?,
+            }),
+            Kind::PositionStreams => Message::PositionStreams(reader.streams()?),
+            Kind::PositionClusters => Message::PositionClusters(reader.clusters()?),
             Kind::PositionDelta => Message::PositionDelta(reader.delta()?),
         };
         if !reader.bytes.is_empty() {
@@ -299,6 +346,37 @@ fn put_markers(out: &mut Vec<u8>, markers: &[Marker]) {
         entries.extend_from_slice(&marker.y.to_le_bytes());
         entries.extend_from_slice(&marker.z.to_le_bytes());
         entries.push(marker.yaw);
+        count += 1;
+    }
+    out.push(dimensions.len() as u8);
+    for dimension in &dimensions {
+        put_short(out, dimension);
+    }
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&entries);
+}
+
+/// A table of dimensions, then the clusters pointing into it.
+fn put_clusters(out: &mut Vec<u8>, clusters: &[Cluster]) {
+    let mut dimensions: Vec<&str> = Vec::new();
+    let mut entries = Vec::with_capacity(clusters.len().min(MAX_MARKERS) * 11);
+    let mut count: u16 = 0;
+    for cluster in clusters {
+        if usize::from(count) == MAX_MARKERS || cluster.dimension.len() > MAX_DIMENSION {
+            continue;
+        }
+        let index = match dimensions.iter().position(|known| *known == cluster.dimension) {
+            Some(index) => index,
+            None if dimensions.len() < MAX_DIMENSIONS => {
+                dimensions.push(&cluster.dimension);
+                dimensions.len() - 1
+            }
+            None => continue,
+        };
+        entries.push(index as u8);
+        entries.extend_from_slice(&cluster.x.to_le_bytes());
+        entries.extend_from_slice(&cluster.z.to_le_bytes());
+        entries.extend_from_slice(&cluster.count.to_le_bytes());
         count += 1;
     }
     out.push(dimensions.len() as u8);
@@ -411,8 +489,30 @@ impl<'a> Reader<'a> {
         Ok(markers)
     }
 
+    fn streams(&mut self) -> Result<Vec<u32>, DecodeError> {
+        let count = usize::from(self.u16()?);
+        if count > MAX_STREAMS {
+            return Err(DecodeError::TooMany);
+        }
+        (0..count).map(|_| self.u32()).collect()
+    }
+
+    fn clusters(&mut self) -> Result<Vec<Cluster>, DecodeError> {
+        let mut dimensions = Vec::new();
+        for _ in 0..self.u8()? {
+            dimensions.push(self.short(MAX_DIMENSION)?);
+        }
+        let count = self.count()?;
+        let mut clusters = Vec::with_capacity(count);
+        for _ in 0..count {
+            let dimension = dimensions.get(usize::from(self.u8()?)).ok_or(DecodeError::BadIndex)?.clone();
+            clusters.push(Cluster { dimension, x: self.i32()?, z: self.i32()?, count: self.u16()? });
+        }
+        Ok(clusters)
+    }
+
     fn delta(&mut self) -> Result<PositionDelta, DecodeError> {
-        let (key, seq) = (self.u32()?, self.u32()?);
+        let (stream, key, seq) = (self.u32()?, self.u32()?, self.u32()?);
         let removed_count = self.count()?;
         let mut removed = Vec::with_capacity(removed_count);
         for _ in 0..removed_count {
@@ -426,7 +526,7 @@ impl<'a> Reader<'a> {
             let (dx, dy, dz) = (self.varint()?, self.varint()?, self.varint()?);
             moved.push(MarkerMove { index, dx, dy, dz, yaw: self.u8()? });
         }
-        Ok(PositionDelta { key, seq, removed, added, moved })
+        Ok(PositionDelta { stream, key, seq, removed, added, moved })
     }
 }
 
@@ -435,6 +535,7 @@ impl<'a> Reader<'a> {
 #[allow(dead_code)]
 #[derive(Default)]
 pub struct ChannelEncoder {
+    stream: u32,
     key: u32,
     seq: u32,
     base: Vec<Marker>,
@@ -445,16 +546,17 @@ pub struct ChannelEncoder {
 
 #[allow(dead_code)]
 impl ChannelEncoder {
-    /// `markers` becomes the new key frame, numbered `key`.
-    pub fn key_frame(&mut self, key: u32, mut markers: Vec<Marker>) -> PositionKey {
+    /// `markers` becomes the new key frame of `stream`, numbered `key`.
+    pub fn key_frame(&mut self, stream: u32, key: u32, mut markers: Vec<Marker>) -> PositionKey {
         markers.truncate(MAX_MARKERS);
+        self.stream = stream;
         self.key = key;
         self.seq = 0;
         self.index = markers.iter().enumerate().map(|(index, marker)| (marker.uuid, index as u16)).collect();
         self.base.clone_from(&markers);
         self.last.clone_from(&markers);
-        self.delta = PositionDelta { key, ..PositionDelta::default() };
-        PositionKey { key, markers }
+        self.delta = PositionDelta { stream, key, ..PositionDelta::default() };
+        PositionKey { stream, key, markers }
     }
 
     /// `markers` against the key frame, and whether anything changed since the previous call. An unchanged channel
@@ -465,7 +567,7 @@ impl ChannelEncoder {
             return (&self.delta, false);
         }
         self.seq = self.seq.wrapping_add(1);
-        let mut delta = PositionDelta { key: self.key, seq: self.seq, ..PositionDelta::default() };
+        let mut delta = PositionDelta { stream: self.stream, key: self.key, seq: self.seq, ..PositionDelta::default() };
         let mut kept = vec![false; self.base.len()];
         for marker in &markers {
             let known = self.index.get(&marker.uuid).map(|index| (*index, &self.base[usize::from(*index)]));
@@ -540,6 +642,56 @@ impl PositionTable {
         next.extend_from_slice(&delta.added);
         self.current = next;
         true
+    }
+}
+
+/// Everything a client knows about other players: one table per stream, and the clusters.
+#[derive(Default)]
+pub struct PositionTables {
+    streams: HashMap<u32, PositionTable>,
+    clusters: Vec<Cluster>,
+}
+
+impl PositionTables {
+    pub fn marker_count(&self) -> usize {
+        self.streams.values().map(|table| table.markers().len()).sum()
+    }
+
+    // Read by the map once it is drawn, and by tests.
+    #[allow(dead_code)]
+    pub fn markers(&self) -> impl Iterator<Item = &Marker> {
+        self.streams.values().flat_map(|table| table.markers())
+    }
+
+    // Read by the map once it is drawn, and by tests.
+    #[allow(dead_code)]
+    pub fn clusters(&self) -> &[Cluster] {
+        &self.clusters
+    }
+
+    /// `false` when it was ignored or changed nothing.
+    pub fn apply(&mut self, message: Message) -> bool {
+        match message {
+            Message::PositionKey(frame) => {
+                if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&frame.stream) {
+                    return false;
+                }
+                self.streams.entry(frame.stream).or_default().apply_key(frame);
+                true
+            }
+            Message::PositionDelta(delta) => {
+                self.streams.get_mut(&delta.stream).is_some_and(|table| table.apply_delta(&delta))
+            }
+            Message::PositionStreams(streams) => {
+                self.streams.retain(|stream, _| streams.contains(stream));
+                true
+            }
+            Message::PositionClusters(clusters) => {
+                self.clusters = clusters;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -875,9 +1027,14 @@ mod tests {
 
     #[test]
     fn position_messages_roundtrip() {
-        let key = Message::PositionKey(PositionKey { key: 9, markers: vec![marker(1, -239_999_872), marker(2, 80)] });
+        let key = Message::PositionKey(PositionKey {
+            stream: 0,
+            key: 9,
+            markers: vec![marker(1, -239_999_872), marker(2, 80)],
+        });
         assert_eq!(roundtrip(key.clone(), MAX_S2C_FRAME), key);
         let delta = Message::PositionDelta(PositionDelta {
+            stream: 0,
             key: 9,
             seq: 3,
             removed: vec![1],
@@ -893,19 +1050,20 @@ mod tests {
     #[test]
     fn a_walking_player_costs_a_handful_of_bytes() {
         let mut encoder = ChannelEncoder::default();
-        encoder.key_frame(1, vec![marker(1, 0)]);
+        encoder.key_frame(0, 1, vec![marker(1, 0)]);
         let mut moved = marker(1, 40);
         moved.z = -40;
         let (delta, changed) = encoder.delta(vec![moved]);
         assert!(changed);
-        // key, seq, three empty counts and one empty dimension table, then index, three offsets and yaw.
-        assert_eq!(Message::PositionDelta(delta.clone()).body().len(), 4 + 4 + 2 + 1 + 2 + 2 + (2 + 1 + 1 + 1 + 1));
+        // stream, key, seq, three empty counts and one empty dimension table, then index, three offsets and yaw.
+        assert_eq!(Message::PositionDelta(delta.clone()).body().len(), 4 + 4 + 4 + 2 + 1 + 2 + 2 + (2 + 1 + 1 + 1 + 1));
     }
 
     #[test]
     fn every_truncation_of_a_position_message_is_an_error() {
-        let key = Message::PositionKey(PositionKey { key: 1, markers: vec![marker(1, 4)] });
+        let key = Message::PositionKey(PositionKey { stream: 0, key: 1, markers: vec![marker(1, 4)] });
         let delta = Message::PositionDelta(PositionDelta {
+            stream: 0,
             key: 1,
             seq: 1,
             removed: vec![0],
@@ -922,11 +1080,11 @@ mod tests {
 
     #[test]
     fn hostile_position_messages_are_refused() {
-        let mut too_many = 1u32.to_le_bytes().to_vec();
+        let mut too_many = vec![0; 8];
         too_many.extend_from_slice(&[0, 0xff, 0xff]);
         assert_eq!(Message::decode(7, &too_many), Err(DecodeError::TooMany));
 
-        let mut overlong = vec![0; 8];
+        let mut overlong = vec![0; 12];
         overlong.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0, 0]);
         assert_eq!(Message::decode(8, &overlong), Err(DecodeError::BadNumber));
     }
@@ -936,7 +1094,7 @@ mod tests {
         let mut encoder = ChannelEncoder::default();
         let mut table = PositionTable::default();
         let mut world: Vec<Marker> = (0..40).map(|id| marker(id, id as i32 * 8)).collect();
-        table.apply_key(encoder.key_frame(1, world.clone()));
+        table.apply_key(encoder.key_frame(0, 1, world.clone()));
         let mut random = 0x2545_f491_u32;
         for round in 0..200u128 {
             random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -967,7 +1125,7 @@ mod tests {
     #[test]
     fn an_unchanged_channel_says_so() {
         let mut encoder = ChannelEncoder::default();
-        encoder.key_frame(1, vec![marker(1, 0)]);
+        encoder.key_frame(0, 1, vec![marker(1, 0)]);
         assert!(!encoder.delta(vec![marker(1, 0)]).1);
         assert!(encoder.delta(vec![marker(1, 8)]).1);
         let (delta, changed) = encoder.delta(vec![marker(1, 8)]);
@@ -982,26 +1140,63 @@ mod tests {
         let (first, _) = encoder.delta(vec![]);
         assert!(!table.apply_delta(first), "no key frame yet");
 
-        table.apply_key(encoder.key_frame(2, vec![marker(1, 0)]));
+        table.apply_key(encoder.key_frame(0, 2, vec![marker(1, 0)]));
         let shown = table.markers().to_vec();
-        let other_key = PositionDelta { key: 1, seq: 5, ..PositionDelta::default() };
+        let other_key = PositionDelta { stream: 0, key: 1, seq: 5, ..PositionDelta::default() };
         assert!(!table.apply_delta(&other_key));
-        let bad_index = PositionDelta { key: 2, seq: 5, removed: vec![9], ..PositionDelta::default() };
+        let bad_index = PositionDelta { stream: 0, key: 2, seq: 5, removed: vec![9], ..PositionDelta::default() };
         assert!(!table.apply_delta(&bad_index));
         assert_eq!(table.markers(), shown);
 
-        let newer = PositionDelta { key: 2, seq: 5, removed: vec![0], ..PositionDelta::default() };
+        let newer = PositionDelta { stream: 0, key: 2, seq: 5, removed: vec![0], ..PositionDelta::default() };
         assert!(table.apply_delta(&newer));
         assert!(table.markers().is_empty());
-        let older = PositionDelta { key: 2, seq: 4, ..PositionDelta::default() };
+        let older = PositionDelta { stream: 0, key: 2, seq: 4, ..PositionDelta::default() };
         assert!(!table.apply_delta(&older), "an older delta never undoes a newer one");
+    }
+
+    #[test]
+    fn stream_lists_and_clusters_roundtrip() {
+        let streams = Message::PositionStreams(vec![1, 9, u32::MAX]);
+        assert_eq!(roundtrip(streams.clone(), MAX_S2C_FRAME), streams);
+        let clusters = Message::PositionClusters(vec![
+            Cluster { dimension: "minecraft:overworld".into(), x: -80, z: 16, count: 300 },
+            Cluster { dimension: "minecraft:the_end".into(), x: 0, z: 0, count: 1 },
+        ]);
+        assert_eq!(roundtrip(clusters.clone(), MAX_S2C_FRAME), clusters);
+        assert_eq!(Message::decode(9, &[0xff, 0xff]), Err(DecodeError::TooMany));
+    }
+
+    #[test]
+    fn a_client_holds_only_the_streams_it_was_told_to() {
+        let mut tables = PositionTables::default();
+        for stream in [1, 2] {
+            let markers = vec![marker(u128::from(stream), 0)];
+            assert!(tables.apply(Message::PositionKey(PositionKey { stream, key: stream, markers })));
+        }
+        assert_eq!(tables.marker_count(), 2);
+        tables.apply(Message::PositionStreams(vec![2]));
+        assert_eq!(tables.markers().map(|m| m.uuid).collect::<Vec<_>>(), [2]);
+        let unknown = PositionDelta { stream: 1, key: 1, seq: 1, ..PositionDelta::default() };
+        assert!(!tables.apply(Message::PositionDelta(unknown)));
+        tables.apply(Message::PositionStreams(vec![]));
+        assert_eq!(tables.marker_count(), 0);
+    }
+
+    #[test]
+    fn a_confused_server_cannot_grow_the_client_without_limit() {
+        let mut tables = PositionTables::default();
+        for stream in 0..MAX_STREAMS as u32 + 10 {
+            tables.apply(Message::PositionKey(PositionKey { stream, key: 1, markers: vec![marker(1, 0)] }));
+        }
+        assert_eq!(tables.marker_count(), MAX_STREAMS);
     }
 
     #[test]
     fn an_empty_key_frame_clears_the_map() {
         let mut table = PositionTable::default();
-        table.apply_key(PositionKey { key: 1, markers: vec![marker(1, 0)] });
-        table.apply_key(PositionKey { key: 2, markers: vec![] });
+        table.apply_key(PositionKey { stream: 0, key: 1, markers: vec![marker(1, 0)] });
+        table.apply_key(PositionKey { stream: 0, key: 2, markers: vec![] });
         assert!(table.markers().is_empty());
     }
 

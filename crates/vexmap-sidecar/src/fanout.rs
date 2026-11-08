@@ -1,7 +1,8 @@
 //! Decides who sees whom and turns the newest positions into ready frames (rule 8: the mod only forwards them).
 //!
-//! A channel is a set of viewers who all see the same markers, so each frame is built once however many read it. A key
-//! frame carries the whole channel every 10 s, and each delta describes the present against that key frame. A delta can
+//! A channel is a set of viewers who all see the same markers, so each frame is built once however many read it. A large
+//! channel is divided into streams per cell of the world: a viewer reads the cells around them and sees the rest as
+//! clusters. A key frame carries the whole channel every 10 s, and each delta describes the present against that key frame. A delta can
 //! therefore be lost or dropped under backpressure at no cost.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,7 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use vexmap_core::{Core, CoreError, CountryId, MAX_JOURNAL_PAGE, Role};
 use vexmap_link::{Delivery, encode_deliveries};
-use vexmap_proto::{ChannelEncoder, MAX_S2C_FRAME, Marker, Message, PositionKey, encode};
+use vexmap_proto::{ChannelEncoder, Cluster, MAX_S2C_FRAME, Marker, Message, encode};
 
 use crate::feed::PositionStore;
 
@@ -19,6 +20,16 @@ use crate::feed::PositionStore;
 const STEP: Duration = Duration::from_millis(500);
 /// Steps between key frames: 10 s.
 const KEY_EVERY: u32 = 20;
+/// Up to this many markers everyone in a channel sees all of them. Past it the channel is divided into cells.
+const DETAIL_ALL_UP_TO: usize = 256;
+/// A divided channel goes back only below this, so a channel at the limit does not flip every step.
+const DETAIL_RESUMES_BELOW: usize = 192;
+/// A cell of a divided channel: 1024 blocks, in 1/8 of a block. A viewer reads the 3x3 around them.
+const CELL: i32 = 1024 * 8;
+/// The coarse grid of clusters: 4096 blocks, in 1/8 of a block.
+const CLUSTER_CELL: i32 = 4096 * 8;
+/// Clusters change slowly: every 2 s is enough.
+const CLUSTERS_EVERY: u32 = 4;
 
 /// What decides which markers a player may see. Always read from the database, never from the game or the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,17 +61,37 @@ pub struct Online {
     pub marker: Marker,
 }
 
-struct ChannelState {
+/// One part of a channel: all of it, or one cell of the world.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Area {
+    Whole,
+    Cell(String, i32, i32),
+}
+
+type StreamKey = (Channel, Area);
+
+struct StreamState {
+    id: u32,
     encoder: ChannelEncoder,
     key_frame: Vec<u8>,
     steps: u32,
 }
 
+#[derive(Default)]
+struct ViewerState {
+    streams: Vec<u32>,
+    clustered: bool,
+}
+
 /// What each region must send, per step. Pure, so every visibility rule is testable without sockets.
 #[derive(Default)]
 pub struct Fanout {
-    channels: HashMap<Channel, ChannelState>,
-    subscribed: HashMap<u128, Channel>,
+    streams: HashMap<StreamKey, StreamState>,
+    viewers: HashMap<u128, ViewerState>,
+    divided: HashSet<Channel>,
+    clusters: HashMap<Channel, Vec<Cluster>>,
+    step_number: u32,
+    next_stream: u32,
     next_key: u32,
     next_message: u32,
 }
@@ -75,6 +106,31 @@ fn route(out: &mut Routed, viewers: &[&Online], frame: &[u8]) {
     for (region, viewers) in by_region {
         out.entry(region.to_owned()).or_default().push(Delivery { viewers, frame: frame.to_vec() });
     }
+}
+
+fn cell_of(marker: &Marker) -> Area {
+    Area::Cell(marker.dimension.clone(), marker.x.div_euclid(CELL), marker.z.div_euclid(CELL))
+}
+
+/// Players summed up on a coarse grid, each group placed at its own centre.
+fn clusters_of(markers: &[Marker]) -> Vec<Cluster> {
+    let mut groups: BTreeMap<(&str, i32, i32), (i64, i64, u32)> = BTreeMap::new();
+    for marker in markers {
+        let cell = (marker.dimension.as_str(), marker.x.div_euclid(CLUSTER_CELL), marker.z.div_euclid(CLUSTER_CELL));
+        let group = groups.entry(cell).or_default();
+        group.0 += i64::from(marker.x);
+        group.1 += i64::from(marker.z);
+        group.2 += 1;
+    }
+    groups
+        .into_iter()
+        .map(|((dimension, _, _), (x, z, count))| Cluster {
+            dimension: dimension.to_owned(),
+            x: (x / i64::from(count)) as i32,
+            z: (z / i64::from(count)) as i32,
+            count: count.min(u32::from(u16::MAX)) as u16,
+        })
+        .collect()
 }
 
 impl Fanout {
@@ -96,9 +152,21 @@ impl Fanout {
         }
     }
 
+    /// Whether this channel is divided now. Two limits, so a channel at the edge does not flip every step.
+    fn update_division(&mut self, channel: &Channel, markers: usize) -> bool {
+        if markers > DETAIL_ALL_UP_TO {
+            self.divided.insert(channel.clone());
+        } else if markers < DETAIL_RESUMES_BELOW {
+            self.divided.remove(channel);
+        }
+        self.divided.contains(channel)
+    }
+
     /// `online` is sorted by player and holds each player once.
     pub fn step(&mut self, online: &[Online], directory: &HashMap<u128, Viewer>) -> Routed {
-        let mut out = Routed::new();
+        let number = self.step_number;
+        self.step_number = number.wrapping_add(1);
+
         let mut audiences: BTreeMap<Channel, Vec<&Online>> = BTreeMap::new();
         let mut countries: HashMap<&CountryId, Vec<Marker>> = HashMap::new();
         for player in online {
@@ -110,66 +178,209 @@ impl Fanout {
                 countries.entry(country).or_default().push(player.marker.clone());
             }
         }
+        let present: HashSet<u128> = online.iter().map(|player| player.marker.uuid).collect();
+        self.viewers.retain(|uuid, _| present.contains(uuid));
 
-        // Whoever lost their channel but is still here must stop seeing what they saw.
-        let present: HashMap<u128, &Online> = online.iter().map(|player| (player.marker.uuid, player)).collect();
-        self.subscribed.retain(|uuid, _| present.contains_key(uuid));
-        let cleared: Vec<&Online> = self
-            .subscribed
-            .keys()
-            .filter(|uuid| directory.get(uuid).and_then(channel_of).is_none())
-            .filter_map(|uuid| present.get(uuid).copied())
-            .collect();
-        if !cleared.is_empty() {
-            let key = self.next_key();
-            if let Some(frame) = self.frame(&Message::PositionKey(PositionKey { key, markers: Vec::new() })) {
-                route(&mut out, &cleared, &frame);
-            }
-            for viewer in &cleared {
-                self.subscribed.remove(&viewer.marker.uuid);
-            }
-        }
-
-        let mut channels = HashMap::with_capacity(audiences.len());
-        for (channel, viewers) in audiences {
-            let markers = match &channel {
+        // Who reads which stream, and what each stream holds.
+        let mut readers: BTreeMap<StreamKey, Vec<&Online>> = BTreeMap::new();
+        let mut contents: HashMap<StreamKey, Vec<Marker>> = HashMap::new();
+        let mut wanted: HashMap<u128, Vec<StreamKey>> = HashMap::new();
+        let mut channel_clusters: Vec<(&Channel, Vec<Cluster>)> = Vec::new();
+        for (channel, viewers) in &audiences {
+            let markers: Vec<Marker> = match channel {
                 Channel::Everyone => online.iter().map(|player| player.marker.clone()).collect(),
                 Channel::Country(country) => countries.remove(country).unwrap_or_default(),
             };
-            let state = self.advance(&channel, &viewers, markers, &mut out);
-            for viewer in &viewers {
-                self.subscribed.insert(viewer.marker.uuid, channel.clone());
+            if !self.update_division(channel, markers.len()) {
+                let key = (channel.clone(), Area::Whole);
+                readers.insert(key.clone(), viewers.clone());
+                for viewer in viewers {
+                    wanted.entry(viewer.marker.uuid).or_default().push(key.clone());
+                }
+                contents.insert(key, markers);
+                continue;
             }
-            if let Some(state) = state {
-                channels.insert(channel, state);
+            channel_clusters.push((channel, clusters_of(&markers)));
+            let mut cells: HashMap<Area, Vec<Marker>> = HashMap::new();
+            for marker in markers {
+                cells.entry(cell_of(&marker)).or_default().push(marker);
+            }
+            for viewer in viewers {
+                let Area::Cell(dimension, cell_x, cell_z) = cell_of(&viewer.marker) else { continue };
+                for x in cell_x - 1..=cell_x + 1 {
+                    for z in cell_z - 1..=cell_z + 1 {
+                        let area = Area::Cell(dimension.clone(), x, z);
+                        if cells.contains_key(&area) {
+                            let key = (channel.clone(), area);
+                            readers.entry(key.clone()).or_default().push(viewer);
+                            wanted.entry(viewer.marker.uuid).or_default().push(key);
+                        }
+                    }
+                }
+            }
+            for (area, list) in cells {
+                let key = (channel.clone(), area);
+                if readers.contains_key(&key) {
+                    contents.insert(key, list);
+                }
             }
         }
-        // A channel nobody reads costs nothing, and comes back with a key frame.
-        self.channels = channels;
+
+        // Key frames and deltas. Viewers' old subscriptions are still in place, which tells who has just joined.
+        let mut frames = Routed::new();
+        let mut streams = HashMap::with_capacity(readers.len());
+        let mut ids: HashMap<&StreamKey, u32> = HashMap::with_capacity(readers.len());
+        for (key, viewers) in &readers {
+            let markers = contents.remove(key).unwrap_or_default();
+            if let Some(state) = self.advance(key, viewers, markers, &mut frames) {
+                ids.insert(key, state.id);
+                streams.insert(key.clone(), state);
+            }
+        }
+        // A stream nobody reads costs nothing, and comes back with a key frame.
+        self.streams = streams;
+
+        let mut out = Routed::new();
+        self.send_stream_lists(online, &wanted, &ids, number, &mut out);
+        self.send_clusters(online, &audiences, channel_clusters, number, &mut out);
+        for (region, deliveries) in frames {
+            out.entry(region).or_default().extend(deliveries);
+        }
         out
+    }
+
+    /// Goes first, so a client never drops a stream it is about to receive. Repeated with the key frames, because a
+    /// lost list would otherwise leave markers on the client for good.
+    fn send_stream_lists(
+        &mut self,
+        online: &[Online],
+        wanted: &HashMap<u128, Vec<StreamKey>>,
+        ids: &HashMap<&StreamKey, u32>,
+        number: u32,
+        out: &mut Routed,
+    ) {
+        let repeat = number.is_multiple_of(KEY_EVERY + 1);
+        let mut by_list: BTreeMap<Vec<u32>, Vec<&Online>> = BTreeMap::new();
+        for player in online {
+            let uuid = player.marker.uuid;
+            let mut list: Vec<u32> = wanted
+                .get(&uuid)
+                .map_or(Vec::new(), |keys| keys.iter().filter_map(|key| ids.get(key).copied()).collect());
+            list.sort_unstable();
+            let known = self.viewers.get(&uuid);
+            if known.map_or(!list.is_empty(), |state| state.streams != list) || (repeat && !list.is_empty()) {
+                by_list.entry(list.clone()).or_default().push(player);
+            }
+            if !list.is_empty() || known.is_some_and(|state| state.clustered) {
+                self.viewers.entry(uuid).or_default().streams = list;
+            } else {
+                self.viewers.remove(&uuid);
+            }
+        }
+        for (list, viewers) in by_list {
+            if let Some(frame) = self.frame(&Message::PositionStreams(list)) {
+                route(out, &viewers, &frame);
+            }
+        }
+    }
+
+    fn send_clusters(
+        &mut self,
+        online: &[Online],
+        audiences: &BTreeMap<Channel, Vec<&Online>>,
+        channel_clusters: Vec<(&Channel, Vec<Cluster>)>,
+        number: u32,
+        out: &mut Routed,
+    ) {
+        let mut in_divided: HashSet<u128> = HashSet::new();
+        let refresh = number.is_multiple_of(CLUSTERS_EVERY);
+        for (channel, clusters) in channel_clusters {
+            let Some(viewers) = audiences.get(channel) else { continue };
+            let changed = self.clusters.get(channel).is_none_or(|known| refresh && *known != clusters);
+            if changed {
+                self.clusters.insert(channel.clone(), clusters);
+            }
+            let Some(current) = self.clusters.get(channel).cloned() else { continue };
+            let is_new =
+                |viewer: &&&Online| !self.viewers.get(&viewer.marker.uuid).is_some_and(|state| state.clustered);
+            let addressees: Vec<&Online> = viewers.iter().filter(|viewer| changed || is_new(viewer)).copied().collect();
+            if !addressees.is_empty()
+                && let Some(frame) = self.frame(&Message::PositionClusters(current))
+            {
+                route(out, &addressees, &frame);
+            }
+            for viewer in viewers {
+                in_divided.insert(viewer.marker.uuid);
+                self.viewers.entry(viewer.marker.uuid).or_default().clustered = true;
+            }
+        }
+        self.clusters.retain(|channel, _| self.divided.contains(channel) && audiences.contains_key(channel));
+
+        let finished: Vec<&Online> = online
+            .iter()
+            .filter(|player| {
+                !in_divided.contains(&player.marker.uuid)
+                    && self.viewers.get(&player.marker.uuid).is_some_and(|state| state.clustered)
+            })
+            .collect();
+        if !finished.is_empty()
+            && let Some(frame) = self.frame(&Message::PositionClusters(Vec::new()))
+        {
+            route(out, &finished, &frame);
+        }
+        for viewer in finished {
+            if let Some(state) = self.viewers.get_mut(&viewer.marker.uuid) {
+                state.clustered = false;
+            }
+        }
     }
 
     fn advance(
         &mut self,
-        channel: &Channel,
+        key: &StreamKey,
         viewers: &[&Online],
         markers: Vec<Marker>,
         out: &mut Routed,
-    ) -> Option<ChannelState> {
-        let state = self.channels.remove(channel);
-        let Some(mut state) = state.filter(|state| state.steps < KEY_EVERY) else {
-            let key = self.next_key();
-            let mut encoder = ChannelEncoder::default();
-            let key_frame = self.frame(&Message::PositionKey(encoder.key_frame(key, markers)))?;
-            route(out, viewers, &key_frame);
-            return Some(ChannelState { encoder, key_frame, steps: 0 });
-        };
+    ) -> Option<StreamState> {
+        match self.streams.remove(key) {
+            Some(state) if state.steps < KEY_EVERY => self.send_delta(state, viewers, markers, out),
+            previous => self.send_key(previous.map(|state| state.id), viewers, markers, out),
+        }
+    }
+
+    /// A key frame on schedule keeps its stream, and a new stream takes a new number.
+    fn send_key(
+        &mut self,
+        id: Option<u32>,
+        viewers: &[&Online],
+        markers: Vec<Marker>,
+        out: &mut Routed,
+    ) -> Option<StreamState> {
+        let id = id.unwrap_or_else(|| {
+            self.next_stream = self.next_stream.wrapping_add(1);
+            self.next_stream
+        });
+        let key = self.next_key();
+        let mut encoder = ChannelEncoder::default();
+        let key_frame = self.frame(&Message::PositionKey(encoder.key_frame(id, key, markers)))?;
+        route(out, viewers, &key_frame);
+        Some(StreamState { id, encoder, key_frame, steps: 0 })
+    }
+
+    fn send_delta(
+        &mut self,
+        mut state: StreamState,
+        viewers: &[&Online],
+        markers: Vec<Marker>,
+        out: &mut Routed,
+    ) -> Option<StreamState> {
         state.steps += 1;
         let (delta, changed) = state.encoder.delta(markers);
         let message = Message::PositionDelta(delta.clone());
         let frame = self.frame(&message)?;
-        let (joined, staying): (Vec<&Online>, Vec<&Online>) =
-            viewers.iter().copied().partition(|viewer| self.subscribed.get(&viewer.marker.uuid) != Some(channel));
+        let (joined, staying): (Vec<&Online>, Vec<&Online>) = viewers.iter().copied().partition(|viewer| {
+            self.viewers.get(&viewer.marker.uuid).is_none_or(|known| !known.streams.contains(&state.id))
+        });
         if changed {
             route(out, &staying, &frame);
         }
@@ -252,7 +463,7 @@ pub async fn run(core: Core, store: Arc<PositionStore>) {
 
 #[cfg(test)]
 mod tests {
-    use vexmap_proto::{Feed, Limits, PositionTable, Reassembler};
+    use vexmap_proto::{Feed, Limits, PositionTables, Reassembler};
 
     use super::*;
 
@@ -284,7 +495,8 @@ mod tests {
     /// Plays deliveries into one client per player and shows what each of them ends up seeing.
     #[derive(Default)]
     struct Clients {
-        tables: HashMap<u128, PositionTable>,
+        tables: HashMap<u128, PositionTables>,
+        bytes: HashMap<u128, usize>,
     }
 
     impl Clients {
@@ -293,27 +505,21 @@ mod tests {
                 for viewer in &delivery.viewers {
                     let mut reassembler = Reassembler::new(Limits::default());
                     let Feed::Complete { kind, body } = reassembler.feed(&delivery.frame, 0) else { panic!() };
-                    let table = self.tables.entry(*viewer).or_default();
-                    match Message::decode(kind, &body).unwrap() {
-                        Message::PositionKey(frame) => table.apply_key(frame),
-                        Message::PositionDelta(delta) => {
-                            table.apply_delta(&delta);
-                        }
-                        other => panic!("{other:?}"),
-                    }
+                    *self.bytes.entry(*viewer).or_default() += delivery.frame.len();
+                    self.tables.entry(*viewer).or_default().apply(Message::decode(kind, &body).unwrap());
                 }
             }
         }
 
         fn sees(&self, viewer: u128) -> Vec<u128> {
             let mut seen: Vec<u128> =
-                self.tables.get(&viewer).map_or(Vec::new(), |table| table.markers().iter().map(|m| m.uuid).collect());
+                self.tables.get(&viewer).map_or(Vec::new(), |table| table.markers().map(|m| m.uuid).collect());
             seen.sort_unstable();
             seen
         }
 
         fn x_of(&self, viewer: u128, target: u128) -> Option<i32> {
-            self.tables.get(&viewer)?.markers().iter().find(|m| m.uuid == target).map(|m| m.x)
+            self.tables.get(&viewer)?.markers().find(|m| m.uuid == target).map(|m| m.x)
         }
     }
 
@@ -382,7 +588,8 @@ mod tests {
         for _ in 0..KEY_EVERY {
             assert!(fanout.step(&online, &dir).is_empty());
         }
-        assert_eq!(fanout.step(&online, &dir)["a"].len(), 1);
+        // The stream list is repeated in case the earlier one was lost, together with the key frame.
+        assert_eq!(fanout.step(&online, &dir)["a"].len(), 2);
     }
 
     #[test]
@@ -430,6 +637,107 @@ mod tests {
         clients.apply(&fanout.step(&online, &dir));
         clients.apply(&fanout.step(&online, &dir));
         assert_eq!(clients.sees(1), [1, 2]);
+    }
+
+    /// A country far over the limit, spread over the world: 25 members per cell.
+    fn crowd(step: i32) -> Vec<Online> {
+        (0..5000).map(|uuid| player(uuid, "a", uuid as i32 * 320 + step * 16)).collect()
+    }
+
+    fn crowd_directory() -> HashMap<u128, Viewer> {
+        (0..5000).map(|uuid| (uuid, member("north"))).collect()
+    }
+
+    #[test]
+    fn a_large_channel_shows_the_neighbourhood_and_sums_up_the_rest() {
+        let dir = crowd_directory();
+        let mut fanout = Fanout::default();
+        let mut clients = Clients::default();
+        clients.apply(&fanout.step(&crowd(0), &dir));
+
+        let seen = clients.sees(2500);
+        assert!(seen.contains(&2500) && seen.contains(&2510));
+        assert!(!seen.contains(&0), "a member 100 km away is not a marker");
+        assert!(seen.len() < 200, "{}", seen.len());
+        let table = &clients.tables[&2500];
+        let total: u32 = table.clusters().iter().map(|cluster| u32::from(cluster.count)).sum();
+        assert_eq!(total, 5000, "everyone is still accounted for");
+    }
+
+    #[test]
+    fn walking_into_the_next_cell_changes_what_is_shown() {
+        let mut members = vec![(1, member("north"))];
+        let mut online = vec![player(1, "a", 0)];
+        for uuid in 2..400u128 {
+            members.push((uuid, member("north")));
+            online.push(player(uuid, "a", 8192 * 10 + uuid as i32));
+        }
+        let dir: HashMap<u128, Viewer> = members.into_iter().collect();
+        let mut fanout = Fanout::default();
+        let mut clients = Clients::default();
+        clients.apply(&fanout.step(&online, &dir));
+        assert_eq!(clients.sees(1), [1]);
+
+        online[0] = player(1, "a", 8192 * 9);
+        clients.apply(&fanout.step(&online, &dir));
+        clients.apply(&fanout.step(&online, &dir));
+        assert_eq!(clients.sees(1).len(), 399);
+
+        online[0] = player(1, "a", 0);
+        clients.apply(&fanout.step(&online, &dir));
+        clients.apply(&fanout.step(&online, &dir));
+        assert_eq!(clients.sees(1), [1], "markers left behind are gone");
+    }
+
+    #[test]
+    fn a_channel_that_shrinks_goes_back_to_showing_everyone() {
+        let mut dir = HashMap::new();
+        let many: Vec<Online> = (0..300).map(|uuid| player(uuid, "a", uuid as i32 * 8192 * 4)).collect();
+        for uuid in 0..300 {
+            dir.insert(uuid, member("north"));
+        }
+        let mut fanout = Fanout::default();
+        let mut clients = Clients::default();
+        clients.apply(&fanout.step(&many, &dir));
+        assert!(clients.sees(0).len() < 10);
+
+        // Between the two limits it stays divided, so a channel at the limit does not flip every step.
+        let middle = &many[..DETAIL_RESUMES_BELOW + 10];
+        clients.apply(&fanout.step(middle, &dir));
+        assert!(clients.sees(0).len() < 10);
+
+        let few = &many[..DETAIL_RESUMES_BELOW - 1];
+        clients.apply(&fanout.step(few, &dir));
+        clients.apply(&fanout.step(few, &dir));
+        assert_eq!(clients.sees(0).len(), DETAIL_RESUMES_BELOW - 1);
+        assert!(clients.tables[&0].clusters().is_empty(), "clusters go away with the division");
+    }
+
+    #[test]
+    fn another_country_never_shares_a_cell() {
+        let mut dir = crowd_directory();
+        for uuid in (0..5000).step_by(2) {
+            dir.insert(uuid, member("south"));
+        }
+        let mut clients = Clients::default();
+        clients.apply(&Fanout::default().step(&crowd(0), &dir));
+        assert!(clients.sees(2500).iter().all(|uuid| uuid % 2 == 0));
+        assert!(clients.sees(2501).iter().all(|uuid| uuid % 2 == 1));
+    }
+
+    /// The budget of ADR "Бюджеты": 16 KB/s on average. Every member of a 5000-strong channel walks all the time.
+    #[test]
+    fn the_largest_channel_stays_inside_the_traffic_budget() {
+        let dir = crowd_directory();
+        let mut fanout = Fanout::default();
+        let mut clients = Clients::default();
+        let steps = KEY_EVERY as i32 * 3;
+        for step in 0..steps {
+            clients.apply(&fanout.step(&crowd(step), &dir));
+        }
+        let per_second = clients.bytes[&2500] as f64 / (f64::from(steps) * STEP.as_secs_f64());
+        println!("traffic to one viewer: {:.0} B/s", per_second);
+        assert!(per_second < 16_000.0, "{per_second:.0} B/s");
     }
 
     #[test]

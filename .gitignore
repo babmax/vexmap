@@ -3,6 +3,8 @@
 target/
 .local/
 dist/
+# Graphify's generated knowledge graph, rebuilt with `graphify extract . --code-only --cargo`.
+graphify-out/
 # The sidecar's local development database.
 *.db
 *.db-shm

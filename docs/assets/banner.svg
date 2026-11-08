@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" role="img" aria-label="VexMap: круглая карта мира внутри Minecraft">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1020"/>
+      <stop offset="1" stop-color="#14264a"/>
+    </linearGradient>
+    <radialGradient id="sea" cx="38%" cy="32%" r="80%">
+      <stop offset="0" stop-color="#5cb4f2"/>
+      <stop offset="1" stop-color="#1c5fa8"/>
+    </radialGradient>
+    <radialGradient id="air" cx="50%" cy="50%" r="50%">
+      <stop offset=".78" stop-color="#6fc4ff" stop-opacity=".42"/>
+      <stop offset="1" stop-color="#6fc4ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="shade" cx="34%" cy="30%" r="86%">
+      <stop offset=".55" stop-color="#04101f" stop-opacity="0"/>
+      <stop offset="1" stop-color="#04101f" stop-opacity=".55"/>
+    </radialGradient>
+    <clipPath id="ball"><circle cx="960" cy="210" r="168"/></clipPath>
+  </defs>
+  <rect width="1280" height="420" rx="20" fill="url(#sky)"/>
+  <g fill="#ffffff">
+    <circle cx="640" cy="58" r="1.6" opacity=".7"/><circle cx="702" cy="340" r="1.3" opacity=".5"/>
+    <circle cx="1204" cy="62" r="1.7" opacity=".8"/><circle cx="1236" cy="300" r="1.2" opacity=".5"/>
+    <circle cx="742" cy="130" r="1.2" opacity=".6"/><circle cx="1180" cy="382" r="1.5" opacity=".6"/>
+    <circle cx="580" cy="372" r="1.3" opacity=".5"/><circle cx="1262" cy="176" r="1.1" opacity=".6"/>
+  </g>
+  <circle cx="960" cy="210" r="212" fill="url(#air)"/>
+  <circle cx="960" cy="210" r="168" fill="url(#sea)"/>
+  <g clip-path="url(#ball)">
+    <path d="M820 96c44-30 92-34 124-20 26 11 32 38 14 58-16 18-12 44-38 54-34 13-58-8-90-4-30 4-52-14-48-42 3-20 18-34 38-46z" fill="#8fce7f"/>
+    <path d="M976 66c40-16 96-8 122 22 20 24 8 54-20 62-26 8-36 32-66 28-30-4-46-26-44-54 2-26 2-46 8-58z" fill="#e9c77b"/>
+    <path d="M1010 204c34-14 84-10 106 16 18 22 8 66-22 86-30 20-74 18-98-6-22-22-26-48-16-66 6-14 16-24 30-30z" fill="#c7a0e8"/>
+    <path d="M846 226c34-16 78-6 104 18 24 22 26 62 2 88-22 24-72 26-104 8-30-17-46-50-36-78 6-16 18-28 34-36z" fill="#f29a8a"/>
+    <g fill="none" stroke="#10325e" stroke-width="2.2" stroke-opacity=".75">
+      <path d="M820 96c44-30 92-34 124-20 26 11 32 38 14 58-16 18-12 44-38 54-34 13-58-8-90-4-30 4-52-14-48-42 3-20 18-34 38-46z"/>
+      <path d="M976 66c40-16 96-8 122 22 20 24 8 54-20 62-26 8-36 32-66 28-30-4-46-26-44-54 2-26 2-46 8-58z"/>
+      <path d="M1010 204c34-14 84-10 106 16 18 22 8 66-22 86-30 20-74 18-98-6-22-22-26-48-16-66 6-14 16-24 30-30z"/>
+      <path d="M846 226c34-16 78-6 104 18 24 22 26 62 2 88-22 24-72 26-104 8-30-17-46-50-36-78 6-16 18-28 34-36z"/>
+    </g>
+    <g fill="none" stroke="#ffffff" stroke-opacity=".17" stroke-width="1.2">
+      <circle cx="960" cy="210" r="44"/><circle cx="960" cy="210" r="88"/><circle cx="960" cy="210" r="132"/>
+      <path d="M792 210h336M960 42v336M841 91l238 238M1079 91 841 329"/>
+    </g>
+    <path d="M876 142C924 166 948 150 1008 124M1008 124C1040 170 1070 198 1056 262M876 142C872 196 880 236 898 282" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-dasharray="1 10"/>
+  </g>
+  <circle cx="960" cy="210" r="168" fill="url(#shade)"/>
+  <g stroke="#ffffff" stroke-width="3">
+    <circle cx="876" cy="142" r="9" fill="#3fa34d"/>
+    <circle cx="1008" cy="124" r="9" fill="#d9912b"/>
+    <circle cx="1056" cy="262" r="9" fill="#8a56c9"/>
+    <circle cx="898" cy="282" r="9" fill="#d9503f"/>
+  </g>
+  <g font-family="Segoe UI,Helvetica,Arial,sans-serif">
+    <text x="76" y="172" font-size="92" font-weight="800" fill="#ffffff" letter-spacing="-2">VexMap</text>
+    <text x="80" y="226" font-size="30" font-weight="600" fill="#bcd6ff">Круглая карта мира внутри Minecraft</text>
+    <text x="80" y="268" font-size="20" fill="#92a8cc">Страны, GPS, панорамы, вики и войны прямо в клиенте</text>
+    <text x="80" y="298" font-size="20" fill="#92a8cc">Rust · Horizon · цель 5000+ игроков</text>
+  </g>
+</svg>

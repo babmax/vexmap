@@ -1,11 +1,55 @@
-# VexMap
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="VexMap: круглая карта мира внутри Minecraft" width="100%">
+</p>
 
-Карта мира в духе Google Maps и Google Earth внутри Minecraft 26.3 на [Horizon](https://github.com/horizon-rust/horizon).
-Нативный мод для клиента и для серверов регионов. Лицензия MIT.
+<p align="center">
+  <a href="https://github.com/babmax/vexmap/actions/workflows/ci.yml"><img src="https://github.com/babmax/vexmap/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-35d0a5" alt="MIT"></a>
+  <img src="https://img.shields.io/badge/Rust-1.99-b7410e?logo=rust" alt="Rust 1.99">
+  <img src="https://img.shields.io/badge/Minecraft-26.3%20on%20Horizon-4f9dff" alt="Minecraft 26.3 on Horizon">
+  <img src="https://img.shields.io/badge/status-Phase%203-ffb547" alt="Phase 3">
+</p>
 
-Состояние: Фаза 3, realtime-слой. Позиции игроков доходят до клиентов по каналам стран, но карта их пока не рисует. Ядро данных и локальный API уже есть. План и решения лежат в [docs/](docs/).
+**VexMap** это функциональный аналог Google Maps и Google Earth для ролевого мира на [Horizon](https://github.com/horizon-rust/horizon), Rust-версии Minecraft Java 26.3.
+Нативный мод для клиента и серверов регионов: круглая карта и 3D-глобус, GPS, страны и границы, места с отзывами, панорамы улиц, вики, дипломатия и войны. Всё внутри игры, без сайта.
 
-## Устройство
+> [!NOTE]
+> Проект в разработке, идёт Фаза 3 из 15. Позиции игроков уже доходят до клиентов по каналам стран, но карта их пока не рисует: интерфейс появится в Фазах 4–5.
+
+## Что уже работает
+
+| | |
+|---|---|
+| **Допуск** | Только клиенты с модом, рукопожатие проходит через прокси Velocity и переходы между серверами |
+| **Данные** | Игроки, роли, страны, выключатели модулей и журнал изменений на SQLite и PostgreSQL |
+| **Локальный API** | REST для RP-модов, только loopback, с лимитами и идемпотентностью |
+| **Позиции** | Снимок 2 Гц, кванты 1/8 блока, ключевые кадры и дельты |
+| **Видимость** | Участник страны видит свою страну, модераторы и выше видят всех. Решает сервер |
+| **Масштаб** | Большие каналы делятся на клетки и кластеры: 1,9 КБ/с на зрителя в симуляции канала на 5000 игроков |
+| **Изоляция** | Тик не ждёт сеть и базу. Sidecar упал, а игра продолжается |
+| **Релизы** | Подпись minisign и воспроизводимые архивы |
+
+Замеры, стендовые тесты и нерешённые вопросы лежат в [docs/phase-3](docs/phase-3/README.md).
+
+## Архитектура
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Клиенты подключаются через Velocity к серверам регионов, а те по локальному TCP к sidecar с базой данных" width="100%">
+</p>
+
+Ключевые решения и их альтернативы записаны как ADR: [аудит Horizon](docs/phase-0/audit.md), [Фаза 0](docs/phase-0/adr.md), [Фаза 2](docs/phase-2/README.md), [Фаза 3](docs/phase-3/README.md).
+
+## Фазы
+
+<p align="center">
+  <img src="docs/assets/roadmap.svg" alt="Фаза 0 готова, у Фаз 1 и 2 готова основа, идёт Фаза 3, Фазы с 4 по 15 впереди" width="100%">
+</p>
+
+## Устройство кода
+
+<p align="center">
+  <img src="docs/assets/code-graph.svg" alt="Граф символов кода, раскрашенный по компонентам. Центральные узлы: Core, CoreError, Module, Role, Message" width="100%">
+</p>
 
 ```text
 mods/vexmap/                 бандл horizon-mixins: один мод на клиент и сервер
@@ -13,17 +57,17 @@ mods/vexmap/                 бандл horizon-mixins: один мод на к�
   mixins/vexmap/proto.rs     протокол, только std, он же крейт vexmap-proto
   mixins/vexmap/runtime.rs   связь с API Horizon
 crates/vexmap-proto/         Cargo-обёртка над proto.rs для тестов и sidecar
-crates/vexmap-core/          игроки, роли, выключатели модулей, журнал изменений (SQLite и PostgreSQL)
-crates/vexmap-sidecar/       отдельный процесс: ядро данных за локальным REST API, приём потока игроков
-crates/vexmap-link/          Cargo-обёртка над sidecar_link.rs: связь сервера региона с sidecar и формат потока
+crates/vexmap-core/          игроки, роли, страны, выключатели модулей, журнал изменений
+crates/vexmap-sidecar/       отдельный процесс: REST API, приём игроков, раздача позиций
+crates/vexmap-link/          Cargo-обёртка над sidecar_link.rs: связь сервера региона с sidecar
 tools/dev/stage.py           применить мод к Horizon и запустить cargo (Windows и Linux)
 tools/release/sign.py        архивы релиза, SHA256SUMS, подпись minisign
 ```
 
-## Команды
+## Быстрый старт
 
 ```sh
-cargo test --workspace                                # протокол, без сборки игры
+cargo test --workspace                                # протокол, ядро и sidecar, без сборки игры
 python tools/dev/stage.py check mods/vexmap           # мод внутри настоящего Horizon
 python tools/dev/stage.py build mods/vexmap           # клиент с модом, профиль fast
 cargo run -p vexmap-sidecar                           # локальный API на 127.0.0.1:7878, база SQLite рядом
@@ -43,3 +87,7 @@ RWSFNDOgqs3Sr6jDLI06gzKF/1NtoK6CV9S14KIx65gPS+KLqHTvWn5o
 minisign -Vm SHA256SUMS -p vexmap.pub
 sha256sum -c SHA256SUMS
 ```
+
+## Лицензия
+
+[MIT](LICENSE). Код и изображения в этом репозитории оригинальные. Файлы игры и ассеты Mojang сюда не входят: игроку нужен свой аккаунт с Java Edition.

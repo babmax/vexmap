@@ -231,8 +231,8 @@ struct Client {
     handshake: proto::ClientHandshake,
     inbound: proto::Reassembler,
     outbox: proto::Outbox,
-    positions: proto::PositionTable,
-    reported_markers: Option<usize>,
+    positions: proto::PositionTables,
+    reported_markers: usize,
 }
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
@@ -243,17 +243,17 @@ fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
         handshake: proto::ClientHandshake::default(),
         inbound: proto::Reassembler::new(proto::Limits::default()),
         outbox: proto::Outbox::default(),
-        positions: proto::PositionTable::default(),
-        reported_markers: None,
+        positions: proto::PositionTables::default(),
+        reported_markers: 0,
     });
     Some(f(client))
 }
 
 /// The map is not drawn yet, so the log is the only sign of the table. Only when the number of markers changes.
 fn report_markers(client: &mut Client) {
-    let count = client.positions.markers().len();
-    if client.reported_markers != Some(count) {
-        client.reported_markers = Some(count);
+    let count = client.positions.marker_count();
+    if client.reported_markers != count {
+        client.reported_markers = count;
         log(format_args!("positions: {count} markers"));
     }
 }
@@ -314,12 +314,11 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
             proto::Message::Ping(stamp) => {
                 send_to_server(game, &mut client.outbox, &proto::Message::Pong(stamp));
             }
-            proto::Message::PositionKey(frame) => {
-                client.positions.apply_key(frame);
-                report_markers(client);
-            }
-            proto::Message::PositionDelta(delta) => {
-                if client.positions.apply_delta(&delta) {
+            message @ (proto::Message::PositionKey(_)
+            | proto::Message::PositionDelta(_)
+            | proto::Message::PositionStreams(_)
+            | proto::Message::PositionClusters(_)) => {
+                if client.positions.apply(message) {
                     report_markers(client);
                 }
             }

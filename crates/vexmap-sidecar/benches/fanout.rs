@@ -53,9 +53,23 @@ fn benches(c: &mut Criterion) {
         })
     });
 
+    let one_country: HashMap<u128, Viewer> = directory
+        .keys()
+        .map(|uuid| (*uuid, Viewer { role: Role::Player, country: CountryId::new("north").ok() }))
+        .collect();
+    let mut divided = Fanout::default();
+    divided.step(&online(0), &one_country);
+    let mut flip = false;
+    c.bench_function("fanout_5000_players_one_divided_channel", |b| {
+        b.iter(|| {
+            flip = !flip;
+            black_box(divided.step(if flip { &moved } else { &moved_again }, &one_country).len())
+        })
+    });
+
     let mut encoder = ChannelEncoder::default();
     let mut table = PositionTable::default();
-    table.apply_key(encoder.key_frame(1, (0..MARKERS_ON_A_CLIENT).map(|uuid| marker(uuid, 0)).collect()));
+    table.apply_key(encoder.key_frame(0, 1, (0..MARKERS_ON_A_CLIENT).map(|uuid| marker(uuid, 0)).collect()));
     let (delta, _) = encoder.delta((0..MARKERS_ON_A_CLIENT).map(|uuid| marker(uuid, 1)).collect());
     let mut delta = delta.clone();
     c.bench_function("client_apply_delta_1000_markers", |b| {

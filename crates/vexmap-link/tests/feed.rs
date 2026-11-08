@@ -389,11 +389,13 @@ async fn next_key_for(
         if boxes.deliveries.try_take(&mut read) {
             for delivery in read.iter().filter(|delivery| delivery.viewers.contains(&viewer)) {
                 let (header, data) = parse_frame(&delivery.frame).unwrap();
-                if let Message::PositionKey(frame) = Message::decode(header.kind, data).unwrap() {
-                    let seen: Vec<u128> = frame.markers.iter().map(|marker| marker.uuid).collect();
-                    if wanted(&seen) {
-                        return seen;
-                    }
+                let seen: Vec<u128> = match Message::decode(header.kind, data).unwrap() {
+                    Message::PositionKey(frame) => frame.markers.iter().map(|marker| marker.uuid).collect(),
+                    Message::PositionStreams(streams) if streams.is_empty() => Vec::new(),
+                    _ => continue,
+                };
+                if wanted(&seen) {
+                    return seen;
                 }
             }
         }
