@@ -107,7 +107,9 @@ docs/phase-1/horizon-prs.md      PR в Horizon и временные микси�
 |---|---|
 | Протокол `proto.rs`, 16 тестов | Готово, проходят на Windows |
 | Мод `mods/vexmap`: рукопожатие, допуск, `Probe` | Готово. `stage.py check` на пине `6560641`: компилируется без предупреждений из нашего кода |
-| `ci.yml`, `upstream.yml`, `release.yml` | Написаны, **не запускались**: нет репозитория на GitHub |
+| `ci.yml` | Зелёный на [github.com/babmax/vexmap](https://github.com/babmax/vexmap): тесты на Linux, macOS и Windows, `stage.py check` на Linux за 4,5 мин с холодным кэшем |
+| `upstream.yml`, `release.yml` | Не запускались: первый ночной прогон и первый тег впереди |
 | `sign.py` | Архивы воспроизводимы (одинаковый SHA-256 при повторе). Подпись не проверена: нет ключа |
 | Ручной тест: клиент через Velocity, вход с модом и отказ без мода | Не проведён |
-| Сборка на Linux, `--trust-native-code`, ключ minisign | За владельцем |
+| Linux | `cargo check` мода проходит в CI. Полная сборка сервера и запуск на Linux ещё не проверены |
+| `--trust-native-code`, ключ minisign | За владельцем |
