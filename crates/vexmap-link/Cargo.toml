@@ -1,0 +1,19 @@
+[package]
+name = "vexmap-link"
+description = "The region server's link to the VexMap sidecar. The same file is injected into the game."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# This exact source is also injected into Horizon as the `vexmap_link` module, see mods/vexmap/mixins/vexmap.
+path = "../../mods/vexmap/mixins/vexmap/sidecar_link.rs"
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+vexmap-core.workspace = true
+vexmap-sidecar = { path = "../vexmap-sidecar" }

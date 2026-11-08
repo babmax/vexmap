@@ -4,10 +4,13 @@
 1. A client with the mod joins server a through the proxy and is admitted (`[vexmap] admit`), then is moved to b and
    back: each server admits it again (the `Probe` path, since the client cannot see a proxy switch).
 2. The launcher's stock Horizon client (same version, no vexmap mod) joins and must be kicked with our message.
+3. Phase 3: each server takes its region's modules from the sidecar (tiles on in a, off in b), and when the sidecar dies
+   a server keeps its last modules and still admits players.
 
 Local only, everything under .deps/run/admission. Reuses the S5 harness (two servers, Velocity, horizon-ctl).
 
     python tools/dev/stage.py build mods/vexmap
+    cargo build -p vexmap-sidecar
     python tools/dev/admission_test.py
 """
 import json
@@ -18,6 +21,7 @@ import secrets
 import subprocess
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import s5_measure as s5  # noqa: E402
@@ -26,6 +30,9 @@ s5.RUN = s5.DEPS / "run" / "admission"
 MODDED = s5.BIN / "horizon-client.exe"
 STOCK = s5.VERSION / "horizon-client.exe"
 CLIENT_LOG = Path(os.environ["TEMP"]) / "horizon-control.log"
+SIDECAR = s5.ROOT / "target" / "debug" / "vexmap-sidecar.exe"
+SIDECAR_ADDR = "127.0.0.1:25620"
+TILES_BIT = 1 << 1
 
 
 def lines(path, needle):
@@ -44,6 +51,47 @@ def wait_for(path, needle, before, seconds):
     return None
 
 
+def admitted_region_mask(path):
+    """The module mask in the newest `[vexmap] admit` line of a server log, or None."""
+    found = re.findall(r"region (0x[0-9a-f]+)", "\n".join(lines(path, "[vexmap] admit")))
+    return int(found[-1], 16) if found else None
+
+
+def api(method, path, key=None, body=None):
+    request = urllib.request.Request(f"http://{SIDECAR_ADDR}{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode())
+    request.add_header("X-VexMap-Client", "bench")
+    request.add_header("Content-Type", "application/json")
+    if key:
+        request.add_header("Idempotency-Key", key)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def start_sidecar():
+    """A sidecar on a fresh database with tiles on everywhere except region b."""
+    s5.RUN.mkdir(parents=True, exist_ok=True)
+    database = s5.RUN / "sidecar.db"
+    for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+        path.unlink(missing_ok=True)
+    env = dict(os.environ, VEXMAP_API_ADDR=SIDECAR_ADDR,
+               VEXMAP_DATABASE_URL=f"sqlite:{database.as_posix()}?mode=rwc")
+    process = subprocess.Popen([str(SIDECAR)], env=env, stdout=(s5.RUN / "sidecar.log").open("w", encoding="utf-8"),
+                               stderr=subprocess.STDOUT)
+    deadline = time.monotonic() + 20
+    while True:
+        try:
+            with urllib.request.urlopen(f"http://{SIDECAR_ADDR}/healthz", timeout=2):
+                break
+        except OSError:
+            if process.poll() is not None or time.monotonic() > deadline:
+                raise SystemExit("the sidecar did not start, see sidecar.log")
+            time.sleep(0.2)
+    api("PUT", "/v1/features/tiles", "bench-1", {"enabled": True})
+    api("PUT", "/v1/features/tiles", "bench-2", {"enabled": False, "region": "b"})
+    return process
+
+
 def launch(game):
     return s5.ctl("launch", "--game", str(game), "--resources", str(s5.RESOURCES), "--game-dir",
                   str(s5.RUN / "client-game"), "--width", "1280", "--height", "720", "--no-pause",
@@ -55,7 +103,7 @@ def join(logs, server="a"):
     return wait_for(logs[server], "logged in", before, 120)
 
 
-def modded(logs, results):
+def modded(logs, results, sidecar):
     s5.log("modded client")
     admits = {name: len(lines(path, "[vexmap] admit")) for name, path in logs.items()}
     welcomes = len(lines(CLIENT_LOG, "[vexmap] welcomed"))
@@ -73,9 +121,22 @@ def modded(logs, results):
         login = wait_for(logs[target], "logged in", before_login, 90)
         admit = wait_for(logs[target], "[vexmap] admit", before_admit, 20)
         moves.append({"target": target, "login_s": login,
-                      "admit_after_switch_s": admit and round(time.monotonic() - started, 2)})
+                      "admit_after_switch_s": None if admit is None else round(time.monotonic() - started, 2)})
         s5.log(json.dumps(moves[-1]))
     results["modded_switches"] = moves
+    results["region_a_mask"] = admitted_region_mask(logs["a"])
+    results["region_b_mask"] = admitted_region_mask(logs["b"])
+
+    sidecar.kill()
+    sidecar.wait(timeout=10)
+    s5.log("sidecar killed")
+    time.sleep(6)  # at least one failed poll on each server
+    before_admit = len(lines(logs["a"], "[vexmap] admit"))
+    s5.ctl("command", "server a")
+    results["admit_without_sidecar_s"] = wait_for(logs["a"], "[vexmap] admit", before_admit, 30)
+    results["region_a_mask_without_sidecar"] = admitted_region_mask(logs["a"])
+    results["sidecar_loss_logged"] = bool(lines(logs["a"], "sidecar unavailable"))
+
     time.sleep(15)  # past the 10 s deadline: no server may kick an admitted player
     results["modded_kicks"] = sum(len(lines(path, "[vexmap] kick")) for path in logs.values())
     s5.ctl("quit")
@@ -97,23 +158,28 @@ def stock(logs, results):
 
 
 def main():
-    if not MODDED.is_file() or not STOCK.is_file():
-        raise SystemExit(f"need {MODDED} (stage.py build mods/vexmap) and {STOCK}")
+    if not MODDED.is_file() or not STOCK.is_file() or not SIDECAR.is_file():
+        raise SystemExit(f"need {MODDED} (stage.py build mods/vexmap), {SIDECAR} (cargo build) and {STOCK}")
     secret = secrets.token_hex(16)
     processes, logs, results = [], {}, {}
+    sidecar = start_sidecar()
     try:
         for name, port in s5.BACKENDS.items():
-            process, logfile = s5.start_backend(name, port, secret, None)
+            region_env = {"VEXMAP_REGION": name, "VEXMAP_API_ADDR": SIDECAR_ADDR}
+            process, logfile = s5.start_backend(name, port, secret, None, extra_env=region_env)
             processes.append(process)
             logs[name] = logfile
         proxy, proxy_log = s5.start_proxy(secret)
         processes.append(proxy)
         s5.log("servers and proxy up")
-        modded(logs, results)
+        time.sleep(6)  # one poll of the sidecar by each server
+        modded(logs, results, sidecar)
         stock(logs, results)
         results["proxy_notable"] = [l[-160:] for l in proxy_log.read_text(encoding="utf-8", errors="replace")
                                     .splitlines() if re.search(r"WARN|ERROR|disconnected|kicked", l)][-10:]
     finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
         for process, command in zip(processes, ("stop\n", "stop\n", "shutdown\n")):
             try:
                 process.stdin.write(command)
@@ -126,8 +192,12 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
     passed = bool(results.get("modded_admit_a_s") is not None and results.get("modded_welcomed_client")
-                  and all(m["admit_after_switch_s"] for m in results.get("modded_switches", []))
-                  and results.get("modded_kicks") == 0 and results.get("stock_kick_after_join_s") is not None)
+                  and all(m["admit_after_switch_s"] is not None for m in results.get("modded_switches", []))
+                  and results.get("modded_kicks") == 0 and results.get("stock_kick_after_join_s") is not None
+                  and results.get("region_a_mask") == TILES_BIT and results.get("region_b_mask") == 0
+                  and results.get("admit_without_sidecar_s") is not None
+                  and results.get("region_a_mask_without_sidecar") == TILES_BIT
+                  and results.get("sidecar_loss_logged"))
     results["passed"] = passed
     (s5.RUN / "results.json").write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(results, indent=1, ensure_ascii=False))

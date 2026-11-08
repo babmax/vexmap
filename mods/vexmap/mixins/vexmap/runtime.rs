@@ -4,14 +4,19 @@
 //
 // Phase 1 carries only the handshake and admission (ADR-007). Map features arrive behind feature bits in later phases.
 
+use super::vexmap_link as link;
 use super::vexmap_proto as proto;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 pub(super) const MOD_VERSION: &str = "0.1.0";
-/// Feature bits this build knows. Phase 1 has none; later modules each get a bit and a server flag.
+/// Modules this client build implements, as bits of `Hello.features`. None yet: each arrives with its phase.
 pub(super) const FEATURES: u64 = 0;
+
+/// Modules switched on for this region, kept current by the sidecar link. All off until the sidecar first answers.
+static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
 
 const KICK_NO_MOD: &str = "VexMap: this server needs the VexMap client mod.\n\
 Этому серверу нужен клиентский мод VexMap.";
@@ -37,12 +42,30 @@ static SERVER: Mutex<Option<Server>> = Mutex::new(None);
 
 fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
     let mut guard = SERVER.lock().ok()?;
-    let server = guard.get_or_insert_with(|| Server {
-        gate: proto::AdmissionGate::new(FEATURES),
-        inbound: HashMap::new(),
-        outbox: proto::Outbox::default(),
+    let server = guard.get_or_insert_with(|| {
+        start_sidecar_link();
+        Server {
+            gate: proto::AdmissionGate::new(SERVER_FEATURES.load(Ordering::Relaxed)),
+            inbound: HashMap::new(),
+            outbox: proto::Outbox::default(),
+        }
     });
     Some(f(server))
+}
+
+/// Runs once, on the first server hook, so a player's client never starts the thread. A failure leaves all modules off
+/// and admission working.
+fn start_sidecar_link() {
+    let addr = std::env::var("VEXMAP_API_ADDR").ok();
+    let region = std::env::var("VEXMAP_REGION").ok();
+    match link::Config::parse(addr.as_deref(), region.as_deref()) {
+        Ok(config) => {
+            if let Err(error) = link::start(config, &SERVER_FEATURES) {
+                log(format_args!("sidecar link did not start: {error}"));
+            }
+        }
+        Err(error) => log(format_args!("sidecar link is off: {error}")),
+    }
 }
 
 fn send_to_player(
@@ -121,9 +144,13 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
         let Ok(message) = proto::Message::decode(kind, &body) else { return };
         match message {
             proto::Message::Hello { protocol, features, mod_version } => {
+                server.gate.server_features = SERVER_FEATURES.load(Ordering::Relaxed);
                 match server.gate.hello(player, protocol, features) {
                     proto::HelloOutcome::Welcome { features } => {
-                        log(format_args!("admit {player:032x} mod {mod_version} features {features:#x}"));
+                        let region_modules = server.gate.server_features;
+                        log(format_args!(
+                            "admit {player:032x} mod {mod_version} features {features:#x} region {region_modules:#x}"
+                        ));
                         let welcome = proto::Message::Welcome { protocol: proto::PROTOCOL, features };
                         send_to_player(game, &mut server.outbox, player, &welcome);
                     }

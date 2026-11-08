@@ -81,7 +81,7 @@ def serve(directory):
 TRANSFERS = "expect_seconds=20,max_expect_seconds=60,max_expected=8,max_freeze_seconds=30,max_hold_seconds=60"
 
 
-def start_backend(name, port, secret, pack, transfers=False):
+def start_backend(name, port, secret, pack, transfers=False, extra_env=None):
     directory = RUN / name
     directory.mkdir(parents=True, exist_ok=True)
     properties = {"server-ip": "127.0.0.1", "server-port": str(port), "online-mode": "false", "level-seed": "12345",
@@ -96,7 +96,7 @@ def start_backend(name, port, secret, pack, transfers=False):
     (directory / "eula.txt").write_text("eula=true\n")
     (directory / "forwarding.secret").write_text(secret)
     env = dict(os.environ, VEXMAP_S3_SIZE="800", VEXMAP_S3_MSGS="1", HORIZON_NO_AUDIO="1",
-               HORIZON_HOME=str(directory / "home"))
+               HORIZON_HOME=str(directory / "home"), **(extra_env or {}))
     logfile = directory / "server.log"
     extra = []
     if transfers:

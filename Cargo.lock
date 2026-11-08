@@ -1689,6 +1689,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vexmap-link"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "vexmap-core",
+ "vexmap-sidecar",
+]
+
+[[package]]
 name = "vexmap-proto"
 version = "0.1.0"
 

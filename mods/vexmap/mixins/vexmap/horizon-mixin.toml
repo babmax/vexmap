@@ -14,6 +14,13 @@ file = "crates/horizon-client/src/game.rs"
 name = "vexmap_proto"
 source = "proto.rs"
 
+# Runtime refers to it as `super::vexmap_link`. Also the `vexmap-link` crate.
+[[module]]
+id = "sidecar-link"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_link"
+source = "sidecar_link.rs"
+
 [[module]]
 id = "runtime"
 file = "crates/horizon-client/src/game.rs"
