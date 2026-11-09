@@ -93,6 +93,27 @@ impl TileStore {
     }
 }
 
+impl TileStore {
+    /// Writes the tile unless the stored one already shows exactly these pixels. Then the version stays, so no client
+    /// downloads it again and nothing above it in the pyramid needs a redraw. Returns whether anything was written.
+    pub fn write_if_changed(
+        &self,
+        dimension: &str,
+        id: TileId,
+        version: u32,
+        pixels: &[u8; TILE_AREA],
+    ) -> io::Result<bool> {
+        // A stored tile that does not read back is simply replaced.
+        if let Ok(Some(old)) = self.read_pixels(dimension, id)
+            && old.as_ref() == pixels
+        {
+            return Ok(false);
+        }
+        self.write(dimension, id, version, pixels)?;
+        Ok(true)
+    }
+}
+
 /// One region file found on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Found {
@@ -156,7 +177,10 @@ fn region_of(path: &Path) -> Option<(i32, i32)> {
 pub struct ScanReport {
     pub regions: usize,
     pub damaged_chunks: usize,
+    /// Tiles written.
     pub tiles: usize,
+    /// Tiles redrawn that came out exactly as before: not written, so clients keep theirs.
+    pub unchanged: usize,
 }
 
 /// Walks the world folders and redraws whatever changed since the last pass.
@@ -205,10 +229,13 @@ impl Scanner {
             report.damaged_chunks += read.damaged;
             for (index, pixels) in rasterize(&columns).iter().enumerate() {
                 let id = TileId { level: 0, x: x * 2 + (index % 2) as i32, z: z * 2 + (index / 2) as i32 };
-                self.store.write(dimension, id, version, pixels)?;
-                report.tiles += 1;
-                if let Some(parent) = id.parent() {
-                    dirty.entry(dimension.clone()).or_default().insert(parent);
+                if self.store.write_if_changed(dimension, id, version, pixels)? {
+                    report.tiles += 1;
+                    if let Some(parent) = id.parent() {
+                        dirty.entry(dimension.clone()).or_default().insert(parent);
+                    }
+                } else {
+                    report.unchanged += 1;
                 }
             }
             let attempts = self.attempts.entry(key.clone()).or_insert(0);
@@ -224,9 +251,12 @@ impl Scanner {
                 let started = std::time::Instant::now();
                 let mut parents = BTreeSet::new();
                 for id in &tiles {
-                    self.rebuild(&dimension, *id, version)?;
-                    report.tiles += 1;
-                    parents.extend(id.parent());
+                    if self.rebuild(&dimension, *id, version)? {
+                        report.tiles += 1;
+                        parents.extend(id.parent());
+                    } else {
+                        report.unchanged += 1;
+                    }
                 }
                 self.pause_after(started.elapsed());
                 if parents.is_empty() {
@@ -239,14 +269,14 @@ impl Scanner {
         Ok(report)
     }
 
-    fn rebuild(&self, dimension: &str, id: TileId, version: u32) -> io::Result<()> {
-        let Some(children) = id.children() else { return Ok(()) };
+    fn rebuild(&self, dimension: &str, id: TileId, version: u32) -> io::Result<bool> {
+        let Some(children) = id.children() else { return Ok(false) };
         let mut loaded: [Option<Box<[u8; TILE_AREA]>>; 4] = [None, None, None, None];
         for (slot, child) in loaded.iter_mut().zip(children) {
             *slot = self.store.read_pixels(dimension, child)?;
         }
         let view: [Option<&[u8; TILE_AREA]>; 4] = std::array::from_fn(|index| loaded[index].as_deref());
-        self.store.write(dimension, id, version, &downsample(view))
+        self.store.write_if_changed(dimension, id, version, &downsample(view))
     }
 }
 
@@ -310,6 +340,24 @@ mod tests {
         decode_tile(&tile.encoded, &mut back).unwrap();
         assert_eq!(back, pixels);
         assert_eq!(store.read("../evil:x", id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_redrawn_tile_that_looks_the_same_keeps_its_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TileStore::new(directory.path());
+        let (world, id) = ("minecraft:overworld", TileId { level: 0, x: 1, z: 1 });
+        let mut pixels = Box::new([3; TILE_AREA]);
+        assert!(store.write_if_changed(world, id, 10, &pixels).unwrap());
+        assert!(!store.write_if_changed(world, id, 11, &pixels).unwrap());
+        assert_eq!(store.read(world, id).unwrap().unwrap().version, 10);
+        pixels[5] = 4;
+        assert!(store.write_if_changed(world, id, 12, &pixels).unwrap());
+        assert_eq!(store.read(world, id).unwrap().unwrap().version, 12);
+        // A file that does not decode is replaced, not an error.
+        let path = directory.path().join("public/minecraft~overworld/0/1.1.vxt");
+        std::fs::write(&path, [1, 0, 0, 0, 200]).unwrap();
+        assert!(store.write_if_changed(world, id, 13, &pixels).unwrap());
     }
 
     #[test]
