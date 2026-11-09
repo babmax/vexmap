@@ -10,7 +10,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -21,6 +21,7 @@ use vexmap_core::{
 
 pub mod fanout;
 pub mod feed;
+pub mod network;
 pub mod tiles;
 
 pub use feed::PositionStore;
@@ -113,10 +114,11 @@ struct AppState {
     core: Core,
     limiter: Arc<Limiter>,
     positions: Arc<PositionStore>,
+    routes: Arc<network::RouteCache>,
 }
 
 pub fn router(core: Core, rate: RateLimit, positions: Arc<PositionStore>) -> Router {
-    let state = AppState { core, limiter: Arc::new(Limiter::new(rate)), positions };
+    let state = AppState { core, limiter: Arc::new(Limiter::new(rate)), positions, routes: Arc::default() };
     let api = Router::new()
         .route("/positions", get(get_positions))
         .route("/players/{id}", get(get_player).put(put_player))
@@ -125,6 +127,11 @@ pub fn router(core: Core, rate: RateLimit, positions: Arc<PositionStore>) -> Rou
         .route("/features", get(get_features))
         .route("/features/{module}", put(put_feature))
         .route("/journal", get(get_journal))
+        .route("/network", get(network::get_network))
+        .route("/network/nodes", post(network::post_node))
+        .route("/network/lines", post(network::post_line))
+        .route("/network/lines/{id}/closed", put(network::put_line_closed))
+        .route("/route", post(network::post_route))
         .route_layer(middleware::from_fn_with_state(state.clone(), limit_client));
     Router::new()
         .route("/healthz", get(healthz))

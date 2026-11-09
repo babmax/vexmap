@@ -29,6 +29,14 @@ pub(crate) fn check_set_country(actor: Option<Role>) -> Result<(), CoreError> {
     }
 }
 
+/// Drawing and closing roads. Rulers of countries join in Phase 7, wars close sections in Phase 11.
+pub(crate) fn check_edit_network(actor: Option<Role>) -> Result<(), CoreError> {
+    match actor {
+        None | Some(Role::Admin | Role::Owner) => Ok(()),
+        Some(_) => Err(CoreError::Forbidden("only admins and the owner can edit the route network")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,7 +69,9 @@ mod tests {
             assert!(check_set_role(Some(actor), Role::Player, Role::Player).is_err());
             assert!(check_set_feature(Some(actor)).is_err());
             assert!(check_set_country(Some(actor)).is_err());
+            assert!(check_edit_network(Some(actor)).is_err());
         }
+        assert!(check_edit_network(Some(Role::Admin)).is_ok() && check_edit_network(None).is_ok());
         assert!(check_set_feature(Some(Role::Admin)).is_ok());
         assert!(check_set_country(Some(Role::Admin)).is_ok());
         assert!(check_set_country(None).is_ok());

@@ -248,6 +248,29 @@ impl Module {
     }
 }
 
+/// How a line of the route network is travelled. Stored by name, so the names never change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMode {
+    Walk,
+    Boat,
+    Train,
+}
+
+impl RouteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteMode::Walk => "walk",
+            RouteMode::Boat => "boat",
+            RouteMode::Train => "train",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [RouteMode::Walk, RouteMode::Boat, RouteMode::Train].into_iter().find(|mode| mode.as_str() == value)
+    }
+}
+
 /// A player name as the game allows it.
 pub(crate) fn validate_player_name(name: &str) -> Result<(), CoreError> {
     if !name.is_empty() && name.len() <= 16 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {

@@ -194,3 +194,68 @@ async fn a_flooding_client_gets_429() {
     let (status, body) = send(&app, request("GET", "/v1/journal", None, None)).await;
     assert_eq!((status, body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
 }
+
+async fn draw(app: &Router, key: &str, uri: &str, body: Value) -> i64 {
+    let (status, reply) = send(app, request("POST", uri, Some(key), Some(body))).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    reply["seq"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn a_network_is_drawn_and_a_route_is_built_over_it() {
+    let (core, _dir) = core().await;
+    let app = router(core, OPEN, Default::default());
+    let a = draw(&app, "n1", "/v1/network/nodes", json!({"x": 0, "z": 0})).await;
+    let b = draw(&app, "n2", "/v1/network/nodes", json!({"x": 100, "z": 0})).await;
+    let c = draw(&app, "n3", "/v1/network/nodes", json!({"x": 100, "z": -100})).await;
+    draw(&app, "l1", "/v1/network/lines", json!({"a": a, "b": b, "mode": "walk"})).await;
+    let second = draw(&app, "l2", "/v1/network/lines", json!({"a": b, "b": c, "mode": "walk"})).await;
+
+    let (_, network) = send(&app, request("GET", "/v1/network", None, None)).await;
+    assert_eq!((network["nodes"].as_array().unwrap().len(), network["lines"].as_array().unwrap().len()), (3, 2));
+
+    let ask = json!({"stops": [{"x": 0, "z": 0}, {"x": 100, "z": -100}], "modes": ["walk"]});
+    let (status, route) = send(&app, request("POST", "/v1/route", None, Some(ask.clone()))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(route["length"], 200.0);
+    assert_eq!(route["hints"][0]["turn"], "left");
+    assert_eq!(route["legs"][0]["mode"], "walk");
+
+    // Closing the second road takes the network away from the end stop, so the walk there is a straight line.
+    let closed = format!("/v1/network/lines/{second}/closed");
+    let (status, _) = send(&app, request("PUT", &closed, Some("c1"), Some(json!({"closed": true})))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, detour) = send(&app, request("POST", "/v1/route", None, Some(ask.clone()))).await;
+    assert!(detour["legs"].as_array().unwrap().iter().any(|leg| leg["kind"] == "direct"));
+    // Without walking allowed there is no honest straight line, so the answer is "no route".
+    let by_rail = json!({"stops": [{"x": 0, "z": 0}, {"x": 100, "z": -100}], "modes": ["train"]});
+    let (status, body) = send(&app, request("POST", "/v1/route", None, Some(by_rail))).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("no_route")));
+    // Reopening brings the cached graph up to date: the route is on the network again.
+    send(&app, request("PUT", &closed, Some("c2"), Some(json!({"closed": false})))).await;
+    let (_, again) = send(&app, request("POST", "/v1/route", None, Some(ask))).await;
+    assert_eq!(again["length"], 200.0);
+}
+
+#[tokio::test]
+async fn the_network_api_refuses_what_it_should() {
+    let (core, _dir) = core().await;
+    let app = router(core, OPEN, Default::default());
+    let id = Uuid::new_v4();
+    // A player with no powers cannot draw.
+    let body = json!({"x": 1, "z": 1, "actor": id});
+    let (status, _) = send(&app, request("POST", "/v1/network/nodes", Some("k1"), Some(body))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&app, request("POST", "/v1/network/nodes", None, Some(json!({"x": 1, "z": 1})))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a write needs an Idempotency-Key");
+    let unknown = json!({"stops": [{"x": 0, "z": 0}, {"x": 1, "z": 1}], "modes": ["plane"]});
+    assert_eq!(send(&app, request("POST", "/v1/route", None, Some(unknown))).await.0, StatusCode::BAD_REQUEST);
+    let one = json!({"stops": [{"x": 0, "z": 0}]});
+    assert_eq!(send(&app, request("POST", "/v1/route", None, Some(one))).await.0, StatusCode::BAD_REQUEST);
+    let slow = json!({"stops": [{"x": 0, "z": 0}, {"x": 1, "z": 1}], "walk_speed": -1});
+    assert_eq!(send(&app, request("POST", "/v1/route", None, Some(slow))).await.0, StatusCode::BAD_REQUEST);
+    // Off the network a route is still a straight walk.
+    let open = json!({"stops": [{"x": 0, "z": 0}, {"x": 30, "z": 40}]});
+    let (status, route) = send(&app, request("POST", "/v1/route", None, Some(open))).await;
+    assert_eq!((status, &route["legs"][0]["kind"], &route["length"]), (StatusCode::OK, &json!("direct"), &json!(50.0)));
+}

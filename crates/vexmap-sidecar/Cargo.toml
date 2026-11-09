@@ -17,6 +17,7 @@ uuid.workspace = true
 vexmap-core.workspace = true
 vexmap-link.workspace = true
 vexmap-proto.workspace = true
+vexmap-routing.workspace = true
 vexmap-tiler.workspace = true
 
 [[bench]]

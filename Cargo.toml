@@ -12,6 +12,7 @@ license = "MIT"
 vexmap-core = { path = "crates/vexmap-core" }
 vexmap-link = { path = "crates/vexmap-link" }
 vexmap-proto = { path = "crates/vexmap-proto" }
+vexmap-routing = { path = "crates/vexmap-routing" }
 vexmap-tiler = { path = "crates/vexmap-tiler" }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

@@ -2188,6 +2188,7 @@ dependencies = [
  "vexmap-core",
  "vexmap-link",
  "vexmap-proto",
+ "vexmap-routing",
  "vexmap-tiler",
 ]
 

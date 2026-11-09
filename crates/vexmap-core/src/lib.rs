@@ -17,10 +17,18 @@ use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::migrate::Migrator;
 use sqlx::{AnyPool, Row};
 
-pub use types::{Actor, Category, ClientName, CommandContext, CountryId, Module, PlayerId, RegionId, RequestId, Role};
+pub use types::{
+    Actor, Category, ClientName, CommandContext, CountryId, Module, PlayerId, RegionId, RequestId, Role, RouteMode,
+};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
 static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("migrations/postgres");
+
+/// Bounds that keep a runaway editor from filling the database and every client's memory.
+pub const MAX_ROUTE_NODES: i64 = 200_000;
+pub const MAX_ROUTE_LINES: i64 = 500_000;
+/// Block coordinates the world allows, with room to spare.
+pub const MAX_ROUTE_COORDINATE: i64 = 30_000_000;
 
 /// The most journal rows one read returns.
 pub const MAX_JOURNAL_PAGE: i64 = 1000;
@@ -73,6 +81,32 @@ impl Player {
     fn to_json(&self) -> Value {
         json!({ "name": self.name, "role": self.role, "categories": self.categories, "country": self.country })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteNode {
+    pub id: i64,
+    pub x: i64,
+    pub z: i64,
+    pub transfer: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteLine {
+    pub id: i64,
+    pub a: i64,
+    pub b: i64,
+    pub mode: RouteMode,
+    pub one_way: bool,
+    pub closed: bool,
+}
+
+/// The whole network at one moment. `version` changes whenever any node or line does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteNetwork {
+    pub version: i64,
+    pub nodes: Vec<RouteNode>,
+    pub lines: Vec<RouteLine>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -333,6 +367,209 @@ impl Core {
             }
         }
         Ok(flags.into_iter().filter(|(_, (_, enabled))| *enabled).map(|(module, _)| module).collect())
+    }
+
+    /// The newest change to the network, 0 when it is empty. Cheap, so a cache can ask before rebuilding.
+    pub async fn route_network_version(&self) -> Result<i64, CoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
+             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// The network as of one snapshot, nodes and lines ordered by id.
+    pub async fn route_network(&self) -> Result<RouteNetwork, CoreError> {
+        let mut tx = self.pool.begin().await?;
+        let version: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
+             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let node_rows =
+            sqlx::query("SELECT id, x, z, transfer FROM route_nodes ORDER BY id").fetch_all(&mut *tx).await?;
+        let line_rows = sqlx::query("SELECT id, a, b, mode, one_way, closed FROM route_lines ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        let nodes = node_rows
+            .iter()
+            .map(|row| {
+                Ok(RouteNode {
+                    id: row.try_get(0)?,
+                    x: row.try_get(1)?,
+                    z: row.try_get(2)?,
+                    transfer: row.try_get::<i64, _>(3)? != 0,
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        let lines = line_rows
+            .iter()
+            .map(|row| {
+                let mode: String = row.try_get(3)?;
+                Ok(RouteLine {
+                    id: row.try_get(0)?,
+                    a: row.try_get(1)?,
+                    b: row.try_get(2)?,
+                    mode: RouteMode::parse(&mode).ok_or_else(|| CoreError::Corrupt(format!("route mode {mode:?}")))?,
+                    one_way: row.try_get::<i64, _>(4)? != 0,
+                    closed: row.try_get::<i64, _>(5)? != 0,
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        Ok(RouteNetwork { version, nodes, lines })
+    }
+
+    /// Adds a node (a junction, a bend, or with `transfer` a station where the mode may change). Its id is the returned
+    /// `seq`. Two nodes cannot share a block.
+    pub async fn add_route_node(
+        &self,
+        ctx: &CommandContext,
+        x: i64,
+        z: i64,
+        transfer: bool,
+    ) -> Result<Outcome, CoreError> {
+        if x.abs() > MAX_ROUTE_COORDINATE || z.abs() > MAX_ROUTE_COORDINATE {
+            return Err(CoreError::Invalid("coordinate is outside the world".into()));
+        }
+        let (mut tx, seq) = match self.begin_write(ctx).await? {
+            Write::Open { tx, seq } => (tx, seq),
+            Write::Replayed(seq) => return Ok(Outcome::Replayed { seq }),
+        };
+        access::check_edit_network(actor_role(&mut tx, &ctx.actor).await?)?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_nodes").fetch_one(&mut **tx).await?;
+        if count >= MAX_ROUTE_NODES {
+            return Err(CoreError::Invalid("the network has the most nodes it may".into()));
+        }
+        let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM route_nodes WHERE x = $1 AND z = $2")
+            .bind(x)
+            .bind(z)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if taken.is_some() {
+            return Err(CoreError::Invalid("there already is a node at this block".into()));
+        }
+        sqlx::query("INSERT INTO route_nodes (id, x, z, transfer, updated_seq) VALUES ($1, $2, $3, $4, $5)")
+            .bind(seq)
+            .bind(x)
+            .bind(z)
+            .bind(i64::from(transfer))
+            .bind(seq)
+            .execute(&mut **tx)
+            .await?;
+        let object_id = seq.to_string();
+        let change = Change {
+            kind: "route.node_added",
+            object_type: "route_node",
+            object_id: &object_id,
+            before: None,
+            after: json!({ "x": x, "z": z, "transfer": transfer }),
+        };
+        finish(tx, ctx, seq, change).await
+    }
+
+    /// Draws a line between two existing nodes. Its id is the returned `seq`. A pair of nodes has at most one line per
+    /// mode, whichever way round, so a second drawing is refused instead of doubling the road.
+    pub async fn add_route_line(
+        &self,
+        ctx: &CommandContext,
+        a: i64,
+        b: i64,
+        mode: RouteMode,
+        one_way: bool,
+    ) -> Result<Outcome, CoreError> {
+        if a == b {
+            return Err(CoreError::Invalid("a line needs two different nodes".into()));
+        }
+        let (mut tx, seq) = match self.begin_write(ctx).await? {
+            Write::Open { tx, seq } => (tx, seq),
+            Write::Replayed(seq) => return Ok(Outcome::Replayed { seq }),
+        };
+        access::check_edit_network(actor_role(&mut tx, &ctx.actor).await?)?;
+        for node in [a, b] {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM route_nodes WHERE id = $1")
+                .bind(node)
+                .fetch_optional(&mut **tx)
+                .await?;
+            if exists.is_none() {
+                return Err(CoreError::Invalid(format!("no node {node}")));
+            }
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_lines").fetch_one(&mut **tx).await?;
+        if count >= MAX_ROUTE_LINES {
+            return Err(CoreError::Invalid("the network has the most lines it may".into()));
+        }
+        let twin: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM route_lines WHERE mode = $1 AND ((a = $2 AND b = $3) OR (a = $3 AND b = $2))",
+        )
+        .bind(mode.as_str())
+        .bind(a)
+        .bind(b)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if twin.is_some() {
+            return Err(CoreError::Invalid("these nodes already have a line of this mode".into()));
+        }
+        sqlx::query(
+            "INSERT INTO route_lines (id, a, b, mode, one_way, closed, updated_seq) VALUES ($1, $2, $3, $4, $5, 0, $6)",
+        )
+        .bind(seq)
+        .bind(a)
+        .bind(b)
+        .bind(mode.as_str())
+        .bind(i64::from(one_way))
+        .bind(seq)
+        .execute(&mut **tx)
+        .await?;
+        let object_id = seq.to_string();
+        let change = Change {
+            kind: "route.line_added",
+            object_type: "route_line",
+            object_id: &object_id,
+            before: None,
+            after: json!({ "a": a, "b": b, "mode": mode, "one_way": one_way, "closed": false }),
+        };
+        finish(tx, ctx, seq, change).await
+    }
+
+    /// Closes or reopens a line (works, a closed border). Closed lines stay in the network and are skipped by routes.
+    pub async fn set_route_line_closed(
+        &self,
+        ctx: &CommandContext,
+        line: i64,
+        closed: bool,
+    ) -> Result<Outcome, CoreError> {
+        let (mut tx, seq) = match self.begin_write(ctx).await? {
+            Write::Open { tx, seq } => (tx, seq),
+            Write::Replayed(seq) => return Ok(Outcome::Replayed { seq }),
+        };
+        access::check_edit_network(actor_role(&mut tx, &ctx.actor).await?)?;
+        let before: Option<i64> = sqlx::query_scalar("SELECT closed FROM route_lines WHERE id = $1")
+            .bind(line)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let Some(before) = before else { return Err(CoreError::Invalid(format!("no line {line}"))) };
+        if before == i64::from(closed) {
+            tx.rollback().await?;
+            return Ok(Outcome::Unchanged);
+        }
+        sqlx::query("UPDATE route_lines SET closed = $1, updated_seq = $2 WHERE id = $3")
+            .bind(i64::from(closed))
+            .bind(seq)
+            .bind(line)
+            .execute(&mut **tx)
+            .await?;
+        let object_id = line.to_string();
+        let change = Change {
+            kind: "route.line_closed_changed",
+            object_type: "route_line",
+            object_id: &object_id,
+            before: Some(json!({ "closed": before != 0 })),
+            after: json!({ "closed": closed }),
+        };
+        finish(tx, ctx, seq, change).await
     }
 
     /// Takes the write lock and checks the request id. The bump comes first so that a read inside the transaction can

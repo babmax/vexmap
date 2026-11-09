@@ -270,6 +270,66 @@ async fn country_membership_is_journaled_and_guarded() {
     .await;
 }
 
+fn seq_of(outcome: Outcome) -> i64 {
+    match outcome {
+        Outcome::Applied { seq } | Outcome::Replayed { seq } => seq,
+        Outcome::Unchanged => panic!("expected a change"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_route_network_is_drawn_closed_and_journaled() {
+    use vexmap_core::RouteMode;
+    on_every_backend(|core| async move {
+        assert_eq!(core.route_network().await.unwrap().version, 0);
+        let a = seq_of(core.add_route_node(&ctx(system(), "n1"), 0, 0, false).await.unwrap());
+        let b = seq_of(core.add_route_node(&ctx(system(), "n2"), 100, 0, true).await.unwrap());
+        let line = seq_of(core.add_route_line(&ctx(system(), "l1"), a, b, RouteMode::Walk, false).await.unwrap());
+
+        let network = core.route_network().await.unwrap();
+        assert_eq!((network.nodes.len(), network.lines.len(), network.version), (2, 1, line));
+        assert!(network.nodes[1].transfer && !network.lines[0].closed);
+        assert_eq!(core.route_network_version().await.unwrap(), line);
+
+        // Refusals: same block, same pair and mode (either way round), unknown node, self loop, off the world.
+        for result in [
+            core.add_route_node(&ctx(system(), "n3"), 100, 0, false).await,
+            core.add_route_node(&ctx(system(), "n4"), 31_000_000, 0, false).await,
+            core.add_route_line(&ctx(system(), "l2"), b, a, RouteMode::Walk, true).await,
+            core.add_route_line(&ctx(system(), "l3"), a, 999_999, RouteMode::Walk, false).await,
+            core.add_route_line(&ctx(system(), "l4"), a, a, RouteMode::Walk, false).await,
+        ] {
+            assert!(matches!(result, Err(CoreError::Invalid(_))), "{result:?}");
+        }
+        // The same pair by another mode is a different line.
+        assert!(core.add_route_line(&ctx(system(), "l5"), a, b, RouteMode::Train, false).await.is_ok());
+
+        let closed = core.set_route_line_closed(&ctx(system(), "c1"), line, true).await.unwrap();
+        let version = seq_of(closed);
+        assert!(core.route_network().await.unwrap().lines[0].closed);
+        assert_eq!(core.route_network_version().await.unwrap(), version);
+        let again = core.set_route_line_closed(&ctx(system(), "c2"), line, true).await.unwrap();
+        assert_eq!(again, Outcome::Unchanged);
+        assert!(core.set_route_line_closed(&ctx(system(), "c3"), 12345, true).await.is_err());
+
+        // A retried request id does not draw twice.
+        let replay = core.add_route_node(&ctx(system(), "n1"), 5, 5, false).await.unwrap();
+        assert_eq!(replay, Outcome::Replayed { seq: a });
+        assert_eq!(core.route_network().await.unwrap().nodes.len(), 2);
+
+        let moderator = make(&core, Role::Moderator, BTreeSet::from([Category::Places])).await;
+        let refused = core.add_route_node(&ctx(Actor::Player(moderator), "n5"), 9, 9, false).await;
+        assert!(matches!(refused, Err(CoreError::Forbidden(_))));
+        let admin = make(&core, Role::Admin, none()).await;
+        assert!(core.add_route_node(&ctx(Actor::Player(admin), "n6"), 9, 9, false).await.is_ok());
+
+        let kinds: Vec<_> = core.journal(0, 100).await.unwrap().into_iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&"route.line_closed_changed".to_owned()));
+        assert_eq!(kinds.iter().filter(|k| k.starts_with("route.")).count(), 6);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn an_unsupported_database_is_refused() {
     assert!(matches!(Core::connect("mysql://x").await, Err(CoreError::Invalid(_))));

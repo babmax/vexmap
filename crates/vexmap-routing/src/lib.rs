@@ -23,6 +23,18 @@ impl Mode {
     fn index(self) -> usize {
         self as usize
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Walk => "walk",
+            Mode::Boat => "boat",
+            Mode::Train => "train",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Mode> {
+        MODES.into_iter().find(|mode| mode.as_str() == value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -407,6 +419,21 @@ pub enum Turn {
     UTurn,
 }
 
+impl Turn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Turn::Straight => "straight",
+            Turn::SlightLeft => "slight_left",
+            Turn::Left => "left",
+            Turn::SharpLeft => "sharp_left",
+            Turn::SlightRight => "slight_right",
+            Turn::Right => "right",
+            Turn::SharpRight => "sharp_right",
+            Turn::UTurn => "u_turn",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hint {
     pub at: Point,
@@ -557,6 +584,14 @@ mod tests {
     }
 
     const ALL: [Mode; 3] = [Mode::Walk, Mode::Boat, Mode::Train];
+
+    #[test]
+    fn mode_names_round_trip() {
+        for mode in ALL {
+            assert_eq!(Mode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(Mode::parse("plane"), None);
+    }
 
     #[test]
     fn walks_a_straight_road() {
