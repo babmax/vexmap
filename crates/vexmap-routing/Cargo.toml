@@ -1,0 +1,7 @@
+[package]
+name = "vexmap-routing"
+description = "VexMap routing core: graph of roads, rails and sea lanes, multi-mode search, ETA, turn hints, deviation. Pure std."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
