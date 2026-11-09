@@ -739,3 +739,189 @@ pub fn start_feed(config: FeedConfig, boxes: FeedBoxes) -> std::io::Result<()> {
     })?;
     Ok(())
 }
+
+// ---------------------------------------------------------------- route network edits
+//
+// A player's edit travels game client -> region server -> here -> sidecar. The server never judges it: the request goes
+// out with the player's UUID as `actor`, taken from the connection and not from the client, and the sidecar answers
+// from the database (rule 8). The thread below waits on the sidecar so the tick never does.
+
+use std::collections::VecDeque;
+use std::sync::Condvar;
+
+/// Edits waiting for the sidecar. Beyond this the newest are refused: a flood costs the flooder, not the game.
+pub const MAX_QUEUED_EDITS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkEdit {
+    AddNode {
+        x: i32,
+        z: i32,
+        transfer: bool,
+    },
+    /// `mode` is the API's name: `walk`, `boat` or `train`.
+    AddLine {
+        a: u64,
+        b: u64,
+        mode: &'static str,
+        one_way: bool,
+    },
+    SetClosed {
+        line: u64,
+        closed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditJob {
+    pub player: u128,
+    pub token: u32,
+    pub edit: LinkEdit,
+}
+
+/// What the sidecar said. `http` is 0 when it could not be reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditDone {
+    pub player: u128,
+    pub token: u32,
+    pub http: u16,
+    /// The `seq` of the change, which is the id of a node or line it created. 0 when there was none.
+    pub id: u64,
+    /// The sidecar said the request was a replay.
+    pub replayed: bool,
+}
+
+/// A `static` for the game: jobs in, answers out, and a thread between that waits on the sidecar.
+pub struct EditQueue {
+    jobs: Mutex<VecDeque<EditJob>>,
+    wake: Condvar,
+    done: Mutex<Vec<EditDone>>,
+}
+
+impl EditQueue {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        EditQueue { jobs: Mutex::new(VecDeque::new()), wake: Condvar::new(), done: Mutex::new(Vec::new()) }
+    }
+
+    /// For the tick. Never waits for the sidecar; `false` when the queue is full or poisoned.
+    pub fn push(&self, job: EditJob) -> bool {
+        let Ok(mut jobs) = self.jobs.try_lock() else { return false };
+        if jobs.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        jobs.push_back(job);
+        self.wake.notify_one();
+        true
+    }
+
+    /// For the tick: the answers that arrived, appended to `into`. Skips this tick when the thread holds the lock.
+    pub fn take_done(&self, into: &mut Vec<EditDone>) {
+        if let Ok(mut done) = self.done.try_lock() {
+            into.append(&mut done);
+        }
+    }
+
+    fn next(&self) -> Option<EditJob> {
+        let mut jobs = self.jobs.lock().ok()?;
+        loop {
+            if let Some(job) = jobs.pop_front() {
+                return Some(job);
+            }
+            jobs = self.wake.wait(jobs).ok()?;
+        }
+    }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, as the API reads a UUID.
+pub fn uuid_text(id: u128) -> String {
+    let hex = format!("{id:032x}");
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// The path and JSON body of the sidecar request for an edit made by `player`.
+pub fn edit_request(player: u128, edit: &LinkEdit) -> (&'static str, String, String) {
+    let actor = uuid_text(player);
+    match *edit {
+        LinkEdit::AddNode { x, z, transfer } => (
+            "POST",
+            "/v1/network/nodes".to_owned(),
+            format!("{{\"x\":{x},\"z\":{z},\"transfer\":{transfer},\"actor\":\"{actor}\"}}"),
+        ),
+        LinkEdit::AddLine { a, b, mode, one_way } => (
+            "POST",
+            "/v1/network/lines".to_owned(),
+            format!("{{\"a\":{a},\"b\":{b},\"mode\":\"{mode}\",\"one_way\":{one_way},\"actor\":\"{actor}\"}}"),
+        ),
+        LinkEdit::SetClosed { line, closed } => (
+            "PUT",
+            format!("/v1/network/lines/{line}/closed"),
+            format!("{{\"closed\":{closed},\"actor\":\"{actor}\"}}"),
+        ),
+    }
+}
+
+/// The HTTP status and the `seq` from a raw response. The body is the API's own fixed shape, so it is searched, not parsed.
+pub fn parse_edit_reply(response: &[u8]) -> Result<(u16, u64, bool), String> {
+    let text = std::str::from_utf8(response).map_err(|_| "response is not UTF-8".to_owned())?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("response has no body")?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or("response has no status")?;
+    let replayed = body.contains("\"outcome\":\"replayed\"");
+    let id = body.split_once("\"seq\":").map_or(0, |(_, rest)| {
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().unwrap_or(0)
+    });
+    Ok((status, id, replayed))
+}
+
+/// One blocking request. `key` makes a retry of the same edit harmless.
+pub fn post_edit(config: &Config, job: &EditJob, key: &str) -> Result<EditDone, String> {
+    let failed = |error: std::io::Error| error.to_string();
+    let (method, path, body) = edit_request(job.player, &job.edit);
+    let mut stream = TcpStream::connect_timeout(&config.addr, TIMEOUT).map_err(failed)?;
+    stream.set_read_timeout(Some(TIMEOUT)).map_err(failed)?;
+    stream.set_write_timeout(Some(TIMEOUT)).map_err(failed)?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-VexMap-Client: region-server\r\nX-VexMap-Region: {}\r\n\
+         Idempotency-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        config.addr,
+        config.region,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).map_err(failed)?;
+    let mut response = Vec::new();
+    stream.take(MAX_RESPONSE).read_to_end(&mut response).map_err(failed)?;
+    let (http, id, replayed) = parse_edit_reply(&response)?;
+    Ok(EditDone { player: job.player, token: job.token, http, id, replayed })
+}
+
+/// Starts the thread that sends queued edits. A sidecar that cannot be reached answers `http: 0`, so the player is told.
+pub fn start_edits(config: Config, queue: &'static EditQueue) -> std::io::Result<()> {
+    std::thread::Builder::new().name("vexmap-edits".to_owned()).spawn(move || {
+        // Unique across restarts and players: the sidecar treats a repeated (actor, key) as the same request.
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let mut counter = 0u64;
+        while let Some(job) = queue.next() {
+            counter += 1;
+            let key = format!("edit-{started:x}-{counter:x}");
+            let done = post_edit(&config, &job, &key).unwrap_or(EditDone {
+                player: job.player,
+                token: job.token,
+                http: 0,
+                id: 0,
+                replayed: false,
+            });
+            if let Ok(mut finished) = queue.done.lock() {
+                finished.push(done);
+            }
+        }
+    })?;
+    Ok(())
+}

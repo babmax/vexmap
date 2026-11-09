@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vexmap-proto", "crates/vexmap-core", "crates/vexmap-sidecar", "crates/vexmap-link", "crates/vexmap-resourcepack", "crates/vexmap-ui", "crates/vexmap-tiler", "crates/vexmap-routing"]
+members = ["crates/vexmap-proto", "crates/vexmap-core", "crates/vexmap-sidecar", "crates/vexmap-link", "crates/vexmap-resourcepack", "crates/vexmap-ui", "crates/vexmap-tiler", "crates/vexmap-routing", "crates/vexmap-editor"]
 resolver = "3"
 
 [workspace.package]

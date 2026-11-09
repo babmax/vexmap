@@ -51,6 +51,8 @@ pub enum Kind {
     TileWants = 12,
     Tile = 13,
     WorldDisc = 14,
+    NetworkEdit = 15,
+    NetworkEditResult = 16,
 }
 
 impl Kind {
@@ -70,6 +72,8 @@ impl Kind {
             12 => Kind::TileWants,
             13 => Kind::Tile,
             14 => Kind::WorldDisc,
+            15 => Kind::NetworkEdit,
+            16 => Kind::NetworkEditResult,
             _ => return None,
         })
     }
@@ -185,6 +189,19 @@ pub enum Message {
         center_x: i32,
         center_z: i32,
         radius: u32,
+    },
+    /// Client to server: one edit of the route network. The server forwards it to the sidecar as this player, and the
+    /// sidecar decides from the database whether the player may. `token` comes back in the result.
+    NetworkEdit {
+        token: u32,
+        edit: NetworkEdit,
+    },
+    /// Server to client: what became of the edit with this `token`.
+    NetworkEditResult {
+        token: u32,
+        status: EditStatus,
+        /// The id of what was created (a node or line), 0 when nothing was.
+        id: u64,
     },
 }
 
@@ -369,6 +386,8 @@ impl Message {
             Message::TileWants { .. } => Kind::TileWants,
             Message::Tile { .. } => Kind::Tile,
             Message::WorldDisc { .. } => Kind::WorldDisc,
+            Message::NetworkEdit { .. } => Kind::NetworkEdit,
+            Message::NetworkEditResult { .. } => Kind::NetworkEditResult,
         }
     }
 
@@ -401,6 +420,15 @@ impl Message {
                 put_tile_id(&mut out, *id);
                 out.extend_from_slice(&version.to_le_bytes());
                 out.extend_from_slice(pixels);
+            }
+            Message::NetworkEdit { token, edit } => {
+                out.extend_from_slice(&token.to_le_bytes());
+                put_edit(&mut out, edit);
+            }
+            Message::NetworkEditResult { token, status, id } => {
+                out.extend_from_slice(&token.to_le_bytes());
+                out.push(*status as u8);
+                out.extend_from_slice(&id.to_le_bytes());
             }
             Message::WorldDisc { dimension, center_x, center_z, radius } => {
                 put_short(&mut out, truncate_dimension(dimension));
@@ -478,6 +506,12 @@ impl Message {
                 let pixels = std::mem::take(&mut reader.bytes).to_vec();
                 Message::Tile { dimension, id, version, pixels }
             }
+            Kind::NetworkEdit => Message::NetworkEdit { token: reader.u32()?, edit: reader.edit()? },
+            Kind::NetworkEditResult => Message::NetworkEditResult {
+                token: reader.u32()?,
+                status: EditStatus::from_u8(reader.u8()?).ok_or(DecodeError::BadNumber)?,
+                id: reader.u64()?,
+            },
             Kind::WorldDisc => Message::WorldDisc {
                 dimension: reader.short(MAX_DIMENSION)?,
                 center_x: reader.u32()? as i32,
@@ -497,6 +531,101 @@ impl Message {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(message)
+    }
+}
+
+/// How a line of the route network is travelled. The numbers are on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineMode {
+    Walk = 0,
+    Boat = 1,
+    Train = 2,
+}
+
+impl LineMode {
+    pub fn from_u8(value: u8) -> Option<LineMode> {
+        Some(match value {
+            0 => LineMode::Walk,
+            1 => LineMode::Boat,
+            2 => LineMode::Train,
+            _ => return None,
+        })
+    }
+
+    /// The name the sidecar API uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            LineMode::Walk => "walk",
+            LineMode::Boat => "boat",
+            LineMode::Train => "train",
+        }
+    }
+}
+
+/// An edit of the route network, as the editor makes it. Coordinates are blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkEdit {
+    AddNode { x: i32, z: i32, transfer: bool },
+    AddLine { a: u64, b: u64, mode: LineMode, one_way: bool },
+    SetClosed { line: u64, closed: bool },
+}
+
+/// What became of a `NetworkEdit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditStatus {
+    Done = 0,
+    /// The same edit was already applied.
+    AlreadyDone = 1,
+    Forbidden = 2,
+    Invalid = 3,
+    /// The sidecar did not answer. Nothing was changed as far as the server knows.
+    Unavailable = 4,
+}
+
+impl EditStatus {
+    /// What the sidecar's HTTP answer means for the player. 0 is "could not be reached".
+    pub fn from_http(http: u16, replayed: bool) -> EditStatus {
+        match http {
+            200 if replayed => EditStatus::AlreadyDone,
+            200 => EditStatus::Done,
+            403 => EditStatus::Forbidden,
+            400 | 404 | 409 | 422 => EditStatus::Invalid,
+            _ => EditStatus::Unavailable,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Option<EditStatus> {
+        Some(match value {
+            0 => EditStatus::Done,
+            1 => EditStatus::AlreadyDone,
+            2 => EditStatus::Forbidden,
+            3 => EditStatus::Invalid,
+            4 => EditStatus::Unavailable,
+            _ => return None,
+        })
+    }
+}
+
+fn put_edit(out: &mut Vec<u8>, edit: &NetworkEdit) {
+    match *edit {
+        NetworkEdit::AddNode { x, z, transfer } => {
+            out.push(1);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&z.to_le_bytes());
+            out.push(u8::from(transfer));
+        }
+        NetworkEdit::AddLine { a, b, mode, one_way } => {
+            out.push(2);
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&b.to_le_bytes());
+            out.push(mode as u8);
+            out.push(u8::from(one_way));
+        }
+        NetworkEdit::SetClosed { line, closed } => {
+            out.push(3);
+            out.extend_from_slice(&line.to_le_bytes());
+            out.push(u8::from(closed));
+        }
     }
 }
 
@@ -624,6 +753,28 @@ impl<'a> Reader<'a> {
     fn u16(&mut self) -> Result<u16, DecodeError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn flag(&mut self) -> Result<bool, DecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DecodeError::BadNumber),
+        }
+    }
+
+    fn edit(&mut self) -> Result<NetworkEdit, DecodeError> {
+        Ok(match self.u8()? {
+            1 => NetworkEdit::AddNode { x: self.i32()?, z: self.i32()?, transfer: self.flag()? },
+            2 => NetworkEdit::AddLine {
+                a: self.u64()?,
+                b: self.u64()?,
+                mode: LineMode::from_u8(self.u8()?).ok_or(DecodeError::BadNumber)?,
+                one_way: self.flag()?,
+            },
+            3 => NetworkEdit::SetClosed { line: self.u64()?, closed: self.flag()? },
+            _ => return Err(DecodeError::BadNumber),
+        })
     }
 
     fn u64(&mut self) -> Result<u64, DecodeError> {
@@ -1377,6 +1528,14 @@ mod tests {
             Message::Hello { protocol: PROTOCOL, features: 0b1011, mod_version: "0.1.0".into() },
             Message::Welcome { protocol: PROTOCOL, features: 3, player: u128::MAX - 7 },
             Message::OpenMap,
+            Message::NetworkEdit { token: 7, edit: NetworkEdit::AddNode { x: -30_000_000, z: 12, transfer: true } },
+            Message::NetworkEdit {
+                token: u32::MAX,
+                edit: NetworkEdit::AddLine { a: 3, b: u64::MAX, mode: LineMode::Boat, one_way: true },
+            },
+            Message::NetworkEdit { token: 0, edit: NetworkEdit::SetClosed { line: 9, closed: false } },
+            Message::NetworkEditResult { token: 7, status: EditStatus::Forbidden, id: 0 },
+            Message::NetworkEditResult { token: 8, status: EditStatus::Done, id: 123_456 },
             Message::Reject { reason: "Установите мод VexMap".into() },
             Message::Ping(42),
             Message::Pong(u64::MAX),
@@ -1384,6 +1543,44 @@ mod tests {
         ] {
             assert_eq!(roundtrip(message.clone(), MAX_C2S_FRAME), message);
         }
+    }
+
+    #[test]
+    fn http_answers_map_to_statuses() {
+        assert_eq!(EditStatus::from_http(200, false), EditStatus::Done);
+        assert_eq!(EditStatus::from_http(200, true), EditStatus::AlreadyDone);
+        assert_eq!(EditStatus::from_http(403, false), EditStatus::Forbidden);
+        for code in [400, 404, 409, 422] {
+            assert_eq!(EditStatus::from_http(code, false), EditStatus::Invalid);
+        }
+        for code in [0, 429, 500, 503] {
+            assert_eq!(EditStatus::from_http(code, false), EditStatus::Unavailable, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_edit_is_an_error_never_a_panic() {
+        let good = Message::NetworkEdit {
+            token: 1,
+            edit: NetworkEdit::AddLine { a: 1, b: 2, mode: LineMode::Walk, one_way: false },
+        }
+        .body();
+        // Every truncation, and a trailing byte, fail.
+        for cut in 0..good.len() {
+            assert!(Message::decode(Kind::NetworkEdit as u8, &good[..cut]).is_err(), "cut {cut}");
+        }
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(Message::decode(Kind::NetworkEdit as u8, &long), Err(DecodeError::TrailingBytes));
+        // Unknown tag, mode and flag values.
+        for (at, value) in [(4, 9u8), (4 + 1 + 16, 7), (4 + 1 + 16 + 1, 2)] {
+            let mut bad = good.clone();
+            bad[at] = value;
+            assert_eq!(Message::decode(Kind::NetworkEdit as u8, &bad), Err(DecodeError::BadNumber), "byte {at}");
+        }
+        let mut status = Message::NetworkEditResult { token: 1, status: EditStatus::Done, id: 1 }.body();
+        status[4] = 99;
+        assert_eq!(Message::decode(Kind::NetworkEditResult as u8, &status), Err(DecodeError::BadNumber));
     }
 
     fn marker(uuid: u128, x: i32) -> Marker {

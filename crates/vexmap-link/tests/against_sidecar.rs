@@ -101,3 +101,99 @@ fn settings_cannot_leave_loopback_or_bend_the_request() {
     }
     assert!(Config::parse(Some("[::1]:7878"), Some("eu-1")).is_ok());
 }
+
+#[test]
+fn uuids_are_written_the_way_the_api_reads_them() {
+    let id: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
+    assert_eq!(vexmap_link::uuid_text(id), "01234567-89ab-cdef-0123-456789abcdef");
+    assert_eq!(vexmap_link::uuid_text(0), "00000000-0000-0000-0000-000000000000");
+    assert_eq!(vexmap_link::uuid_text(id).parse::<uuid::Uuid>().unwrap().as_u128(), id);
+}
+
+#[test]
+fn a_reply_is_read_for_status_and_id() {
+    use vexmap_link::parse_edit_reply;
+    let ok = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"outcome\":\"applied\",\"seq\":42}";
+    assert_eq!(parse_edit_reply(ok), Ok((200, 42, false)));
+    let replay = b"HTTP/1.1 200 OK\r\n\r\n{\"outcome\":\"replayed\",\"seq\":7}";
+    assert_eq!(parse_edit_reply(replay), Ok((200, 7, true)));
+    let no = b"HTTP/1.1 403 Forbidden\r\n\r\n{\"error\":\"forbidden\",\"message\":\"x\"}";
+    assert_eq!(parse_edit_reply(no), Ok((403, 0, false)));
+    assert!(parse_edit_reply(b"garbage").is_err());
+    assert!(parse_edit_reply(b"HTTP/1.1 abc\r\n\r\n").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_reach_the_sidecar_as_the_player_and_the_database_decides() {
+    use vexmap_core::{Category, Role};
+    use vexmap_link::{EditJob, EditQueue, LinkEdit, start_edits};
+
+    let (core, addr, _dir) = serve().await;
+    let system = |key: &str| CommandContext {
+        actor: Actor::System(ClientName::new("test").unwrap()),
+        region: RegionId::global(),
+        request_id: RequestId::new(key).unwrap(),
+    };
+    let admin = uuid::Uuid::new_v4();
+    let nobody = uuid::Uuid::new_v4();
+    core.set_role(&system("admin"), admin, Role::Admin, Default::default()).await.unwrap();
+    core.set_role(&system("mod"), nobody, Role::Moderator, [Category::Wiki].into()).await.unwrap();
+
+    let queue: &'static EditQueue = Box::leak(Box::new(EditQueue::new()));
+    start_edits(config(addr, "a"), queue).unwrap();
+    let job = |player: uuid::Uuid, token: u32, edit| EditJob { player: player.as_u128(), token, edit };
+    assert!(queue.push(job(admin, 1, LinkEdit::AddNode { x: 0, z: 0, transfer: false })));
+    assert!(queue.push(job(admin, 2, LinkEdit::AddNode { x: 100, z: 0, transfer: true })));
+    assert!(queue.push(job(nobody, 3, LinkEdit::AddNode { x: 5, z: 5, transfer: false })));
+
+    let mut done = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done.len() < 3 && Instant::now() < deadline {
+        queue.take_done(&mut done);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(done.len(), 3, "{done:?}");
+    done.sort_by_key(|d| d.token);
+    assert_eq!((done[0].http, done[1].http, done[2].http), (200, 200, 403));
+    assert!(done[0].id > 0 && done[1].id > done[0].id && done[2].id == 0);
+
+    // The line between the two new nodes, then the network holds what the admin drew and nothing of the moderator's.
+    let line = LinkEdit::AddLine { a: done[0].id, b: done[1].id, mode: "walk", one_way: false };
+    assert!(queue.push(job(admin, 4, line)));
+    let mut more = Vec::new();
+    while more.is_empty() && Instant::now() < deadline {
+        queue.take_done(&mut more);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!((more[0].http, more[0].token), (200, 4));
+    let network = core.route_network().await.unwrap();
+    assert_eq!((network.nodes.len(), network.lines.len()), (2, 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_sidecar_is_reported_not_hung() {
+    use vexmap_link::{EditJob, EditQueue, LinkEdit, start_edits};
+    // A port nothing listens on: bind, note the port, drop.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let queue: &'static EditQueue = Box::leak(Box::new(EditQueue::new()));
+    start_edits(config(port, "a"), queue).unwrap();
+    assert!(queue.push(EditJob { player: 1, token: 9, edit: LinkEdit::SetClosed { line: 1, closed: true } }));
+    let mut done = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done.is_empty() && Instant::now() < deadline {
+        queue.take_done(&mut done);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!((done[0].http, done[0].token), (0, 9));
+}
+
+#[test]
+fn the_queue_is_bounded() {
+    use vexmap_link::{EditJob, EditQueue, LinkEdit, MAX_QUEUED_EDITS};
+    let queue = EditQueue::new();
+    let job = EditJob { player: 1, token: 1, edit: LinkEdit::SetClosed { line: 1, closed: true } };
+    for _ in 0..MAX_QUEUED_EDITS {
+        assert!(queue.push(job));
+    }
+    assert!(!queue.push(job));
+}

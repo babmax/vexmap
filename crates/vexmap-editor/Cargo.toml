@@ -1,0 +1,11 @@
+[package]
+name = "vexmap-editor"
+description = "VexMap route network editor logic: tools, snapping, edits to send. The same file is injected into the game."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# This exact source is also injected into Horizon as the `vexmap_editor` module, see mods/vexmap/mixins/vexmap.
+path = "../../mods/vexmap/mixins/vexmap/editor.rs"

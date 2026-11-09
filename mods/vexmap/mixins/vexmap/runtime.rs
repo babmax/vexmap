@@ -16,6 +16,11 @@ use std::time::Instant;
 pub(super) const MOD_VERSION: &str = "0.1.0";
 /// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
 const REALTIME: u64 = 1;
+/// `Module::Routing`. A client that took it may send `NetworkEdit`.
+const ROUTING: u64 = 1 << 2;
+/// One player may send this many edits per second. The sidecar limits the whole server; this keeps one player from
+/// using all of it.
+const EDITS_PER_SECOND: u32 = 8;
 /// `Module::Tiles`.
 const TILES: u64 = 2;
 /// Modules this client build implements, as bits of `Hello.features`. Each arrives with its phase.
@@ -25,6 +30,9 @@ pub(super) const FEATURES: u64 = REALTIME | TILES;
 static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
 /// The newest list of this server's players, on its way to the sidecar.
 static PLAYER_FEED: link::Mailbox = link::Mailbox::new();
+/// Route network edits from players, on their way to the sidecar, and its answers on the way back.
+static EDITS: link::EditQueue = link::EditQueue::new();
+
 /// The newest frames for this server's players, on their way from the sidecar.
 static DELIVERIES: link::DeliveryBox = link::DeliveryBox::new();
 static TILE_REQUESTS: link::TileRequestBox = link::TileRequestBox::new();
@@ -75,6 +83,8 @@ struct Server {
     packs: proto::PackGate,
     tick_meter: proto::TickMeter,
     bench_admit_all: bool,
+    edit_limits: HashMap<u128, (u64, u32)>,
+    edit_answers: Vec<link::EditDone>,
 }
 
 /// Where the resource pack is hosted. Without it the server does not ask for a pack: fine on a bench, wrong in production.
@@ -143,6 +153,8 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
                 .filter(|radius| *radius > 0)
                 .unwrap_or(DEFAULT_MAP_RADIUS),
             deliveries: Vec::new(),
+            edit_limits: HashMap::new(),
+            edit_answers: Vec::new(),
             pack: load_pack_offer(),
             packs: proto::PackGate::default(),
             tick_meter: proto::TickMeter::new(window),
@@ -165,6 +177,11 @@ fn start_sidecar_link() {
             }
         }
         Err(error) => log(format_args!("sidecar link is off: {error}")),
+    }
+    if let Ok(config) = link::Config::parse(addr.as_deref(), region.as_deref())
+        && let Err(error) = link::start_edits(config, &EDITS)
+    {
+        log(format_args!("route editing did not start: {error}"));
     }
     match link::FeedConfig::parse(feed_addr.as_deref(), region.as_deref()) {
         Ok(config) => {
@@ -265,6 +282,46 @@ fn send_deliveries(game: &mut crate::game::Game<'_>, server: &mut Server) {
     }
 }
 
+/// Hands answers from the sidecar to the players who made the edits. A player who has left simply gets nothing.
+fn send_edit_answers(game: &mut crate::game::Game<'_>, server: &mut Server) {
+    EDITS.take_done(&mut server.edit_answers);
+    for done in std::mem::take(&mut server.edit_answers) {
+        let status = proto::EditStatus::from_http(done.http, done.replayed);
+        let id = if matches!(status, proto::EditStatus::Done | proto::EditStatus::AlreadyDone) { done.id } else { 0 };
+        let result = proto::Message::NetworkEditResult { token: done.token, status, id };
+        send_to_player(game, &mut server.outbox, done.player, &result);
+    }
+}
+
+/// An edit of the route network. The server only checks that the player took `routing` and is not flooding; whether the
+/// player may edit is the sidecar's call, from the database.
+fn network_edit(server: &mut Server, player: u128, token: u32, edit: proto::NetworkEdit, now: u64) {
+    let admitted = server.gate.features(player).is_some_and(|features| features & ROUTING != 0);
+    let region_on = SERVER_FEATURES.load(Ordering::Relaxed) & ROUTING != 0;
+    if !admitted || !region_on {
+        return;
+    }
+    let limit = server.edit_limits.entry(player).or_insert((now, 0));
+    if now.saturating_sub(limit.0) >= 1000 {
+        *limit = (now, 0);
+    }
+    limit.1 += 1;
+    if limit.1 > EDITS_PER_SECOND {
+        return;
+    }
+    let edit = match edit {
+        proto::NetworkEdit::AddNode { x, z, transfer } => link::LinkEdit::AddNode { x, z, transfer },
+        proto::NetworkEdit::AddLine { a, b, mode, one_way } => {
+            link::LinkEdit::AddLine { a, b, mode: mode.name(), one_way }
+        }
+        proto::NetworkEdit::SetClosed { line, closed } => link::LinkEdit::SetClosed { line, closed },
+    };
+    if !EDITS.push(link::EditJob { player, token, edit }) {
+        // A full queue is told as "unavailable" on the next tick, through the same path as a dead sidecar.
+        server.edit_answers.push(link::EditDone { player, token, http: 0, id: 0, replayed: false });
+    }
+}
+
 /// `player_logged_in`: start the admission clock and ask the client to introduce itself.
 pub(super) fn player_logged_in(game: &mut crate::game::Game<'_>, player: u128) {
     with_server(|server| {
@@ -340,6 +397,7 @@ pub(super) fn player_logged_out(player: u128) {
         server.gate.leave(player);
         server.packs.leave(player);
         server.inbound.remove(&player);
+        server.edit_limits.remove(&player);
     });
 }
 
@@ -363,6 +421,7 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
             kick(game, &mut server.outbox, player, proto::KickReason::Pack(proto::PackFailure::TimedOut));
         }
         send_deliveries(game, server);
+        send_edit_answers(game, server);
         send_tiles(game, server);
         if now >= server.next_disc_ms {
             repeat_discs(game, server, now);
@@ -453,6 +512,7 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
             proto::Message::Ping(stamp) => {
                 send_to_player(game, &mut server.outbox, player, &proto::Message::Pong(stamp))
             }
+            proto::Message::NetworkEdit { token, edit } => network_edit(server, player, token, edit, now),
             _ => {}
         }
     });
