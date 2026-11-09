@@ -476,6 +476,9 @@ pub(super) struct Client {
     pub(super) close_requested: bool,
     pub(super) scratch: Vec<ui::Op>,
     pub(super) tiles: ui::TileCache,
+    /// Opened on first use: the map may never be drawn in a session.
+    pub(super) tile_disk: Option<ui::TileDisk>,
+    pub(super) tile_disk_tried: bool,
     pub(super) discs: HashMap<String, ui::Disc>,
     /// The dimension the tile cache belongs to.
     pub(super) tiles_dimension: String,
@@ -524,6 +527,8 @@ pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
             close_requested: false,
             scratch: Vec::new(),
             tiles: ui::TileCache::default(),
+            tile_disk: None,
+            tile_disk_tried: false,
             discs: HashMap::new(),
             tiles_dimension: String::new(),
             diagnostics: std::env::var_os("VEXMAP_DIAG").is_some(),

@@ -118,8 +118,34 @@ pub(super) fn tile_arrived(
     if !encoded.is_empty() && proto::decode_tile(encoded, &mut pixels).is_err() {
         return;
     }
-    if let Some(slot) = client.tiles.answered(to_key(id), version, !encoded.is_empty(), now_ms) {
+    let key = to_key(id);
+    if let Some(slot) = client.tiles.answered(key, version, !encoded.is_empty(), now_ms) {
         horizon_client_render::gfx::vexmap_render::queue_tile(slot, pixels);
+        if let Some(disk) = &client.tile_disk {
+            disk.store(dimension, key, version, encoded);
+        }
+    } else if encoded.is_empty() && version != 0 && !client.tiles.has_pixels(key) {
+        // "Unchanged" for a tile we asked about by its disk version: the pixels are on disk.
+        if let Some(disk) = &client.tile_disk {
+            disk.load(dimension, key);
+        }
+    }
+}
+
+/// Tiles the disk thread has read, handled like ones from the server, a few per frame.
+fn disk_tiles(client: &mut runtime::Client, now_ms: u64) {
+    let Some(disk) = &client.tile_disk else { return };
+    for tile in disk.poll(8) {
+        if tile.dimension != client.tiles_dimension {
+            continue;
+        }
+        let mut pixels = Box::new([0_u8; proto::TILE_AREA]);
+        if proto::decode_tile(&tile.encoded, &mut pixels).is_err() {
+            continue;
+        }
+        if let Some(slot) = client.tiles.answered(tile.key, tile.version, true, now_ms) {
+            horizon_client_render::gfx::vexmap_render::queue_tile(slot, pixels);
+        }
     }
 }
 
@@ -127,15 +153,31 @@ fn ask_for_tiles(game: &mut crate::game::Game<'_>, client: &mut runtime::Client,
     if wants.is_empty() {
         return;
     }
+    let disk = client.tile_disk.as_ref();
+    let dimension = &client.tiles_dimension;
     let wants = wants
         .iter()
         .map(|(key, version)| proto::TileWant {
             id: proto::TileId { level: key.level, x: key.x, z: key.z },
-            version: *version,
+            // A tile we know nothing about may still be on disk: then the server only has to say "unchanged".
+            version: if *version == 0 { disk.map_or(0, |disk| disk.version(dimension, *key)) } else { *version },
         })
         .collect();
     let message = proto::Message::TileWants { dimension: client.tiles_dimension.clone(), wants };
     runtime::send_message(game, client, &message);
+}
+
+/// The disk cache sits next to the settings file. Tried once; the player's limit is followed while it runs.
+fn open_tile_disk(client: &mut runtime::Client) {
+    let limit = client.ui.settings.tile_cache_mb;
+    if let Some(disk) = &mut client.tile_disk {
+        disk.set_limit_mb(limit);
+    } else if !client.tile_disk_tried {
+        client.tile_disk_tried = true;
+        if let Some(root) = client.settings_path.as_ref().and_then(|path| path.parent()).map(|dir| dir.join("tiles")) {
+            client.tile_disk = ui::TileDisk::open(root, limit);
+        }
+    }
 }
 
 /// Keeps the tiles, the page tables and the GPU pass in step with the view. Once per frame while the map is up.
@@ -167,6 +209,8 @@ fn update_ground(game: &mut crate::game::Game<'_>, client: &mut runtime::Client,
     if let Some(disc) = client.discs.get(&player.dimension).copied() {
         client.ui.set_world(disc);
     }
+    open_tile_disk(client);
+    disk_tiles(client, now_ms);
     let night = ui::night_amount(game.native_day_time());
     client.ui.night = night;
     let view = if map_up { client.ui.tile_view(client.gui_size) } else { client.ui.minimap_view(&player) };

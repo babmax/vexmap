@@ -19,6 +19,8 @@ const TITLE_BAR: f32 = 16.0;
 const GRIP: f32 = 10.0;
 const ROW_HEIGHT: f32 = 16.0;
 const SAVE_AFTER_MS: u64 = 500;
+/// The most a player can give the tile cache.
+pub const MAX_TILE_CACHE_MB: u32 = 4096;
 const AUTOTUNE_MS: u64 = 3_000;
 
 const OCEAN: u32 = 0xFF1B_3A5B;
@@ -141,6 +143,8 @@ pub struct Settings {
     pub key_map: String,
     pub key_minimap: String,
     pub autotuned: bool,
+    /// Disk the tile cache may use, in MiB. 0 turns the disk cache off.
+    pub tile_cache_mb: u32,
 }
 
 impl Default for Settings {
@@ -170,6 +174,7 @@ impl Default for Settings {
             key_map: "key.keyboard.m".to_owned(),
             key_minimap: "key.keyboard.n".to_owned(),
             autotuned: false,
+            tile_cache_mb: 256,
         };
         settings.apply_preset(Preset::Balance);
         settings
@@ -260,6 +265,7 @@ impl Settings {
             "key_map" => self.key_map = value.to_owned(),
             "key_minimap" => self.key_minimap = value.to_owned(),
             "autotuned" => self.autotuned = parse_bool(value)?,
+            "tile_cache_mb" => self.tile_cache_mb = value.parse().ok()?,
             _ => {}
         }
         Some(())
@@ -267,6 +273,7 @@ impl Settings {
 
     fn sanitize(&mut self) {
         self.update_hz = self.update_hz.clamp(1, 60);
+        self.tile_cache_mb = self.tile_cache_mb.min(MAX_TILE_CACHE_MB);
         self.minimap.size = self.minimap.size.clamp(48, 256);
         self.minimap.opacity = self.minimap.opacity.clamp(10, 100);
         if !self.minimap.zoom.is_finite() {
@@ -285,7 +292,7 @@ impl Settings {
             "language={}\npreset={}\nquality={}\nbuildings_3d={}\neffects={}\nlabels={}\nupdate_hz={}\nlayers={}\n\
              minimap.enabled={}\nminimap.corner={}\nminimap.size={}\nminimap.shape={}\nminimap.zoom={}\n\
              minimap.rotate_with_look={}\nminimap.opacity={}\nminimap.layers={}\nwindow_mode={}\nmap_mode={}\nwindow={x},{y},{w},{h}\n\
-             key_map={}\nkey_minimap={}\nautotuned={}\n",
+             key_map={}\nkey_minimap={}\nautotuned={}\ntile_cache_mb={}\n",
             self.language.text(),
             self.preset.text(),
             self.quality.text(),
@@ -307,6 +314,7 @@ impl Settings {
             self.key_map,
             self.key_minimap,
             self.autotuned,
+            self.tile_cache_mb,
         )
     }
 }
@@ -2118,6 +2126,254 @@ impl TileCache {
     }
 }
 
+impl TileCache {
+    /// Whether a tile is on the GPU now.
+    pub fn has_pixels(&self, key: TileKey) -> bool {
+        self.entries.get(&key).is_some_and(|entry| entry.slot.is_some())
+    }
+}
+
+/// `minecraft:overworld` as one safe folder name, `None` for anything else. The reverse of `dimension_from_folder`.
+fn dimension_to_folder(dimension: &str) -> Option<String> {
+    let safe = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b))
+            && !part.starts_with('.')
+    };
+    let (namespace, name) = dimension.split_once(':')?;
+    (safe(namespace) && safe(name)).then(|| format!("{namespace}~{name}"))
+}
+
+fn dimension_from_folder(folder: &str) -> Option<String> {
+    let (namespace, name) = folder.split_once('~')?;
+    let dimension = format!("{namespace}:{name}");
+    (dimension_to_folder(&dimension).as_deref() == Some(folder)).then_some(dimension)
+}
+
+type DiskKey = (String, TileKey);
+type SharedVersions = std::sync::Mutex<HashMap<DiskKey, u32>>;
+
+enum DiskJob {
+    Store(DiskKey, u32, Vec<u8>),
+    Load(DiskKey),
+    Limit(u64),
+}
+
+/// A tile read back from disk.
+pub struct DiskTile {
+    pub dimension: String,
+    pub key: TileKey,
+    pub version: u32,
+    pub encoded: Vec<u8>,
+}
+
+/// The client's tiles on disk, so a restart or a return to a place costs no network. One worker thread does every file
+/// operation: the game's thread only sends jobs and collects answers. Nothing here is the truth, so a file that does not
+/// read well is deleted and fetched again. Least recently used tiles go first when the player's limit is reached.
+pub struct TileDisk {
+    jobs: std::sync::mpsc::Sender<DiskJob>,
+    loaded: std::sync::mpsc::Receiver<DiskTile>,
+    versions: std::sync::Arc<SharedVersions>,
+    limit_bytes: u64,
+}
+
+impl TileDisk {
+    /// `None` when the thread cannot start: the map then simply works without a disk cache.
+    pub fn open(root: std::path::PathBuf, limit_mb: u32) -> Option<TileDisk> {
+        let (jobs, job_rx) = std::sync::mpsc::channel();
+        let (loaded_tx, loaded) = std::sync::mpsc::channel();
+        let versions = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let shared = std::sync::Arc::clone(&versions);
+        let limit_bytes = u64::from(limit_mb) << 20;
+        std::thread::Builder::new()
+            .name("vexmap-tile-disk".to_owned())
+            .spawn(move || disk_worker(&root, limit_bytes, &job_rx, &loaded_tx, &shared))
+            .ok()?;
+        Some(TileDisk { jobs, loaded, versions, limit_bytes })
+    }
+
+    /// The version on disk, 0 when there is none (or the scan is not through yet).
+    pub fn version(&self, dimension: &str, key: TileKey) -> u32 {
+        // `try_lock`: the worker holds it for microseconds, and a miss only costs one needless download.
+        self.versions
+            .try_lock()
+            .ok()
+            .and_then(|versions| versions.get(&(dimension.to_owned(), key)).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn store(&self, dimension: &str, key: TileKey, version: u32, encoded: &[u8]) {
+        let _ = self.jobs.send(DiskJob::Store((dimension.to_owned(), key), version, encoded.to_vec()));
+    }
+
+    pub fn load(&self, dimension: &str, key: TileKey) {
+        let _ = self.jobs.send(DiskJob::Load((dimension.to_owned(), key)));
+    }
+
+    pub fn set_limit_mb(&mut self, limit_mb: u32) {
+        let bytes = u64::from(limit_mb) << 20;
+        if bytes != self.limit_bytes {
+            self.limit_bytes = bytes;
+            let _ = self.jobs.send(DiskJob::Limit(bytes));
+        }
+    }
+
+    /// Up to `max` tiles the worker has read since the last call.
+    pub fn poll(&self, max: usize) -> Vec<DiskTile> {
+        self.loaded.try_iter().take(max).collect()
+    }
+}
+
+fn tile_path(root: &std::path::Path, (dimension, key): &DiskKey) -> Option<std::path::PathBuf> {
+    let folder = dimension_to_folder(dimension)?;
+    Some(root.join(folder).join(key.level.to_string()).join(format!("{}.{}.vxt", key.x, key.z)))
+}
+
+struct DiskState {
+    /// Size and the order of last use, per tile.
+    files: HashMap<DiskKey, (u64, u64)>,
+    clock: u64,
+    total: u64,
+}
+
+impl DiskState {
+    fn touch(&mut self, key: &DiskKey, size: u64) {
+        self.clock += 1;
+        let old = self.files.insert(key.clone(), (size, self.clock)).map_or(0, |(old, _)| old);
+        self.total = self.total - old + size;
+    }
+}
+
+fn scan_disk(root: &std::path::Path, state: &mut DiskState) -> HashMap<DiskKey, u32> {
+    let mut found = Vec::new();
+    let mut versions = HashMap::new();
+    let Ok(folders) = std::fs::read_dir(root) else { return versions };
+    for folder in folders.flatten() {
+        let Some(dimension) = folder.file_name().to_str().and_then(dimension_from_folder) else { continue };
+        let Ok(levels) = std::fs::read_dir(folder.path()) else { continue };
+        for level in levels.flatten() {
+            let Some(level_number) = level.file_name().to_str().and_then(|name| name.parse::<u8>().ok()) else {
+                continue;
+            };
+            let Ok(files) = std::fs::read_dir(level.path()) else { continue };
+            for file in files.flatten() {
+                let name = file.file_name();
+                let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".vxt")) else { continue };
+                let Some((x, z)) = stem.split_once('.') else { continue };
+                let (Ok(x), Ok(z), Ok(meta)) = (x.parse::<i32>(), z.parse::<i32>(), file.metadata()) else { continue };
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let key = (dimension.clone(), TileKey { level: level_number, x, z });
+                found.push((modified, key, meta.len(), file.path()));
+            }
+        }
+    }
+    // Oldest first, so the clock hands out the order of last use.
+    found.sort_by_key(|(modified, ..)| *modified);
+    for (_, key, size, path) in found {
+        let mut head = [0_u8; 4];
+        let read = std::fs::File::open(&path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head));
+        if read.is_err() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        state.touch(&key, size);
+        versions.insert(key, u32::from_le_bytes(head));
+    }
+    versions
+}
+
+fn disk_worker(
+    root: &std::path::Path,
+    mut limit: u64,
+    jobs: &std::sync::mpsc::Receiver<DiskJob>,
+    loaded: &std::sync::mpsc::Sender<DiskTile>,
+    shared: &SharedVersions,
+) {
+    let mut state = DiskState { files: HashMap::new(), clock: 0, total: 0 };
+    let versions = scan_disk(root, &mut state);
+    if let Ok(mut shared) = shared.lock() {
+        *shared = versions;
+    }
+    trim_disk(root, &mut state, shared, limit);
+    while let Ok(job) = jobs.recv() {
+        match job {
+            DiskJob::Limit(bytes) => {
+                limit = bytes;
+                trim_disk(root, &mut state, shared, limit);
+            }
+            DiskJob::Store(key, version, encoded) => {
+                if limit == 0 {
+                    continue;
+                }
+                let Some(path) = tile_path(root, &key) else { continue };
+                let mut bytes = Vec::with_capacity(4 + encoded.len());
+                bytes.extend_from_slice(&version.to_le_bytes());
+                bytes.extend_from_slice(&encoded);
+                let temporary = path.with_extension("tmp");
+                let written = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&temporary, &bytes))
+                    .and_then(|()| std::fs::rename(&temporary, &path));
+                if written.is_err() {
+                    continue;
+                }
+                state.touch(&key, bytes.len() as u64);
+                if let Ok(mut shared) = shared.lock() {
+                    shared.insert(key, version);
+                }
+                trim_disk(root, &mut state, shared, limit);
+            }
+            DiskJob::Load(key) => {
+                let read = tile_path(root, &key).and_then(|path| std::fs::read(path).ok());
+                match read.as_deref().and_then(|bytes| bytes.split_first_chunk::<4>()) {
+                    Some((version, encoded)) => {
+                        state.touch(&key, 4 + encoded.len() as u64);
+                        let tile = DiskTile {
+                            dimension: key.0,
+                            key: key.1,
+                            version: u32::from_le_bytes(*version),
+                            encoded: encoded.to_vec(),
+                        };
+                        if loaded.send(tile).is_err() {
+                            return;
+                        }
+                    }
+                    None => forget_tile(root, &mut state, shared, &key),
+                }
+            }
+        }
+    }
+}
+
+fn forget_tile(root: &std::path::Path, state: &mut DiskState, shared: &SharedVersions, key: &DiskKey) {
+    if let Some((size, _)) = state.files.remove(key) {
+        state.total -= size;
+    }
+    if let Some(path) = tile_path(root, key) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(mut shared) = shared.lock() {
+        shared.remove(key);
+    }
+}
+
+fn trim_disk(root: &std::path::Path, state: &mut DiskState, shared: &SharedVersions, limit: u64) {
+    if state.total <= limit {
+        return;
+    }
+    // Down to 90 %, so one new tile does not mean a pass over the list every time.
+    let target = limit / 10 * 9;
+    let mut order: Vec<_> = state.files.iter().map(|(key, (_, used))| (*used, key.clone())).collect();
+    order.sort_unstable_by_key(|(used, _)| *used);
+    for (_, key) in order {
+        if state.total <= target {
+            break;
+        }
+        forget_tile(root, state, shared, &key);
+    }
+}
+
 /// What the GPU pass needs for one frame of the map, all in plain numbers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapScene {
@@ -2768,5 +3024,110 @@ mod tests {
         ui.scroll(short, [0.0, 0.0], -100.0);
         let last = ui.row_rects(short).into_iter().map(|(_, rect)| rect[1] + rect[3]).fold(0.0_f32, f32::max);
         assert!(last <= short[1]);
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vexmap-disk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        let started = Instant::now();
+        loop {
+            if let Some(found) = probe() {
+                return found;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "the disk worker did not answer");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const KEY: TileKey = TileKey { level: 3, x: -4, z: 7 };
+    const WORLD: &str = "minecraft:overworld";
+
+    #[test]
+    fn a_stored_tile_is_known_and_comes_back() {
+        let dir = scratch("roundtrip");
+        let disk = TileDisk::open(dir.clone(), 1).expect("worker");
+        disk.store(WORLD, KEY, 9, &[1, 2, 3]);
+        assert_eq!(wait_for(|| Some(disk.version(WORLD, KEY)).filter(|v| *v != 0)), 9);
+        disk.load(WORLD, KEY);
+        let tile = wait_for(|| disk.poll(1).pop());
+        assert_eq!((tile.dimension.as_str(), tile.key, tile.version, tile.encoded), (WORLD, KEY, 9, vec![1, 2, 3]));
+        drop(disk);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_session_finds_what_the_last_one_stored() {
+        let dir = scratch("restart");
+        let first = TileDisk::open(dir.clone(), 1).expect("worker");
+        first.store(WORLD, KEY, 4, &[5; 100]);
+        wait_for(|| Some(()).filter(|()| first.version(WORLD, KEY) == 4));
+        drop(first);
+        let second = TileDisk::open(dir.clone(), 1).expect("worker");
+        assert_eq!(wait_for(|| Some(second.version(WORLD, KEY)).filter(|v| *v != 0)), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_limit_drops_the_tiles_used_longest_ago() {
+        let dir = scratch("limit");
+        let disk = TileDisk::open(dir.clone(), 1).expect("worker");
+        let payload = vec![7_u8; 100 * 1024];
+        let at = |x| TileKey { level: 0, x, z: 0 };
+        for x in 0..9 {
+            disk.store(WORLD, at(x), 1, &payload);
+        }
+        wait_for(|| Some(()).filter(|()| disk.version(WORLD, at(8)) == 1));
+        // Tile 0 is the oldest, until it is read: then tiles 1 and 2 are.
+        disk.load(WORLD, at(0));
+        wait_for(|| disk.poll(1).pop());
+        disk.store(WORLD, at(90), 1, &payload);
+        disk.store(WORLD, at(91), 1, &payload);
+        wait_for(|| Some(()).filter(|()| disk.version(WORLD, at(1)) == 0));
+        assert_eq!(disk.version(WORLD, at(0)), 1);
+        assert_eq!(disk.version(WORLD, at(2)), 0);
+        assert_eq!(disk.version(WORLD, at(3)), 1);
+        assert_eq!(disk.version(WORLD, at(91)), 1);
+        let on_disk: u64 = std::fs::read_dir(dir.join("minecraft~overworld/0"))
+            .expect("folder")
+            .flatten()
+            .map(|file| file.metadata().map_or(0, |meta| meta.len()))
+            .sum();
+        assert!(on_disk <= 1 << 20, "{on_disk} bytes on disk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_broken_file_is_forgotten_and_a_hostile_dimension_goes_nowhere() {
+        let dir = scratch("broken");
+        let disk = TileDisk::open(dir.clone(), 1).expect("worker");
+        disk.store(WORLD, KEY, 2, &[1]);
+        wait_for(|| Some(()).filter(|()| disk.version(WORLD, KEY) == 2));
+        std::fs::write(dir.join("minecraft~overworld/3/-4.7.vxt"), [1, 2]).expect("overwrite");
+        disk.load(WORLD, KEY);
+        wait_for(|| Some(()).filter(|()| disk.version(WORLD, KEY) == 0));
+        disk.store("../evil:x", KEY, 1, &[1]);
+        disk.store("minecraft:../x", KEY, 1, &[1]);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(disk.version("../evil:x", KEY), 0);
+        assert!(!dir.parent().expect("temp").join("evil").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_setting_survives_the_file_and_is_capped() {
+        let settings = Settings { tile_cache_mb: 64, ..Settings::default() };
+        assert_eq!(Settings::parse(&settings.to_text()).tile_cache_mb, 64);
+        assert_eq!(Settings::parse("tile_cache_mb=999999").tile_cache_mb, MAX_TILE_CACHE_MB);
+        assert_eq!(Settings::parse("tile_cache_mb=banana").tile_cache_mb, 256);
     }
 }
