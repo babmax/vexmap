@@ -4,19 +4,22 @@
 //
 // Phase 1 carries only the handshake and admission (ADR-007). Map features arrive behind feature bits in later phases.
 
+use super::vexmap_editor as editor;
 use super::vexmap_link as link;
 use super::vexmap_proto as proto;
+use super::vexmap_routing as routing;
 use super::vexmap_screen as screen;
 use super::vexmap_ui as ui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 pub(super) const MOD_VERSION: &str = "0.1.0";
 /// `Module::Realtime`. Bits never change (they are `Hello.features` on the wire).
 const REALTIME: u64 = 1;
-/// `Module::Routing`. A client that took it may send `NetworkEdit`.
+/// `Module::Routing`. A client that took it follows the route network and may send `NetworkEdit`.
 const ROUTING: u64 = 1 << 2;
 /// One player may send this many edits per second. The sidecar limits the whole server; this keeps one player from
 /// using all of it.
@@ -24,7 +27,7 @@ const EDITS_PER_SECOND: u32 = 8;
 /// `Module::Tiles`.
 const TILES: u64 = 2;
 /// Modules this client build implements, as bits of `Hello.features`. Each arrives with its phase.
-pub(super) const FEATURES: u64 = REALTIME | TILES;
+pub(super) const FEATURES: u64 = REALTIME | TILES | ROUTING;
 
 /// Modules switched on for this region, kept current by the sidecar link. All off until the sidecar first answers.
 static SERVER_FEATURES: AtomicU64 = AtomicU64::new(0);
@@ -37,9 +40,22 @@ static EDITS: link::EditQueue = link::EditQueue::new();
 static DELIVERIES: link::DeliveryBox = link::DeliveryBox::new();
 static TILE_REQUESTS: link::TileRequestBox = link::TileRequestBox::new();
 static TILE_DELIVERIES: link::TileDeliveryBox = link::TileDeliveryBox::new();
+static NETWORK_WANTS: link::NetworkWantBox = link::NetworkWantBox::new();
+static LIVE_CHUNKS: link::LiveChunkBox = link::LiveChunkBox::new();
+/// What the map shows for each block state, by state id: `Material` as a number, 0 where it looks through.
+static BLOCK_MATERIALS: OnceLock<Vec<u8>> = OnceLock::new();
+/// Chunks looked at per tick: 160 a second, so a player's whole circle every two seconds. Taking one is a pointer copy.
+const LIVE_CHUNKS_PER_TICK: usize = 8;
+/// Block states classified per tick while the table is built, so its cost is spread over a second or two.
+const STATES_PER_TICK: u32 = 1024;
+const LIVE_ROUND_EVERY_MS: u64 = 1000;
+const LIVE_JOB_QUEUE: usize = 128;
+const MAX_REMEMBERED_CHUNKS: usize = 1 << 16;
 /// Tile bytes one tick may forward: 3 MB/s for a server of up to 50 players, spread out instead of in one tick.
 const MAX_TILE_BYTES_PER_TICK: usize = 150 * 1024;
 const MIN_TILE_REQUEST_GAP_MS: u64 = 100;
+/// A client walks the network page by page, so this also bounds how fast one player can make the sidecar read.
+const MIN_NETWORK_REQUEST_GAP_MS: u64 = 100;
 const DISC_EVERY_MS: u64 = 10_000;
 /// Past this a border is the vanilla "no border": the map uses `VEXMAP_MAP_RADIUS` instead.
 const NO_BORDER_HALF_SIZE: f64 = 1_000_000.0;
@@ -66,7 +82,20 @@ fn log(message: std::fmt::Arguments<'_>) {
 
 // ---------------------------------------------------------------- server
 
+type LiveJob = (String, horizon_client::mod_api::NativeChunkSnapshot);
+
+/// The map's view of the running game. Built up over the first ticks, then a few chunks every tick.
+#[derive(Default)]
+struct LiveScan {
+    materials: Vec<u8>,
+    plan: link::LivePlan,
+    next_round_ms: u64,
+    worker: Option<SyncSender<LiveJob>>,
+    worker_failed: bool,
+}
+
 struct Server {
+    live: LiveScan,
     gate: proto::AdmissionGate,
     inbound: HashMap<u128, proto::Reassembler>,
     outbox: proto::Outbox,
@@ -76,6 +105,10 @@ struct Server {
     samples_admitted: Vec<u128>,
     tile_out: Vec<link::Delivery>,
     next_tile_request: HashMap<u128, u64>,
+    next_network_request: HashMap<u128, u64>,
+    /// Per player: when the current second began and how many edits it has seen.
+    edit_limits: HashMap<u128, (u64, u32)>,
+    edit_answers: Vec<link::EditDone>,
     next_disc_ms: u64,
     map_radius: u32,
     deliveries: Vec<link::Delivery>,
@@ -83,8 +116,6 @@ struct Server {
     packs: proto::PackGate,
     tick_meter: proto::TickMeter,
     bench_admit_all: bool,
-    edit_limits: HashMap<u128, (u64, u32)>,
-    edit_answers: Vec<link::EditDone>,
 }
 
 /// Where the resource pack is hosted. Without it the server does not ask for a pack: fine on a bench, wrong in production.
@@ -138,6 +169,7 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
         }
         let window = if bench_admit_all { TICK_REPORT_TICKS_BENCH } else { TICK_REPORT_TICKS };
         Server {
+            live: LiveScan::default(),
             gate: proto::AdmissionGate::new(SERVER_FEATURES.load(Ordering::Relaxed)),
             inbound: HashMap::new(),
             outbox: proto::Outbox::default(),
@@ -146,6 +178,9 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             samples_admitted: Vec::new(),
             tile_out: Vec::new(),
             next_tile_request: HashMap::new(),
+            next_network_request: HashMap::new(),
+            edit_limits: HashMap::new(),
+            edit_answers: Vec::new(),
             next_disc_ms: 0,
             map_radius: std::env::var("VEXMAP_MAP_RADIUS")
                 .ok()
@@ -153,8 +188,6 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
                 .filter(|radius| *radius > 0)
                 .unwrap_or(DEFAULT_MAP_RADIUS),
             deliveries: Vec::new(),
-            edit_limits: HashMap::new(),
-            edit_answers: Vec::new(),
             pack: load_pack_offer(),
             packs: proto::PackGate::default(),
             tick_meter: proto::TickMeter::new(window),
@@ -190,6 +223,8 @@ fn start_sidecar_link() {
                 deliveries: &DELIVERIES,
                 tile_requests: &TILE_REQUESTS,
                 tiles: &TILE_DELIVERIES,
+                network_wants: &NETWORK_WANTS,
+                live_chunks: &LIVE_CHUNKS,
             };
             if let Err(error) = link::start_feed(config, boxes) {
                 log(format_args!("player feed did not start: {error}"));
@@ -370,7 +405,8 @@ fn send_tiles(game: &mut crate::game::Game<'_>, server: &mut Server) {
     }
     for delivery in server.tile_out.drain(..) {
         for viewer in delivery.viewers {
-            if server.gate.features(viewer).is_some_and(|features| features & TILES != 0) {
+            // Tiles and pages of the network share this path. Each was asked for by a client that took its module.
+            if server.gate.features(viewer).is_some_and(|features| features & (TILES | ROUTING) != 0) {
                 let _ = game.native_send_custom_payload_to_player(viewer, proto::CHANNEL, &delivery.frame);
             }
         }
@@ -390,10 +426,136 @@ fn forward_tile_wants(server: &mut Server, player: u128, body: Vec<u8>, now: u64
     TILE_REQUESTS.try_push(link::TileRequest { viewer: player, body });
 }
 
+/// A client asks what is new in the route network. The network is the same for everyone so far, so the sidecar only needs
+/// to know who is asking for the answer's `may_edit`.
+fn forward_network_want(server: &mut Server, player: u128, since: u64, render: bool, now: u64) {
+    let admitted = server.gate.features(player).is_some_and(|features| features & ROUTING != 0);
+    if !admitted || SERVER_FEATURES.load(Ordering::Relaxed) & ROUTING == 0 {
+        return;
+    }
+    let next = server.next_network_request.entry(player).or_insert(0);
+    if now < *next {
+        return;
+    }
+    *next = now + MIN_NETWORK_REQUEST_GAP_MS;
+    NETWORK_WANTS.try_push(link::NetworkWant { viewer: player, since, render });
+}
+
+/// Classifies some more block states. `true` once every state is known.
+fn build_block_table(game: &crate::game::Game<'_>, live: &mut LiveScan) -> bool {
+    if BLOCK_MATERIALS.get().is_some() {
+        return true;
+    }
+    for _ in 0..STATES_PER_TICK {
+        let id = horizon_world::registry::BlockStateId(live.materials.len() as u32);
+        match game.native_state_block(id) {
+            Some(name) => live.materials.push(proto::classify(name).map_or(0, |material| material as u8)),
+            None => {
+                let _ = BLOCK_MATERIALS.set(std::mem::take(&mut live.materials));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A chunk's 256 columns as the feed carries them. Off the tick thread.
+fn live_columns(snapshot: &horizon_client::mod_api::NativeChunkSnapshot, dimension: &str, table: &[u8]) -> Vec<u8> {
+    let [chunk_x, chunk_z] = snapshot.chunk();
+    let (bottom, _) = snapshot.height();
+    let survey = proto::Survey::of_dimension(dimension);
+    let mut bytes = Vec::with_capacity(proto::CHUNK_COLUMN_BYTES);
+    for z in chunk_z * 16..chunk_z * 16 + 16 {
+        for x in chunk_x * 16..chunk_x * 16 + 16 {
+            let top = snapshot.surface(x, z).unwrap_or(bottom) - 1;
+            let column = proto::walk_column(survey, top, bottom, |y| {
+                let state = snapshot.block_state(x, y, z)?;
+                proto::Material::from_u8(*table.get(state.0 as usize)?)
+            });
+            bytes.extend_from_slice(&column.to_bytes());
+        }
+    }
+    bytes
+}
+
+/// Works out what each chunk looks like and passes on only the ones that changed since it was last seen.
+fn live_worker(jobs: Receiver<LiveJob>) {
+    use std::hash::{Hash, Hasher};
+    let Some(table) = BLOCK_MATERIALS.get() else { return };
+    let mut seen: HashMap<(String, [i32; 2]), u64> = HashMap::new();
+    while let Ok((dimension, snapshot)) = jobs.recv() {
+        let chunk = snapshot.chunk();
+        let columns = live_columns(&snapshot, &dimension, table);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        columns.hash(&mut hasher);
+        let hash = hasher.finish();
+        if seen.len() >= MAX_REMEMBERED_CHUNKS {
+            seen.clear();
+        }
+        let key = (dimension.clone(), chunk);
+        if seen.get(&key) == Some(&hash) {
+            continue;
+        }
+        if LIVE_CHUNKS.try_push(link::LiveChunk { dimension, x: chunk[0], z: chunk[1], columns }) {
+            seen.insert(key, hash);
+        }
+    }
+}
+
+fn start_live_worker(live: &mut LiveScan) -> bool {
+    if live.worker.is_some() {
+        return true;
+    }
+    if live.worker_failed {
+        return false;
+    }
+    let (sender, receiver) = sync_channel(LIVE_JOB_QUEUE);
+    match std::thread::Builder::new().name("vexmap-live".to_owned()).spawn(move || live_worker(receiver)) {
+        Ok(_) => {
+            live.worker = Some(sender);
+            true
+        }
+        Err(error) => {
+            live.worker_failed = true;
+            log(format_args!("the live map did not start: {error}"));
+            false
+        }
+    }
+}
+
+/// Once per tick: hands a few chunks near the players to the worker. Never reads a block here.
+fn scan_live(game: &crate::game::Game<'_>, server: &mut Server, now: u64) {
+    if SERVER_FEATURES.load(Ordering::Relaxed) & TILES == 0
+        || !build_block_table(game, &mut server.live)
+        || !start_live_worker(&mut server.live)
+    {
+        return;
+    }
+    if server.live.plan.is_empty() && now >= server.live.next_round_ms {
+        server.live.next_round_ms = now + LIVE_ROUND_EVERY_MS;
+        let players: Vec<(String, f64, f64)> = game
+            .native_server_players()
+            .into_iter()
+            .filter(|player| server.gate.features(player.uuid).is_some())
+            .map(|player| (player.dimension, player.position[0], player.position[2]))
+            .collect();
+        server.live.plan.refill(&players);
+    }
+    let Some(worker) = server.live.worker.clone() else { return };
+    for _ in 0..LIVE_CHUNKS_PER_TICK {
+        let Some((dimension, chunk)) = server.live.plan.pop() else { return };
+        let Some(snapshot) = game.native_chunk_snapshot(&dimension, chunk) else { continue };
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = worker.try_send((dimension, snapshot)) {
+            return; // The worker is behind. The chunk comes round again.
+        }
+    }
+}
+
 /// `player_logged_out`: forget everything about the player.
 pub(super) fn player_logged_out(player: u128) {
     with_server(|server| {
         server.next_tile_request.remove(&player);
+        server.next_network_request.remove(&player);
         server.gate.leave(player);
         server.packs.leave(player);
         server.inbound.remove(&player);
@@ -421,8 +583,9 @@ pub(super) fn server_tick(game: &mut crate::game::Game<'_>) {
             kick(game, &mut server.outbox, player, proto::KickReason::Pack(proto::PackFailure::TimedOut));
         }
         send_deliveries(game, server);
-        send_edit_answers(game, server);
         send_tiles(game, server);
+        send_edit_answers(game, server);
+        scan_live(game, server, now);
         if now >= server.next_disc_ms {
             repeat_discs(game, server, now);
         }
@@ -513,6 +676,7 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
                 send_to_player(game, &mut server.outbox, player, &proto::Message::Pong(stamp))
             }
             proto::Message::NetworkEdit { token, edit } => network_edit(server, player, token, edit, now),
+            proto::Message::NetworkWant { since, render } => forward_network_want(server, player, since, render, now),
             _ => {}
         }
     });
@@ -525,6 +689,9 @@ pub(super) struct Client {
     inbound: proto::Reassembler,
     outbox: proto::Outbox,
     pub(super) positions: proto::PositionTables,
+    pub(super) workspace: editor::Workspace,
+    pub(super) navigator: routing::Navigator,
+    pub(super) route_search: Option<screen::RouteSearch>,
     reported_markers: usize,
     pub(super) ui: ui::Ui,
     /// This player, from `Welcome`.
@@ -543,6 +710,7 @@ pub(super) struct Client {
     /// The dimension the tile cache belongs to.
     pub(super) tiles_dimension: String,
     pub(super) diagnostics: bool,
+    reported_network: Option<(usize, usize, bool)>,
     pub(super) next_fps_report_ms: u64,
     pub(super) gpu_epoch: u64,
     pub(super) sent_generation: u64,
@@ -578,6 +746,9 @@ pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
             inbound: proto::Reassembler::new(proto::Limits::default()),
             outbox: proto::Outbox::default(),
             positions: proto::PositionTables::default(),
+            workspace: editor::Workspace::default(),
+            navigator: routing::Navigator::default(),
+            route_search: None,
             reported_markers: 0,
             ui: ui::Ui::new(settings, offer_autotune),
             me: None,
@@ -592,6 +763,7 @@ pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
             discs: HashMap::new(),
             tiles_dimension: String::new(),
             diagnostics: std::env::var_os("VEXMAP_DIAG").is_some(),
+            reported_network: None,
             next_fps_report_ms: 0,
             gpu_epoch: 0,
             sent_generation: 0,
@@ -606,6 +778,18 @@ fn report_markers(client: &mut Client) {
     if client.reported_markers != count {
         client.reported_markers = count;
         log(format_args!("positions: {count} markers"));
+    }
+}
+
+/// With `VEXMAP_DIAG` set, what the client holds of the route network, for the bench test. Only when it changes.
+fn report_network(client: &mut Client) {
+    if !client.diagnostics {
+        return;
+    }
+    let seen = (client.workspace.network.len_nodes(), client.workspace.network.lines().len(), client.workspace.may_edit);
+    if client.reported_network != Some(seen) {
+        client.reported_network = Some(seen);
+        log(format_args!("network: nodes={} lines={} may_edit={}", seen.0, seen.1, seen.2));
     }
 }
 
@@ -665,6 +849,13 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
             proto::Message::Welcome { protocol, features, player } => {
                 client.handshake.welcomed();
                 client.me = Some(player);
+                client.workspace.welcomed(features & ROUTING != 0);
+                // Another server may have another network: its roads are not the ones this route follows.
+                client.navigator.clear();
+                client.route_search = None;
+                client.ui.route.clear();
+                client.ui.destination = None;
+                client.ui.banner = None;
                 log(format_args!("welcomed: protocol {protocol}, features {features:#x}"));
             }
             proto::Message::WorldDisc { dimension, center_x, center_z, radius } if radius > 0 => {
@@ -675,6 +866,11 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
                 screen::tile_arrived(client, &dimension, id, version, &pixels, now);
             }
             proto::Message::OpenMap => screen::open_from_server(game, client),
+            proto::Message::NetworkPage(page) => {
+                screen::network_page(client, &page, now);
+                report_network(client);
+            }
+            proto::Message::NetworkEditResult { token, status, id } => screen::edit_result(client, token, status, id, now),
             proto::Message::Reject { reason } => log(format_args!("rejected: {reason}")),
             proto::Message::Ping(stamp) => {
                 send_to_server(game, &mut client.outbox, &proto::Message::Pong(stamp));

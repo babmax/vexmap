@@ -35,6 +35,23 @@ const MUTED: u32 = 0x00B8_C4D0;
 const OTHER_PLAYER: u32 = 0xFF35_D0A5;
 const SELF_PLAYER: u32 = 0xFFE5_4B3C;
 const GROUP: u32 = 0xFFFF_B547;
+const ROAD_WALK: u32 = 0xFFC2_571A;
+const ROAD_BOAT: u32 = 0xFF5B_D1FF;
+const ROAD_TRAIN: u32 = 0xFFD6_249F;
+const ROAD_CLOSED: u32 = 0xFF7A_7A7A;
+const ROAD_CASING: u32 = 0xFF10_1820;
+const ROAD_HOT: u32 = 0xFFFF_FFFF;
+const ROUTE: u32 = 0xFF2F_80ED;
+const ROUTE_CASING: u32 = 0xFF0B_2A5B;
+const ROUTE_END: u32 = 0xFFE5_3935;
+const ROAD_STOP: u32 = 0xFFE5_3935;
+const ROAD_NODE: u32 = 0xFFF2_F2F2;
+const BUTTON_LIT: u32 = 0xFF2E_7D4F;
+const PANEL_BUTTON: [f32; 2] = [72.0, 14.0];
+/// Below the settings and view buttons.
+const PANEL_TOP: f32 = 40.0;
+/// A press that moved less than this, in GUI pixels, is a click on the map and not a drag.
+const CLICK_SLOP: f32 = 3.0;
 
 /// Text in both languages: the translation key is the pair itself.
 pub type Tr = (&'static str, &'static str);
@@ -364,6 +381,141 @@ pub struct Group<'a> {
     pub x: f64,
     pub z: f64,
     pub count: u16,
+}
+
+/// How a road is travelled, for its colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoadKind {
+    Walk,
+    Boat,
+    Train,
+}
+
+/// One line of the route network, already in blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoadLine {
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub kind: RoadKind,
+    pub one_way: bool,
+    pub closed: bool,
+    /// Under the cursor.
+    pub hot: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoadNode {
+    pub at: [f64; 2],
+    pub station: bool,
+    /// Under the cursor, or where the line being drawn starts.
+    pub hot: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanelButton {
+    pub label: Tr,
+    pub lit: bool,
+}
+
+/// One straight piece of the route being followed, in blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouteStep {
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    /// Off the network: the straight line a player would have to find for themselves.
+    pub direct: bool,
+}
+
+/// One corner of what is drawn in the world: position, then colour with alpha.
+pub type WorldVertex = [f32; 7];
+
+const ARROW_FILL: [f32; 4] = [0.18, 0.5, 0.93, 0.92];
+const ARROW_EDGE: [f32; 4] = [0.04, 0.16, 0.36, 0.92];
+const BEAM: [f32; 4] = [0.9, 0.22, 0.21, 0.4];
+const ARROW_EDGE_GROWTH: f32 = 1.2;
+/// The destination's beam reaches this far around the camera's height, past any hill.
+const BEAM_BELOW: f32 = 48.0;
+const BEAM_ABOVE: f32 = 128.0;
+const BEAM_MIN_DISTANCE: f64 = 3.0;
+
+/// Triangles of the arrow, each corner along the arrow and across it. The arrow is flat, so nothing depends on depth.
+const ARROW_SHAPE: [[f32; 2]; 9] = [
+    [1.0, 0.0],
+    [0.1, 0.6],
+    [0.1, -0.6],
+    [0.1, 0.22],
+    [-0.8, 0.22],
+    [-0.8, -0.22],
+    [0.1, 0.22],
+    [-0.8, -0.22],
+    [0.1, -0.22],
+];
+
+/// The arrow, flat and centred on the origin, its tip towards `bearing` (degrees, 0 north, 90 east). The renderer puts it
+/// in front of the camera.
+pub fn arrow_mesh(bearing: f64) -> Vec<WorldVertex> {
+    let radians = bearing.to_radians() as f32;
+    let along = [radians.sin(), -radians.cos()];
+    let across = [-along[1], along[0]];
+    let mut out = Vec::with_capacity(ARROW_SHAPE.len() * 2);
+    // The edge first, a little lower, so the fill lies on top of it.
+    for (scale, drop, color) in [(ARROW_EDGE_GROWTH, 0.02_f32, ARROW_EDGE), (1.0, 0.0, ARROW_FILL)] {
+        for corner in ARROW_SHAPE {
+            let (a, c) = (corner[0] * scale, corner[1] * scale);
+            out.push([
+                along[0] * a + across[0] * c,
+                -drop,
+                along[1] * a + across[1] * c,
+                color[0],
+                color[1],
+                color[2],
+                color[3],
+            ]);
+        }
+    }
+    out
+}
+
+/// The destination's beam, relative to `from` (`[x, z]`, the player), side-on to it. Empty when the player is on the spot.
+pub fn beam_mesh(from: [f64; 2], destination: [f64; 2]) -> Vec<WorldVertex> {
+    let (dx, dz) = (destination[0] - from[0], destination[1] - from[1]);
+    let distance = dx.hypot(dz);
+    if distance <= BEAM_MIN_DISTANCE {
+        return Vec::new();
+    }
+    // Wider further off, so it stays visible.
+    let half = 0.35 + distance * 0.003;
+    let side = [(-dz / distance * half) as f32, (dx / distance * half) as f32];
+    let (cx, cz) = (dx as f32, dz as f32);
+    let corner = |sign: f32, y: f32| -> WorldVertex {
+        [cx + side[0] * sign, y, cz + side[1] * sign, BEAM[0], BEAM[1], BEAM[2], BEAM[3]]
+    };
+    vec![
+        corner(-1.0, -BEAM_BELOW),
+        corner(1.0, -BEAM_BELOW),
+        corner(1.0, BEAM_ABOVE),
+        corner(-1.0, -BEAM_BELOW),
+        corner(1.0, BEAM_ABOVE),
+        corner(-1.0, BEAM_ABOVE),
+    ]
+}
+
+/// What the road editor adds to the map. Filled by `map_screen.rs` before each rebuild, so this file knows nothing of the
+/// network itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Overlay {
+    pub buttons: Vec<PanelButton>,
+    /// A click on the map is an edit, and Escape steps back.
+    pub editing: bool,
+    pub lines: Vec<RoadLine>,
+    pub nodes: Vec<RoadNode>,
+    /// The line being drawn: from its first node to the cursor.
+    pub rubber: Option<([f64; 2], [f64; 2])>,
+    pub notice: Option<Tr>,
+    /// Nodes, lines, and whether the copy is still downloading.
+    pub counts: Option<(usize, usize, bool)>,
+    /// Regions of the world drawn so far and how many there are, while the map is being drawn.
+    pub progress: Option<(u32, u32)>,
 }
 
 /// The local player, read from the client and never asked of the server.
@@ -870,6 +1022,10 @@ pub enum Press {
     Ignored,
     Taken,
     Close,
+    /// This button of `Overlay::buttons`.
+    Button(u8),
+    /// Escape while editing: the editor decides what it means.
+    Back,
 }
 
 fn inside(rect: [f32; 4], point: [f32; 2]) -> bool {
@@ -907,9 +1063,20 @@ pub struct Ui {
     pub minimap_ground_drawn: bool,
     /// 0 by day, 1 by night.
     pub night: f32,
+    pub overlay: Overlay,
+    /// The route being followed, for the map and the minimap.
+    pub route: Vec<RouteStep>,
+    pub destination: Option<[f64; 2]>,
+    /// What the route says to do next, on top of the screen.
+    pub banner: Option<String>,
     /// Where globe and flat were looking before "round" took over the view.
     saved_view: Option<([f64; 2], f64)>,
+    /// The round map must be fitted to the window, which is only known at the next rebuild.
+    round_unfitted: bool,
     grab: Option<Grab>,
+    /// While editing: where the press now held began, until it turns out to be a drag.
+    click: Option<[f32; 2]>,
+    dragged: f32,
     rebinding: Option<Row>,
     settings_scroll: f32,
     autotune: Autotune,
@@ -934,8 +1101,15 @@ impl Ui {
             ground_drawn: false,
             minimap_ground_drawn: false,
             night: 0.0,
+            overlay: Overlay::default(),
+            route: Vec::new(),
+            destination: None,
+            banner: None,
             saved_view: None,
+            round_unfitted: false,
             grab: None,
+            click: None,
+            dragged: 0.0,
             rebinding: None,
             settings_scroll: 0.0,
             autotune: if offer_autotune { Autotune::Offer } else { Autotune::Off },
@@ -954,6 +1128,7 @@ impl Ui {
     pub fn opened(&mut self, player: Option<&Player>) {
         self.page = Page::Map;
         self.grab = None;
+        self.click = None;
         self.rebinding = None;
         self.map_stale = true;
         self.view.disc = self.world;
@@ -962,6 +1137,12 @@ impl Ui {
             self.view.clamp_center();
             let world = self.world;
             self.globe.look_at(&world, [player.x, player.z]);
+        }
+        if self.settings.map_mode == MapMode::Round {
+            // Flat comes back to the player, at the scale it was last left at rather than the round map's.
+            let scale = self.saved_view.map_or(self.view.blocks_per_pixel, |(_, scale)| scale);
+            self.saved_view = Some((self.view.center, scale));
+            self.round_unfitted = true;
         }
     }
 
@@ -972,6 +1153,7 @@ impl Ui {
             self.view.disc = disc;
             self.view.clamp_center();
             self.map_stale = true;
+            self.round_unfitted = self.settings.map_mode == MapMode::Round;
         }
     }
 
@@ -1079,6 +1261,184 @@ impl Ui {
         inside.then_some(world)
     }
 
+    /// The round map is the whole disc in the window, like a globe flattened. Zooming in works from there.
+    fn fit_round(&mut self, rect: [f32; 4]) {
+        self.view.center = self.world.center;
+        self.view.blocks_per_pixel = (self.world.radius * 2.0 / f64::from(rect[2].min(rect[3])))
+            .clamp(MIN_BLOCKS_PER_PIXEL, MAX_BLOCKS_PER_PIXEL);
+    }
+
+    /// The world point under the cursor, when it is over the map.
+    pub fn world_at(&self, size: [f32; 2], mouse: [f32; 2]) -> Option<[f64; 2]> {
+        let rect = self.map_rect(size);
+        if inside(rect, mouse) { self.to_world(rect, mouse) } else { None }
+    }
+
+    /// GUI pixels per block where the view is centred.
+    pub fn px_per_block(&self, size: [f32; 2]) -> f64 {
+        let bpp = if self.settings.map_mode == MapMode::Globe {
+            self.globe.blocks_per_pixel(&self.world, f64::from(self.map_rect(size)[3]))
+        } else {
+            self.view.blocks_per_pixel
+        };
+        1.0 / bpp
+    }
+
+    /// The part of the world worth drawing, as low and high corners. The globe shows too much of the disc for a box to help.
+    pub fn view_box(&self, size: [f32; 2]) -> ((f64, f64), (f64, f64)) {
+        if self.settings.map_mode == MapMode::Globe {
+            let [x, z] = self.world.center;
+            let radius = self.world.radius;
+            return ((x - radius, z - radius), (x + radius, z + radius));
+        }
+        let view = self.tile_view(size);
+        (
+            (view.center[0] - view.half_extent[0], view.center[1] - view.half_extent[1]),
+            (view.center[0] + view.half_extent[0], view.center[1] + view.half_extent[1]),
+        )
+    }
+
+    pub fn in_world(&self, point: [f64; 2]) -> bool {
+        (point[0] - self.world.center[0]).hypot(point[1] - self.world.center[1]) <= self.world.radius
+    }
+
+    /// One rectangle per panel button: rows from the left, wrapping at the window's edge.
+    fn panel_rects(&self, rect: [f32; 4]) -> Vec<[f32; 4]> {
+        let [width, height] = PANEL_BUTTON;
+        let left = rect[0] + 6.0;
+        let (mut x, mut y) = (left, rect[1] + PANEL_TOP);
+        let mut rects = Vec::with_capacity(self.overlay.buttons.len());
+        for _ in &self.overlay.buttons {
+            if x > left && x + width > rect[0] + rect[2] - 4.0 {
+                x = left;
+                y += height + 2.0;
+            }
+            rects.push([x, y, width, height]);
+            x += width + 2.0;
+        }
+        rects
+    }
+
+    fn draw_roads(&self, ops: &mut Vec<Op>, rect: [f32; 4], clips: &[Clip]) {
+        let overlay = &self.overlay;
+        for road in &overlay.lines {
+            let (Some(a), Some(b)) = (self.to_screen(rect, road.a), self.to_screen(rect, road.b)) else { continue };
+            let color = match (road.closed, road.kind) {
+                (true, _) => ROAD_CLOSED,
+                (false, RoadKind::Walk) => ROAD_WALK,
+                (false, RoadKind::Boat) => ROAD_BOAT,
+                (false, RoadKind::Train) => ROAD_TRAIN,
+            };
+            if road.hot {
+                line(ops, clips, a, b, 5.0, ROAD_CASING);
+                line(ops, clips, a, b, 3.0, ROAD_HOT);
+            } else {
+                line(ops, clips, a, b, 2.0, color);
+            }
+            let middle = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let length = d[0].hypot(d[1]);
+            if !inside(rect, middle) || length < 18.0 {
+                continue;
+            }
+            if road.one_way {
+                let heading = [d[0] / length, d[1] / length];
+                arrow(ops, middle, heading, 5.0, if road.hot { ROAD_CASING } else { color });
+            }
+            if road.closed {
+                marker(ops, middle, 5.0, ROAD_STOP);
+            }
+        }
+        for node in &overlay.nodes {
+            let Some(at) = self.to_screen(rect, node.at) else { continue };
+            if inside(rect, at) {
+                let (size, color) = match (node.hot, node.station) {
+                    (true, _) => (9.0, RIM),
+                    (false, true) => (7.0, ROAD_NODE),
+                    (false, false) => (4.0, ROAD_NODE),
+                };
+                marker(ops, at, size, color);
+            }
+        }
+        if let Some((from, to)) = overlay.rubber
+            && let (Some(a), Some(b)) = (self.to_screen(rect, from), self.to_screen(rect, to))
+        {
+            line(ops, clips, a, b, 1.5, with_alpha(ROAD_HOT, 80));
+        }
+    }
+
+    /// The line to follow, through any projection: `project` is `None` for a point that cannot be shown.
+    fn draw_route(
+        &self,
+        ops: &mut Vec<Op>,
+        clips: &[Clip],
+        project: impl Fn([f64; 2]) -> Option<[f32; 2]>,
+        shown: impl Fn([f32; 2]) -> bool,
+    ) {
+        let pieces: Vec<_> =
+            self.route.iter().filter_map(|step| Some((project(step.a)?, project(step.b)?, step.direct))).collect();
+        for (a, b, direct) in &pieces {
+            if !direct {
+                line(ops, clips, *a, *b, 4.0, ROUTE_CASING);
+            }
+        }
+        for (a, b, direct) in &pieces {
+            line(ops, clips, *a, *b, if *direct { 1.5 } else { 2.5 }, ROUTE);
+        }
+        if let Some(at) = self.destination.and_then(&project)
+            && shown(at)
+        {
+            marker(ops, at, 7.0, ROUTE_END);
+        }
+    }
+
+    /// What the route says next, across the top of the screen.
+    pub fn banner_ops(&self, size: [f32; 2], top: f32, out: &mut Vec<Op>) {
+        let Some(text) = &self.banner else { return };
+        // The game's font is about 6 pixels a letter; this only sizes the backing.
+        let width = text.chars().count() as f32 * 6.0 + 12.0;
+        out.push(Op::Fill { rect: [size[0] / 2.0 - width / 2.0, top, width, 14.0], argb: PANEL });
+        out.push(Op::TextCentered { text: text.clone(), at: [size[0] / 2.0, top + 3.0], rgb: WHITE });
+    }
+
+    fn draw_panel(&self, ops: &mut Vec<Op>, rect: [f32; 4], mouse: [f32; 2]) {
+        let language = self.settings.language;
+        let rects = self.panel_rects(rect);
+        for (button_rect, panel) in rects.iter().zip(&self.overlay.buttons) {
+            let hover = inside(*button_rect, mouse);
+            let fill = match (panel.lit, hover) {
+                (true, _) => BUTTON_LIT,
+                (false, true) => BUTTON_HOVER,
+                (false, false) => BUTTON,
+            };
+            ops.push(Op::Fill { rect: *button_rect, argb: fill });
+            ops.push(Op::TextCentered {
+                text: language.pick(panel.label).to_owned(),
+                at: [button_rect[0] + button_rect[2] / 2.0, button_rect[1] + 3.0],
+                rgb: WHITE,
+            });
+        }
+        let Some(last) = rects.last() else { return };
+        let at = [rect[0] + 6.0, last[1] + last[3] + 3.0];
+        if let Some(notice) = self.overlay.notice {
+            ops.push(Op::Text { text: language.pick(notice).to_owned(), at, rgb: RIM & 0x00FF_FFFF });
+        } else if let Some((nodes, lines, syncing)) = self.overlay.counts {
+            let label = language.pick(("nodes", "узлов"));
+            let lines_label = language.pick(("lines", "линий"));
+            let mut text = format!("{label}: {nodes}, {lines_label}: {lines}");
+            if syncing {
+                text.push_str(language.pick((", loading...", ", загрузка...")));
+            }
+            ops.push(Op::Text { text, at, rgb: MUTED });
+        } else if let Some((done, total)) = self.overlay.progress {
+            let text = match language {
+                Language::En => format!("Drawing the map: {done} of {total}"),
+                Language::Ru => format!("Прогрузка карты: {done} из {total}"),
+            };
+            ops.push(Op::Text { text, at, rgb: MUTED });
+        }
+    }
+
     pub fn map_ops(&self) -> &[Op] {
         &self.map_ops
     }
@@ -1182,6 +1542,9 @@ impl Ui {
     ) {
         self.size = size;
         let rect = self.map_rect(size);
+        if std::mem::take(&mut self.round_unfitted) && self.settings.map_mode == MapMode::Round {
+            self.fit_round(rect);
+        }
         let mut ops = std::mem::take(&mut self.map_ops);
         ops.clear();
         let (view, settings) = (self.view, &self.settings);
@@ -1230,6 +1593,13 @@ impl Ui {
         if !globe {
             ring(&mut ops, &clip, center, radius, 2.0, RIM);
         }
+        self.draw_roads(&mut ops, rect, if globe { &clip } else { &clips });
+        self.draw_route(
+            &mut ops,
+            if globe { &clip } else { &clips },
+            |at| self.to_screen(rect, at),
+            |at| inside(rect, at),
+        );
 
         let dimension = player.map_or("minecraft:overworld", |player| player.dimension.as_str());
         if settings.layers & layer::CLUSTERS != 0 {
@@ -1314,6 +1684,9 @@ impl Ui {
         };
         button(&mut ops, mode, mode_label, mouse);
         button(&mut ops, close, "x", mouse);
+        self.draw_panel(&mut ops, rect, mouse);
+        // At the bottom: the top of the map is taken by its buttons.
+        self.banner_ops(size, rect[1] + rect[3] - 18.0, &mut ops);
 
         if matches!(self.autotune, Autotune::Offer | Autotune::Measuring { .. }) {
             let [cx, _] = rect_center(rect);
@@ -1438,6 +1811,9 @@ impl Ui {
                 }
             }
         }
+        if player.dimension == "minecraft:overworld" {
+            self.draw_route(&mut ops, &clips, |at| Some(project(at[0], at[1])), |at| clip.contains(at));
+        }
         if minimap.layers & layer::CLUSTERS != 0 {
             for group in groups.iter().filter(|group| group.dimension == player.dimension) {
                 let at = project(group.x, group.z);
@@ -1550,12 +1926,9 @@ impl Ui {
                 let (world, center) = (self.world, self.view.center);
                 self.globe.look_at(&world, center);
             } else if self.settings.map_mode == MapMode::Round {
-                // The round map is the whole disc in the window, like a globe flattened. Zooming in works from there.
                 let bpp = self.globe.blocks_per_pixel(&self.world, f64::from(rect[3]));
                 self.saved_view = Some((self.globe.looking_at(&self.world), bpp));
-                self.view.center = self.world.center;
-                self.view.blocks_per_pixel = (self.world.radius * 2.0 / f64::from(rect[2].min(rect[3])))
-                    .clamp(MIN_BLOCKS_PER_PIXEL, MAX_BLOCKS_PER_PIXEL);
+                self.fit_round(rect);
             } else if let Some((center, bpp)) = self.saved_view.take() {
                 self.view.center = center;
                 self.view.blocks_per_pixel = bpp.clamp(MIN_BLOCKS_PER_PIXEL, MAX_BLOCKS_PER_PIXEL);
@@ -1581,8 +1954,13 @@ impl Ui {
                 return Press::Taken;
             }
         }
+        if let Some(index) = self.panel_rects(rect).iter().position(|button| inside(*button, mouse)) {
+            return Press::Button(index as u8);
+        }
         if inside(rect, mouse) {
             self.grab = Some(Grab::Pan);
+            self.click = self.overlay.editing.then_some(mouse);
+            self.dragged = 0.0;
             return Press::Taken;
         }
         Press::Ignored
@@ -1607,14 +1985,25 @@ impl Ui {
         Press::Taken
     }
 
-    pub fn release(&mut self) {
+    /// The button came up. While editing, a press that never became a drag is a click on this world point.
+    pub fn release(&mut self) -> Option<[f64; 2]> {
         self.grab = None;
+        let click = self.click.take()?;
+        if self.dragged > CLICK_SLOP {
+            return None;
+        }
+        self.to_world(self.map_rect(self.size), click)
     }
 
     pub fn drag(&mut self, size: [f32; 2], delta: [f32; 2], now_ms: u64) -> bool {
         let Some(grab) = self.grab else { return false };
         match grab {
             Grab::Pan => {
+                self.dragged += delta[0].abs() + delta[1].abs();
+                if self.click.is_some() && self.dragged <= CLICK_SLOP {
+                    // Might still be a click: a shaking hand must not move the place it is clicking.
+                    return true;
+                }
                 if self.settings.map_mode == MapMode::Globe {
                     self.globe.drag(delta);
                 } else {
@@ -1668,6 +2057,9 @@ impl Ui {
                 self.touched(now_ms);
             }
             return Press::Taken;
+        }
+        if key == "key.keyboard.escape" && self.page == Page::Map && self.overlay.editing {
+            return Press::Back;
         }
         if key == self.settings.key_map {
             return Press::Close;
@@ -1878,6 +2270,8 @@ const MAX_LEVEL: u8 = 12;
 const MAX_IN_FLIGHT: usize = 8;
 const ANSWER_TIMEOUT_MS: u64 = 2_000;
 const RECHECK_MS: u64 = 60_000;
+/// The tiles at the scale being looked at: the sidecar draws them as the world changes, so a change should show soon.
+const RECHECK_NEAR_MS: u64 = 4_000;
 const PLAN_MIN_GAP_MS: u64 = 33;
 const PLAN_IDLE_MS: u64 = 1_000;
 
@@ -1943,6 +2337,8 @@ fn coarse_level(disc: &Disc) -> u8 {
 
 /// The client's tiles: which GPU slot each lives in, and what to ask the server next.
 pub struct TileCache {
+    /// The whole world is being drawn: the zoomed-out tiles change too, so they are looked at as often as near ones.
+    pub world_changing: bool,
     entries: HashMap<TileKey, Entry>,
     free: Vec<u16>,
     in_flight: HashMap<TileKey, u64>,
@@ -1960,6 +2356,7 @@ pub struct TileCache {
 impl Default for TileCache {
     fn default() -> Self {
         TileCache {
+            world_changing: false,
             entries: HashMap::new(),
             free: (0..TILE_SLOTS as u16).rev().collect(),
             in_flight: HashMap::new(),
@@ -2058,15 +2455,15 @@ impl TileCache {
                 let entry = self.page_entry(key, now_ms);
                 let at = start + (z as usize * PAGE_SIZE + x as usize) * 4;
                 self.pages[at..at + 4].copy_from_slice(&entry);
-                self.want(key, now_ms);
+                self.want(key, now_ms, if table == 0 || self.world_changing { RECHECK_NEAR_MS } else { RECHECK_MS });
             }
         }
     }
 
-    fn want(&mut self, key: TileKey, now_ms: u64) {
+    fn want(&mut self, key: TileKey, now_ms: u64, recheck_ms: u64) {
         let due = match self.entries.get(&key) {
             None => true,
-            Some(entry) => now_ms.saturating_sub(entry.checked_ms) >= RECHECK_MS,
+            Some(entry) => now_ms.saturating_sub(entry.checked_ms) >= recheck_ms,
         };
         if due && !self.in_flight.contains_key(&key) {
             self.wants.push((key, self.entries.get(&key).map_or(0, |entry| entry.version)));
@@ -2394,6 +2791,62 @@ pub struct MapScene {
 }
 
 #[cfg(test)]
+mod world_mark_tests {
+    use super::*;
+
+    fn fill_tip(marks: &[WorldVertex]) -> WorldVertex {
+        marks[ARROW_SHAPE.len()]
+    }
+
+    fn fill_center(marks: &[WorldVertex]) -> [f32; 2] {
+        let fill = &marks[ARROW_SHAPE.len()..ARROW_SHAPE.len() * 2];
+        // The two points of the head are symmetric about the arrow's axis.
+        [(fill[1][0] + fill[2][0]) / 2.0, (fill[1][2] + fill[2][2]) / 2.0]
+    }
+
+    #[test]
+    fn the_tip_points_where_the_route_goes() {
+        let east = arrow_mesh(90.0);
+        let (tip, base) = (fill_tip(&east), fill_center(&east));
+        assert!(tip[0] - base[0] > 0.5, "{tip:?} {base:?}");
+        assert!((tip[2] - base[1]).abs() < 1e-3);
+        let north = arrow_mesh(0.0);
+        assert!(fill_tip(&north)[2] < fill_center(&north)[1], "north is -z");
+    }
+
+    #[test]
+    fn the_fill_lies_on_top_of_its_edge() {
+        let marks = arrow_mesh(0.0);
+        assert_eq!(marks.len(), ARROW_SHAPE.len() * 2);
+        assert!(marks[0][1] < marks[ARROW_SHAPE.len()][1]);
+        assert_eq!(marks[0][3..], ARROW_EDGE);
+        assert_eq!(marks[ARROW_SHAPE.len()][3..], ARROW_FILL);
+    }
+
+    #[test]
+    fn the_beam_stands_at_the_destination_side_on_to_the_player() {
+        let marks = beam_mesh([100.0, -50.0], [200.0, -50.0]);
+        assert_eq!(marks.len(), 6);
+        let (low, high) = (marks[0], marks[2]);
+        assert!(low[1] < 0.0 && high[1] > 0.0);
+        let middle = (marks[0][0] + marks[1][0]) / 2.0;
+        assert!((middle - 100.0).abs() < 1e-3, "{middle}");
+        assert!((marks[0][0] - marks[1][0]).abs() < 1e-3, "side-on: only z differs");
+        assert!((marks[0][2] - marks[1][2]).abs() > 0.5);
+    }
+
+    #[test]
+    fn a_beam_on_top_of_the_player_is_left_out() {
+        assert!(beam_mesh([100.0, -50.0], [101.0, -50.0]).is_empty());
+    }
+
+    #[test]
+    fn the_buffer_in_the_renderer_holds_arrow_and_beam() {
+        assert!(arrow_mesh(0.0).len() + beam_mesh([0.0, 0.0], [500.0, 500.0]).len() <= 64);
+    }
+}
+
+#[cfg(test)]
 mod tile_tests {
     use super::*;
 
@@ -2649,6 +3102,63 @@ mod tile_tests {
         ui.press(size, at, 1);
         assert_eq!(ui.settings.map_mode, MapMode::Flat);
         assert!((ui.view.center[0] - 1000.0).abs() < 1e-3 && (ui.view.center[1] - 500.0).abs() < 1e-3);
+    }
+
+    fn opened_round(world: Disc) -> (Ui, Player) {
+        let mut ui = Ui::new(Settings::default(), false);
+        ui.set_world(world);
+        ui.settings.map_mode = MapMode::Round;
+        let player = Player { x: 300.0, y: 64.0, z: -200.0, yaw: 0.0, dimension: "minecraft:overworld".to_owned() };
+        ui.view.blocks_per_pixel = 3.0;
+        ui.opened(Some(&player));
+        (ui, player)
+    }
+
+    #[test]
+    fn a_map_opened_in_round_mode_shows_the_whole_world() {
+        const SIZE: [f32; 2] = [640.0, 360.0];
+        let world = Disc { center: [10.0, 20.0], radius: 3000.0 };
+        let (mut ui, player) = opened_round(world);
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        assert_eq!(ui.view.center, world.center);
+        assert_eq!(ui.view.blocks_per_pixel, 6000.0 / 360.0);
+    }
+
+    #[test]
+    fn zooming_a_round_map_is_kept_until_it_is_opened_again() {
+        const SIZE: [f32; 2] = [640.0, 360.0];
+        let (mut ui, player) = opened_round(Disc { center: [0.0, 0.0], radius: 3000.0 });
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        ui.scroll(SIZE, [320.0, 180.0], 5.0);
+        let zoomed = ui.view.blocks_per_pixel;
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        assert_eq!(ui.view.blocks_per_pixel, zoomed);
+    }
+
+    #[test]
+    fn flat_comes_back_to_the_player_after_a_map_opened_round_even_twice() {
+        const SIZE: [f32; 2] = [640.0, 360.0];
+        let (mut ui, player) = opened_round(Disc { center: [0.0, 0.0], radius: 3000.0 });
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        ui.opened(Some(&player));
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        let button = ui.view_button([0.0, 0.0, SIZE[0], SIZE[1]]);
+        ui.press(SIZE, [button[0] + 2.0, button[1] + 2.0], 0);
+        assert_eq!(ui.settings.map_mode, MapMode::Flat);
+        assert_eq!(ui.view.center, [300.0, -200.0]);
+        assert_eq!(ui.view.blocks_per_pixel, 3.0, "the scale it had before the round map took over");
+    }
+
+    #[test]
+    fn a_world_learned_after_opening_refits_the_round_map() {
+        const SIZE: [f32; 2] = [640.0, 360.0];
+        let (mut ui, player) = opened_round(Disc::default());
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        let bigger = Disc { center: [50.0, 60.0], radius: 9000.0 };
+        ui.set_world(bigger);
+        ui.rebuild_map(SIZE, [0.0, 0.0], Some(&player), None, &[], &[]);
+        assert_eq!(ui.view.center, bigger.center);
+        assert_eq!(ui.view.blocks_per_pixel, 18000.0 / 360.0);
     }
 
     #[test]
@@ -2955,6 +3465,200 @@ mod tests {
         assert_eq!(ui.page, Page::Settings);
     }
 
+    fn editing_ui() -> Ui {
+        let mut ui = Ui::new(Settings::default(), false);
+        ui.settings.map_mode = MapMode::Flat;
+        ui.overlay.editing = true;
+        ui.overlay.buttons =
+            vec![PanelButton { label: ("A", "А"), lit: true }, PanelButton { label: ("B", "Б"), lit: false }];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        ui
+    }
+
+    #[test]
+    fn panel_buttons_answer_by_index() {
+        let mut ui = editing_ui();
+        let rects = ui.panel_rects(FULL);
+        assert_eq!(press_on(&mut ui, rects[1]), Press::Button(1));
+        assert_eq!(press_on(&mut ui, rects[0]), Press::Button(0));
+    }
+
+    #[test]
+    fn the_panel_wraps_inside_a_narrow_window() {
+        let mut ui = Ui::new(Settings::default(), false);
+        ui.overlay.buttons = vec![PanelButton { label: ("A", "А"), lit: false }; 9];
+        let rect = [10.0, 20.0, 200.0, 140.0];
+        let rects = ui.panel_rects(rect);
+        assert!(rects.iter().all(|r| r[0] >= rect[0] && r[0] + r[2] <= rect[0] + rect[2]));
+        assert!(rects.last().unwrap()[1] > rects[0][1]);
+    }
+
+    #[test]
+    fn a_still_press_is_a_click_and_a_drag_pans_instead() {
+        let mut ui = editing_ui();
+        let spot = [320.0, 200.0];
+        assert_eq!(ui.press(SIZE, spot, 0), Press::Taken);
+        let before = ui.view.center;
+        assert!(ui.drag(SIZE, [1.0, 1.0], 0));
+        assert_eq!(ui.view.center, before, "a shaking hand does not move the map");
+        let world = ui.release().expect("a click");
+        assert_eq!(world, ui.view.screen_to_world(FULL, spot));
+
+        assert_eq!(ui.press(SIZE, spot, 0), Press::Taken);
+        ui.drag(SIZE, [8.0, 0.0], 0);
+        ui.drag(SIZE, [8.0, 0.0], 0);
+        assert_ne!(ui.view.center, before);
+        assert_eq!(ui.release(), None, "that was a drag");
+    }
+
+    #[test]
+    fn without_the_editor_a_press_is_never_a_click() {
+        let mut ui = editing_ui();
+        ui.overlay.editing = false;
+        assert_eq!(ui.press(SIZE, [320.0, 200.0], 0), Press::Taken);
+        assert_eq!(ui.release(), None);
+    }
+
+    #[test]
+    fn escape_goes_to_the_editor_only_while_editing() {
+        let mut ui = editing_ui();
+        assert_eq!(ui.key("key.keyboard.escape", 0), Press::Back);
+        ui.overlay.editing = false;
+        assert_eq!(ui.key("key.keyboard.escape", 0), Press::Ignored);
+    }
+
+    fn quads_colored(ops: &[Op], wanted: u32) -> usize {
+        ops.iter().filter(|op| matches!(op, Op::Quad { argb, .. } if *argb == wanted)).count()
+    }
+
+    #[test]
+    fn roads_are_drawn_by_kind_and_the_one_under_the_cursor_stands_out() {
+        let mut ui = editing_ui();
+        let road = RoadLine {
+            a: [-40.0, 0.0],
+            b: [40.0, 0.0],
+            kind: RoadKind::Boat,
+            one_way: false,
+            closed: false,
+            hot: false,
+        };
+        ui.overlay.lines = vec![road];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_BOAT), 1);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_HOT), 0);
+        ui.overlay.lines = vec![RoadLine { hot: true, ..road }];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_BOAT), 0);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_HOT), 1);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_CASING), 1);
+    }
+
+    #[test]
+    fn closed_and_one_way_roads_carry_their_marks() {
+        let mut ui = editing_ui();
+        let road =
+            RoadLine { a: [-40.0, 0.0], b: [40.0, 0.0], kind: RoadKind::Walk, one_way: true, closed: true, hot: false };
+        ui.overlay.lines = vec![road];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_WALK), 0, "closed is grey whatever the kind");
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_CLOSED), 2, "the road and its arrow");
+        let stop = ui.map_ops().iter().filter(|op| matches!(op, Op::Fill { argb, .. } if *argb == ROAD_STOP)).count();
+        assert_eq!(stop, 1);
+    }
+
+    #[test]
+    fn a_road_outside_the_world_circle_is_cut_off() {
+        let mut ui = editing_ui();
+        let radius = ui.world.radius;
+        ui.view.blocks_per_pixel = 256.0;
+        let road = RoadLine {
+            a: [radius * 3.0, 0.0],
+            b: [radius * 4.0, 0.0],
+            kind: RoadKind::Walk,
+            one_way: false,
+            closed: false,
+            hot: false,
+        };
+        ui.overlay.lines = vec![road];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROAD_WALK), 0);
+    }
+
+    #[test]
+    fn the_line_being_drawn_follows_the_cursor() {
+        let mut ui = editing_ui();
+        let rubber = with_alpha(ROAD_HOT, 80);
+        assert_eq!(quads_colored(ui.map_ops(), rubber), 0);
+        ui.overlay.rubber = Some(([-40.0, 0.0], [40.0, 30.0]));
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), rubber), 1);
+    }
+
+    #[test]
+    fn a_route_is_drawn_on_the_map_with_its_end_marked() {
+        let mut ui = editing_ui();
+        ui.route = vec![RouteStep { a: [-40.0, 0.0], b: [40.0, 0.0], direct: false }];
+        ui.destination = Some([40.0, 0.0]);
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROUTE), 1);
+        assert_eq!(quads_colored(ui.map_ops(), ROUTE_CASING), 1);
+        assert!(ui.map_ops().iter().any(|op| matches!(op, Op::Fill { argb, .. } if *argb == ROUTE_END)));
+    }
+
+    #[test]
+    fn a_stretch_off_the_network_is_drawn_thin_and_without_a_casing() {
+        let mut ui = editing_ui();
+        ui.route = vec![RouteStep { a: [-40.0, 0.0], b: [40.0, 0.0], direct: true }];
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert_eq!(quads_colored(ui.map_ops(), ROUTE), 1);
+        assert_eq!(quads_colored(ui.map_ops(), ROUTE_CASING), 0);
+    }
+
+    #[test]
+    fn the_minimap_shows_the_route_only_on_the_overworld() {
+        let mut ui = editing_ui();
+        ui.route = vec![RouteStep { a: [-10.0, 0.0], b: [10.0, 0.0], direct: false }];
+        let mut here = player();
+        here.x = 0.0;
+        here.z = 0.0;
+        here.dimension = "minecraft:overworld".to_owned();
+        ui.rebuild_minimap(SIZE, &here, None, &[], &[]);
+        assert_eq!(quads_colored(ui.minimap_ops(), ROUTE), 1);
+        here.dimension = "minecraft:the_nether".to_owned();
+        ui.rebuild_minimap(SIZE, &here, None, &[], &[]);
+        assert_eq!(quads_colored(ui.minimap_ops(), ROUTE), 0);
+    }
+
+    #[test]
+    fn the_banner_is_only_there_with_something_to_say() {
+        let mut ui = editing_ui();
+        let mut ops = Vec::new();
+        ui.banner_ops(SIZE, 4.0, &mut ops);
+        assert!(ops.is_empty());
+        ui.banner = Some("Через 120 м: налево".to_owned());
+        ui.banner_ops(SIZE, 4.0, &mut ops);
+        assert_eq!(texts(&ops), vec!["Через 120 м: налево"]);
+    }
+
+    #[test]
+    fn the_status_line_shows_how_far_the_map_has_been_drawn() {
+        let mut ui = editing_ui();
+        ui.overlay.progress = Some((101, 242));
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert!(texts(ui.map_ops()).iter().any(|text| text.contains("101") && text.contains("242")));
+    }
+
+    #[test]
+    fn the_status_line_shows_the_notice_before_the_counts() {
+        let mut ui = editing_ui();
+        ui.overlay.counts = Some((3, 2, true));
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert!(texts(ui.map_ops()).iter().any(|text| text.contains('3') && text.contains("...")));
+        ui.overlay.notice = Some(("Nope", "Nope"));
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        assert!(texts(ui.map_ops()).contains(&"Nope"));
+    }
+
     #[test]
     fn dragging_pans_the_map() {
         let mut ui = Ui::new(Settings::default(), false);
@@ -3092,9 +3796,8 @@ mod disk_tests {
         wait_for(|| disk.poll(1).pop());
         disk.store(WORLD, at(90), 1, &payload);
         disk.store(WORLD, at(91), 1, &payload);
-        wait_for(|| Some(()).filter(|()| disk.version(WORLD, at(1)) == 0));
+        wait_for(|| Some(()).filter(|()| disk.version(WORLD, at(1)) == 0 && disk.version(WORLD, at(2)) == 0));
         assert_eq!(disk.version(WORLD, at(0)), 1);
-        assert_eq!(disk.version(WORLD, at(2)), 0);
         assert_eq!(disk.version(WORLD, at(3)), 1);
         assert_eq!(disk.version(WORLD, at(91)), 1);
         let on_disk: u64 = std::fs::read_dir(dir.join("minecraft~overworld/0"))

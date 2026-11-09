@@ -109,6 +109,18 @@ pub struct RouteNetwork {
     pub lines: Vec<RouteLine>,
 }
 
+/// What changed in the network after a version, oldest first, up to a page. Rows are never removed, so a client that
+/// applies these in order holds the whole network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteChanges {
+    /// The reader is up to date to this version once it has applied the rows.
+    pub to: i64,
+    /// The newest version of the network. Below the version asked about when the database was replaced.
+    pub latest: i64,
+    pub nodes: Vec<RouteNode>,
+    pub lines: Vec<RouteLine>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JournalEntry {
     pub seq: i64,
@@ -394,32 +406,70 @@ impl Core {
             .fetch_all(&mut *tx)
             .await?;
         tx.rollback().await?;
-        let nodes = node_rows
-            .iter()
-            .map(|row| {
-                Ok(RouteNode {
-                    id: row.try_get(0)?,
-                    x: row.try_get(1)?,
-                    z: row.try_get(2)?,
-                    transfer: row.try_get::<i64, _>(3)? != 0,
-                })
-            })
-            .collect::<Result<Vec<_>, CoreError>>()?;
-        let lines = line_rows
-            .iter()
-            .map(|row| {
-                let mode: String = row.try_get(3)?;
-                Ok(RouteLine {
-                    id: row.try_get(0)?,
-                    a: row.try_get(1)?,
-                    b: row.try_get(2)?,
-                    mode: RouteMode::parse(&mode).ok_or_else(|| CoreError::Corrupt(format!("route mode {mode:?}")))?,
-                    one_way: row.try_get::<i64, _>(4)? != 0,
-                    closed: row.try_get::<i64, _>(5)? != 0,
-                })
-            })
-            .collect::<Result<Vec<_>, CoreError>>()?;
+        let nodes = node_rows.iter().map(route_node).collect::<Result<Vec<_>, CoreError>>()?;
+        let lines = line_rows.iter().map(route_line).collect::<Result<Vec<_>, CoreError>>()?;
         Ok(RouteNetwork { version, nodes, lines })
+    }
+
+    /// At most `limit` rows changed after `since`, the oldest first. Each edit touches one row, so a page never cuts an
+    /// edit in half.
+    pub async fn route_network_changes(&self, since: i64, limit: usize) -> Result<RouteChanges, CoreError> {
+        let limit = limit.max(1);
+        let mut tx = self.pool.begin().await?;
+        let latest: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
+             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let node_rows = sqlx::query(
+            "SELECT id, x, z, transfer, updated_seq FROM route_nodes WHERE updated_seq > $1 ORDER BY updated_seq LIMIT $2",
+        )
+        .bind(since)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        let line_rows = sqlx::query(
+            "SELECT id, a, b, mode, one_way, closed, updated_seq FROM route_lines WHERE updated_seq > $1 \
+             ORDER BY updated_seq LIMIT $2",
+        )
+        .bind(since)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+
+        let mut seqs = Vec::with_capacity(node_rows.len() + line_rows.len());
+        for row in &node_rows {
+            seqs.push(row.try_get::<i64, _>(4)?);
+        }
+        for row in &line_rows {
+            seqs.push(row.try_get::<i64, _>(6)?);
+        }
+        seqs.sort_unstable();
+        // Each list is complete up to its own last row, so both are complete up to the page's last seq.
+        let to = if seqs.len() >= limit { seqs[limit - 1] } else { latest };
+        let mut nodes = Vec::new();
+        for row in &node_rows {
+            if row.try_get::<i64, _>(4)? <= to {
+                nodes.push(route_node(row)?);
+            }
+        }
+        let mut lines = Vec::new();
+        for row in &line_rows {
+            if row.try_get::<i64, _>(6)? <= to {
+                lines.push(route_line(row)?);
+            }
+        }
+        Ok(RouteChanges { to, latest, nodes, lines })
+    }
+
+    /// Whether this player's role allows drawing the network. The commands check again, this is for showing the editor.
+    pub async fn may_edit_network(&self, player: PlayerId) -> Result<bool, CoreError> {
+        let mut tx = self.pool.begin().await?;
+        let role = actor_role(&mut tx, &Actor::Player(player)).await?;
+        tx.rollback().await?;
+        Ok(access::check_edit_network(role).is_ok())
     }
 
     /// Adds a node (a junction, a bend, or with `transfer` a station where the mode may change). Its id is the returned
@@ -589,6 +639,29 @@ impl Core {
         }
         Ok(Write::Open { tx: Box::new(tx), seq })
     }
+}
+
+/// A row whose first columns are `id, x, z, transfer`.
+fn route_node(row: &sqlx::any::AnyRow) -> Result<RouteNode, CoreError> {
+    Ok(RouteNode {
+        id: row.try_get(0)?,
+        x: row.try_get(1)?,
+        z: row.try_get(2)?,
+        transfer: row.try_get::<i64, _>(3)? != 0,
+    })
+}
+
+/// A row whose first columns are `id, a, b, mode, one_way, closed`.
+fn route_line(row: &sqlx::any::AnyRow) -> Result<RouteLine, CoreError> {
+    let mode: String = row.try_get(3)?;
+    Ok(RouteLine {
+        id: row.try_get(0)?,
+        a: row.try_get(1)?,
+        b: row.try_get(2)?,
+        mode: RouteMode::parse(&mode).ok_or_else(|| CoreError::Corrupt(format!("route mode {mode:?}")))?,
+        one_way: row.try_get::<i64, _>(4)? != 0,
+        closed: row.try_get::<i64, _>(5)? != 0,
+    })
 }
 
 /// `None` for a local mod. A player unknown to the database has no powers.

@@ -5,3 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[lib]
+# This exact source is also injected into Horizon as the `vexmap_routing` module, see mods/vexmap/mixins/vexmap.
+path = "../../mods/vexmap/mixins/vexmap/routing.rs"

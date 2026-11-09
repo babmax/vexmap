@@ -8,45 +8,16 @@
 pub mod read;
 pub mod store;
 
+pub use vexmap_proto::{Column, Material, classify};
 use vexmap_proto::{TILE_AREA, TILE_SIZE};
-
-/// What a column of the world looks like from above. The numbers are on the wire and in stored tiles: never renumber.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum Material {
-    Unknown = 0,
-    Water = 1,
-    Grass = 2,
-    Forest = 3,
-    Sand = 4,
-    Stone = 5,
-    Snow = 6,
-    Ice = 7,
-    Dirt = 8,
-    Built = 9,
-    Path = 10,
-    Lava = 11,
-    Netherrack = 12,
-    NetherGrowth = 13,
-    EndStone = 14,
-    Fungal = 15,
-}
 
 /// A level-0 tile's pixel count on a region side: a region is 512 blocks, two tiles.
 pub const REGION_BLOCKS: usize = 512;
 const NEUTRAL_SHADE: u8 = 8;
 const MAX_SHADE: u8 = 15;
 
-/// One column as seen from above.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Column {
-    pub material: Option<Material>,
-    pub height: i16,
-    /// Blocks of water over the floor. 0 on land.
-    pub depth: u8,
-}
-
 /// The columns of one region, `REGION_BLOCKS` squared, west to east then north to south.
+#[derive(Clone)]
 pub struct RegionColumns {
     pub columns: Vec<Column>,
 }
@@ -144,70 +115,6 @@ fn merge(pixels: [u8; 4]) -> u8 {
         }
     }
     (best.2 + best.1 / 2).checked_div(best.1).map_or(0, |shade| best.0 | (shade as u8) << 4)
-}
-
-/// Natural things too small to see from above. Found by reading real region files: as "unlisted" they showed as buildings.
-fn is_small_growth(name: &str) -> bool {
-    [
-        "_sapling",
-        "_mushroom",
-        "_bush",
-        "_vine",
-        "_vines",
-        "_vines_plant",
-        "_dripleaf",
-        "_dripleaf_stem",
-        "_bud",
-        "_petals",
-        "_tulip",
-        "_litter",
-    ]
-    .iter()
-    .any(|suffix| name.ends_with(suffix))
-        || matches!(
-            name,
-            "glow_lichen" | "sculk_vein" | "amethyst_cluster" | "spore_blossom" | "hanging_roots" | "pointed_dripstone"
-        )
-}
-
-/// Which material a block shows as from above. `None` means the map looks through it. Unlisted blocks count as built:
-/// anything a player placed that is not listed should read as a structure, not as terrain.
-pub fn classify(name: &str) -> Option<Material> {
-    use Material::*;
-    let name = name.strip_prefix("minecraft:").unwrap_or(name);
-    Some(match name {
-        "air" | "cave_air" | "void_air" | "light" | "barrier" | "structure_void" | "short_grass" | "tall_grass"
-        | "fern" | "large_fern" | "dead_bush" | "seagrass" | "tall_seagrass" | "snow" | "dandelion" | "poppy"
-        | "blue_orchid" | "allium" | "azure_bluet" | "oxeye_daisy" | "cornflower" | "lily_of_the_valley"
-        | "sunflower" | "lilac" | "rose_bush" | "peony" | "sugar_cane" | "vine" | "torch" | "wall_torch" | "kelp"
-        | "kelp_plant" => {
-            return None;
-        }
-        "water" | "bubble_column" => Water,
-        "lava" => Lava,
-        "grass_block" | "moss_block" | "lily_pad" | "melon" | "pumpkin" | "hay_block" | "farmland" => Grass,
-        "sand" | "red_sand" | "sandstone" | "red_sandstone" | "suspicious_sand" | "cactus" => Sand,
-        "snow_block" | "powder_snow" => Snow,
-        "ice" | "packed_ice" | "blue_ice" | "frosted_ice" => Ice,
-        "dirt" | "coarse_dirt" | "podzol" | "rooted_dirt" | "mud" | "mycelium" | "clay" | "gravel"
-        | "suspicious_gravel" => Dirt,
-        "dirt_path" | "rail" | "powered_rail" | "detector_rail" | "activator_rail" => Path,
-        "stone" | "granite" | "diorite" | "andesite" | "deepslate" | "tuff" | "calcite" | "dripstone_block"
-        | "bedrock" | "obsidian" | "terracotta" | "coal_ore" | "iron_ore" | "copper_ore" | "gold_ore"
-        | "emerald_ore" => Stone,
-        "netherrack" | "basalt" | "blackstone" | "soul_sand" | "soul_soil" | "magma_block" | "glowstone"
-        | "nether_quartz_ore" | "nether_gold_ore" | "ancient_debris" => Netherrack,
-        "crimson_nylium" | "warped_nylium" | "nether_wart_block" | "warped_wart_block" | "shroomlight" => NetherGrowth,
-        "end_stone" | "end_stone_bricks" | "purpur_block" => EndStone,
-        "chorus_plant" | "chorus_flower" => Fungal,
-        "mushroom_stem" | "red_mushroom_block" | "brown_mushroom_block" | "azalea" | "flowering_azalea" | "bamboo" => {
-            Forest
-        }
-        other if is_small_growth(other) => return None,
-        other if other.ends_with("_leaves") || other.ends_with("_log") || other.ends_with("_wood") => Forest,
-        other if other.ends_with("_terracotta") => Stone,
-        _ => Built,
-    })
 }
 
 #[cfg(test)]

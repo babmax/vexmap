@@ -5,7 +5,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::native_render::HandDrawn;
+use super::native_render::{HandDrawn, WorldDrawn};
 
 const TILE_SIZE: u32 = 256;
 /// `vexmap_ui::TILE_SLOTS`, `PAGE_SIZE`, `PAGE_BYTES`.
@@ -393,5 +393,198 @@ fn globe(uv: vec2f) -> vec3f {
     let offset = vec2f(in.uv.x, -in.uv.y) * p.flat_view.zw;
     let world = p.flat_view.xy + vec2f(dot(p.turn.xy, offset), dot(p.turn.zw, offset));
     return vec4f(surface(world), p.camera.w);
+}
+"#;
+
+// ---------------------------------------------------------------- the route in the world
+//
+// Through `world_drawn`: on the world's picture, before the hand and the HUD. No depth: the arrow is flat and floats by
+// the player, and a destination is worth seeing through a hill.
+
+/// `vexmap_ui::WorldVertex`: position, then colour.
+const MARK_VERTEX_BYTES: u64 = 7 * 4;
+/// More than the arrow and the beam need. What does not fit is not drawn.
+const MAX_MARK_VERTICES: usize = 64;
+
+/// In front of the camera and below the eye, where the road would be.
+const ARROW_AHEAD: f32 = 3.5;
+const ARROW_BELOW: f32 = 1.0;
+
+/// What to draw for the route, from the game thread. The arrow is placed in front of the camera here, on the render
+/// thread: the frame's own matrix keeps it steady, where the player's position only moves at the rate of game ticks.
+#[derive(Default)]
+pub struct Marks {
+    /// Flat, around its own centre.
+    pub arrow: Vec<[f32; 7]>,
+    /// Relative to `origin`.
+    pub beam: Vec<[f32; 7]>,
+    pub origin: [f64; 3],
+}
+
+static MARKS: Mutex<Marks> = Mutex::new(Marks { arrow: Vec::new(), beam: Vec::new(), origin: [0.0; 3] });
+static MARK_STATE: Mutex<Option<MarkState>> = Mutex::new(None);
+
+struct MarkState {
+    device: wgpu::Device,
+    format: wgpu::TextureFormat,
+    pipeline: wgpu::RenderPipeline,
+    group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    vertices: wgpu::Buffer,
+}
+
+/// What to draw in the world from the next frame on. Empty draws nothing.
+pub fn set_marks(marks: Marks) {
+    if let Ok(mut shared) = MARKS.lock() {
+        *shared = marks;
+    }
+}
+
+fn build_marks(device: &wgpu::Device, format: wgpu::TextureFormat) -> MarkState {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vexmap marks"),
+        source: wgpu::ShaderSource::Wgsl(MARK_SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vexmap marks"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vexmap marks"),
+        bind_group_layouts: &[Some(&layout)],
+        ..Default::default()
+    });
+    let attributes = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 12, shader_location: 1 },
+    ];
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vexmap marks"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: MARK_VERTEX_BYTES,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attributes,
+            })],
+        },
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::COLOR,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vexmap marks"),
+        size: 64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vexmap marks"),
+        size: MARK_VERTEX_BYTES * MAX_MARK_VERTICES as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vexmap marks"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() }],
+    });
+    MarkState { device: device.clone(), format, pipeline, group, params, vertices }
+}
+
+/// The render thread. `try_lock`: if the game holds the marks this instant, this frame goes without them.
+pub fn draw_world(world: &mut WorldDrawn<'_>) {
+    let Ok(marks) = MARKS.try_lock() else { return };
+    if marks.arrow.is_empty() && marks.beam.is_empty() {
+        return;
+    }
+    // A point straight ahead, camera-relative: the frame's matrix knows exactly where it is looking.
+    let ahead = world.view_proj.inverse().project_point3(glam::Vec3::new(0.0, 0.0, 0.5));
+    let flat = glam::Vec2::new(ahead.x, ahead.z).normalize_or_zero();
+    let arrow_at = [flat.x * ARROW_AHEAD, -ARROW_BELOW, flat.y * ARROW_AHEAD];
+    let beam_at = [
+        (marks.origin[0] - world.camera.x) as f32,
+        (marks.origin[1] - world.camera.y) as f32,
+        (marks.origin[2] - world.camera.z) as f32,
+    ];
+    // Looking straight up or down there is no "in front": the arrow would sit on the eye.
+    let arrow: &[[f32; 7]] = if flat == glam::Vec2::ZERO { &[] } else { &marks.arrow };
+    let placed = arrow.iter().map(|vertex| (vertex, arrow_at)).chain(marks.beam.iter().map(|vertex| (vertex, beam_at)));
+    let mut bytes = Vec::new();
+    let mut count = 0;
+    for (vertex, at) in placed.take(MAX_MARK_VERTICES) {
+        count += 1;
+        for (axis, value) in vertex.iter().enumerate() {
+            let shifted = if axis < 3 { value + at[axis] } else { *value };
+            bytes.extend_from_slice(&shifted.to_le_bytes());
+        }
+    }
+    drop(marks);
+    if count == 0 {
+        return;
+    }
+    let Ok(mut state) = MARK_STATE.lock() else { return };
+    if state.as_ref().is_none_or(|existing| existing.format != world.color_format || existing.device != *world.device) {
+        *state = Some(build_marks(world.device, world.color_format));
+    }
+    let Some(state) = state.as_ref() else { return };
+    let mut matrix = [0; 64];
+    for (chunk, value) in matrix.chunks_exact_mut(4).zip(world.view_proj.to_cols_array()) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    world.queue.write_buffer(&state.params, 0, &matrix);
+    world.queue.write_buffer(&state.vertices, 0, &bytes);
+    let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("vexmap marks"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: world.color_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&state.pipeline);
+    pass.set_bind_group(0, &state.group, &[]);
+    pass.set_vertex_buffer(0, state.vertices.slice(..));
+    pass.draw(0..count as u32, 0..1);
+}
+
+const MARK_SHADER: &str = r#"
+@group(0) @binding(0) var<uniform> view_proj: mat4x4f;
+
+struct In { @location(0) at: vec3f, @location(1) color: vec4f }
+struct Out { @builtin(position) pos: vec4f, @location(0) color: vec4f }
+
+@vertex fn vs_main(v: In) -> Out {
+    return Out(view_proj * vec4f(v.at, 1.0), v.color);
+}
+
+@fragment fn fs_main(v: Out) -> @location(0) vec4f {
+    return v.color;
 }
 "#;

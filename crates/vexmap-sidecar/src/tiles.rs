@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use vexmap_link::{Delivery, TileRequest, encode_tile_deliveries};
-use vexmap_proto::{Kind, MAX_S2C_FRAME, Message, Outbox, TileWant};
-use vexmap_tiler::store::{Scanner, TileStore};
+use vexmap_link::{Delivery, LIVE_CHUNK_BYTES, TileRequest, encode_tile_deliveries};
+use vexmap_proto::{COLUMN_BYTES, Column, Kind, MAX_S2C_FRAME, Message, Outbox, TileWant};
+use vexmap_tiler::store::{LiveChunk, RenderProgress, Scanner, TileStore};
 
 use crate::feed::PositionStore;
 
@@ -19,6 +20,14 @@ const BUDGET_BYTES_PER_SECOND: f64 = 64.0 * 1024.0;
 const BUDGET_BURST: f64 = 512.0 * 1024.0;
 const REQUEST_QUEUE: usize = 4096;
 const SCAN_EVERY: Duration = Duration::from_secs(30);
+/// How often chunks from the running game are drawn. A client compares versions, and a redraw costs a region's tiles.
+const LIVE_EVERY: Duration = Duration::from_millis(1500);
+/// Chunks waiting to be drawn, about a full round for 16 regions. Past this the newest are dropped.
+const LIVE_QUEUE: usize = 8192;
+/// Chunks drawn in one go, so a burst cannot hold the scan thread for long.
+const LIVE_BATCH: usize = 2048;
+/// Past this a chunk coordinate is not in any world we accept.
+const MAX_LIVE_CHUNK: i32 = 1 << 22;
 /// A full scan of a big world must not take a core from the game running beside it.
 const SCAN_DUTY: f64 = 0.5;
 const MAX_TRACKED_VIEWERS: usize = 16_384;
@@ -129,31 +138,62 @@ fn serve(mut requests: mpsc::Receiver<RegionRequest>, mut service: TileService, 
     }
 }
 
-fn scan(mut scanner: Scanner) {
-    loop {
-        // A world file is outside data: a bug it trips must cost one pass, not the map for the rest of the run.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.pass())) {
-            Ok(Ok(report)) if report.regions > 0 => tracing::info!(?report, "tiles redrawn"),
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!("tile scan: {error}"),
-            Err(_) => tracing::error!("tile scan panicked, trying again at the next pass"),
-        }
-        std::thread::sleep(SCAN_EVERY);
+/// A chunk as the feed carries it, or `None` when it makes no sense.
+pub fn decode_live(chunk: vexmap_link::LiveChunk) -> Option<LiveChunk> {
+    if chunk.columns.len() != LIVE_CHUNK_BYTES || chunk.x.abs() > MAX_LIVE_CHUNK || chunk.z.abs() > MAX_LIVE_CHUNK {
+        return None;
+    }
+    let columns = chunk
+        .columns
+        .as_chunks::<COLUMN_BYTES>()
+        .0
+        .iter()
+        .map(|bytes| Column::from_bytes(*bytes))
+        .collect::<Option<Vec<_>>>()?;
+    Some(LiveChunk { dimension: chunk.dimension, x: chunk.x, z: chunk.z, columns })
+}
+
+/// A world file is outside data: a bug it trips must cost one pass, not the map for the rest of the run.
+fn guarded(what: &str, work: impl FnOnce() -> std::io::Result<vexmap_tiler::store::ScanReport>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(Ok(report)) if report.regions > 0 => tracing::debug!(?report, what, "tiles redrawn"),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!("{what}: {error}"),
+        Err(_) => tracing::error!("{what} panicked, trying again later"),
     }
 }
 
-/// Starts both threads and returns where requests go.
-pub fn start(config: TileConfig, positions: Arc<PositionStore>) -> std::io::Result<mpsc::Sender<RegionRequest>> {
+fn scan(mut scanner: Scanner, progress: Arc<RenderProgress>) {
+    let mut next_pass = Instant::now();
+    loop {
+        if Instant::now() >= next_pass || progress.requested.swap(false, Ordering::Relaxed) {
+            guarded("tile scan", || scanner.pass());
+            next_pass = Instant::now() + SCAN_EVERY;
+        }
+        guarded("live map", || scanner.apply_live());
+        std::thread::sleep(LIVE_EVERY);
+    }
+}
+
+/// Starts both threads and returns where requests and chunks from the running game go.
+pub fn start(
+    config: TileConfig,
+    positions: Arc<PositionStore>,
+    progress: Arc<RenderProgress>,
+) -> std::io::Result<(mpsc::Sender<RegionRequest>, mpsc::Sender<vexmap_link::LiveChunk>)> {
     let (sender, receiver) = mpsc::channel(REQUEST_QUEUE);
+    let (live_sender, mut live_receiver) = mpsc::channel::<vexmap_link::LiveChunk>(LIVE_QUEUE);
     let service = TileService::new(TileStore::new(config.store.clone()));
     let focus = Arc::clone(&positions);
     std::thread::Builder::new()
         .name("vexmap-tile-serve".to_owned())
         .spawn(move || serve(receiver, service, positions))?;
     if config.worlds.is_empty() {
-        tracing::info!("VEXMAP_WORLD_DIRS is not set: the tile store is served as it is and not redrawn");
-    } else {
-        let scanner = Scanner::new(config.worlds, config.store, SCAN_DUTY).with_focus(Box::new(move || {
+        tracing::info!("VEXMAP_WORLD_DIRS is not set: only chunks from the running game are redrawn");
+    }
+    let scanner = Scanner::new(config.worlds, config.store, SCAN_DUTY)
+        .with_progress(progress.clone())
+        .with_focus(Box::new(move || {
             focus
                 .online()
                 .into_iter()
@@ -162,10 +202,17 @@ pub fn start(config: TileConfig, positions: Arc<PositionStore>) -> std::io::Resu
                     (player.marker.dimension, region(player.marker.x), region(player.marker.z))
                 })
                 .collect()
+        }))
+        .with_live(Box::new(move || {
+            let mut chunks = Vec::new();
+            while chunks.len() < LIVE_BATCH {
+                let Ok(chunk) = live_receiver.try_recv() else { break };
+                chunks.extend(decode_live(chunk));
+            }
+            chunks
         }));
-        std::thread::Builder::new().name("vexmap-tile-scan".to_owned()).spawn(move || scan(scanner))?;
-    }
-    Ok(sender)
+    std::thread::Builder::new().name("vexmap-tile-scan".to_owned()).spawn(move || scan(scanner, progress))?;
+    Ok((sender, live_sender))
 }
 
 #[cfg(test)]
@@ -198,6 +245,16 @@ mod tests {
         let mut reassembler = Reassembler::new(Limits::default());
         let Feed::Complete { kind, body } = reassembler.feed(&delivery.frame, 0) else { panic!("one frame") };
         Message::decode(kind, &body).unwrap()
+    }
+
+    #[test]
+    fn a_live_chunk_is_checked_before_it_is_believed() {
+        let good =
+            vexmap_link::LiveChunk { dimension: OVERWORLD.into(), x: 1, z: -1, columns: vec![0; LIVE_CHUNK_BYTES] };
+        assert_eq!(decode_live(good.clone()).unwrap().columns.len(), 256);
+        assert!(decode_live(vexmap_link::LiveChunk { columns: vec![0; 10], ..good.clone() }).is_none());
+        assert!(decode_live(vexmap_link::LiveChunk { x: i32::MAX, ..good.clone() }).is_none());
+        assert!(decode_live(vexmap_link::LiveChunk { columns: vec![77; LIVE_CHUNK_BYTES], ..good }).is_none());
     }
 
     #[test]

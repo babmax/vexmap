@@ -34,6 +34,9 @@ pub const MAX_TILE_LEVEL: u8 = 12;
 pub const MAX_TILE_WANTS: usize = 32;
 /// PackBits on noise grows by 1/128, so a real tile cannot pass this. A bound for the decoder.
 pub const MAX_ENCODED_TILE: usize = TILE_AREA + TILE_AREA / 64;
+/// The most nodes, and the most lines, one page of the route network carries. At 27 bytes a line this is about 170 KB
+/// with its nodes: one frame, and about what one server tick forwards.
+pub const MAX_NETWORK_PAGE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -53,6 +56,8 @@ pub enum Kind {
     WorldDisc = 14,
     NetworkEdit = 15,
     NetworkEditResult = 16,
+    NetworkWant = 17,
+    NetworkPage = 18,
 }
 
 impl Kind {
@@ -74,6 +79,8 @@ impl Kind {
             14 => Kind::WorldDisc,
             15 => Kind::NetworkEdit,
             16 => Kind::NetworkEditResult,
+            17 => Kind::NetworkWant,
+            18 => Kind::NetworkPage,
             _ => return None,
         })
     }
@@ -203,6 +210,52 @@ pub enum Message {
         /// The id of what was created (a node or line), 0 when nothing was.
         id: u64,
     },
+    /// Client to server: everything in the route network newer than `since`, 0 for all of it.
+    NetworkWant {
+        since: u64,
+        /// Asks the sidecar to finish drawing the whole map at full speed. The sidecar checks the player may.
+        render: bool,
+    },
+    /// Server to client: the answer to `NetworkWant { since }`. Rows are created or changed, never removed, so applying
+    /// pages in order rebuilds the network. The client asks again from `to` while `to` is behind `latest`.
+    NetworkPage(NetworkPage),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkPage {
+    /// The `since` this answers, so a late copy of an old answer is recognised.
+    pub since: u64,
+    /// The client is up to date to here once it has applied this page.
+    pub to: u64,
+    /// The newest version of the network. Below `since` means the database was replaced: start again.
+    pub latest: u64,
+    /// Whether the database would let this player edit. Only decides if the editor is offered: every edit is checked.
+    pub may_edit: bool,
+    /// Region files of the world drawn so far, and how many there are.
+    pub render_done: u32,
+    pub render_total: u32,
+    /// A full drawing asked for by a player is under way.
+    pub rendering: bool,
+    pub nodes: Vec<NetworkNode>,
+    pub lines: Vec<NetworkLine>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkNode {
+    pub id: u64,
+    pub x: i32,
+    pub z: i32,
+    pub transfer: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkLine {
+    pub id: u64,
+    pub a: u64,
+    pub b: u64,
+    pub mode: LineMode,
+    pub one_way: bool,
+    pub closed: bool,
 }
 
 /// A square of the world in the tile quadtree: `256 << level` blocks on a side, at `(x, z)` times that. Tiles live in
@@ -388,6 +441,8 @@ impl Message {
             Message::WorldDisc { .. } => Kind::WorldDisc,
             Message::NetworkEdit { .. } => Kind::NetworkEdit,
             Message::NetworkEditResult { .. } => Kind::NetworkEditResult,
+            Message::NetworkWant { .. } => Kind::NetworkWant,
+            Message::NetworkPage(_) => Kind::NetworkPage,
         }
     }
 
@@ -430,6 +485,11 @@ impl Message {
                 out.push(*status as u8);
                 out.extend_from_slice(&id.to_le_bytes());
             }
+            Message::NetworkWant { since, render } => {
+                out.extend_from_slice(&since.to_le_bytes());
+                out.push(u8::from(*render));
+            }
+            Message::NetworkPage(page) => put_network_page(&mut out, page),
             Message::WorldDisc { dimension, center_x, center_z, radius } => {
                 put_short(&mut out, truncate_dimension(dimension));
                 out.extend_from_slice(&center_x.to_le_bytes());
@@ -512,6 +572,8 @@ impl Message {
                 status: EditStatus::from_u8(reader.u8()?).ok_or(DecodeError::BadNumber)?,
                 id: reader.u64()?,
             },
+            Kind::NetworkWant => Message::NetworkWant { since: reader.u64()?, render: reader.flag()? },
+            Kind::NetworkPage => Message::NetworkPage(reader.network_page()?),
             Kind::WorldDisc => Message::WorldDisc {
                 dimension: reader.short(MAX_DIMENSION)?,
                 center_x: reader.u32()? as i32,
@@ -532,6 +594,206 @@ impl Message {
         }
         Ok(message)
     }
+}
+
+// ---------------------------------------------------------------- what a column of the world looks like from above
+//
+// The sidecar reads these from region files and the region server from loaded chunks. One set of rules, so the map cannot
+// show the same place differently depending on where it was read from.
+
+/// What a column of the world looks like from above. The numbers are on the wire and in stored tiles: never renumber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Material {
+    // Only ever a number in a stored tile: a column with nothing to show has no material at all.
+    #[allow(dead_code)]
+    Unknown = 0,
+    Water = 1,
+    Grass = 2,
+    Forest = 3,
+    Sand = 4,
+    Stone = 5,
+    Snow = 6,
+    Ice = 7,
+    Dirt = 8,
+    Built = 9,
+    Path = 10,
+    Lava = 11,
+    Netherrack = 12,
+    NetherGrowth = 13,
+    EndStone = 14,
+    Fungal = 15,
+}
+
+impl Material {
+    pub fn from_u8(value: u8) -> Option<Material> {
+        use Material::*;
+        Some(match value {
+            1 => Water,
+            2 => Grass,
+            3 => Forest,
+            4 => Sand,
+            5 => Stone,
+            6 => Snow,
+            7 => Ice,
+            8 => Dirt,
+            9 => Built,
+            10 => Path,
+            11 => Lava,
+            12 => Netherrack,
+            13 => NetherGrowth,
+            14 => EndStone,
+            15 => Fungal,
+            _ => return None,
+        })
+    }
+}
+
+/// One column as seen from above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Column {
+    pub material: Option<Material>,
+    pub height: i16,
+    /// Blocks of water over the floor. 0 on land.
+    pub depth: u8,
+}
+
+/// Bytes of one column on the feed between the region server and the sidecar.
+pub const COLUMN_BYTES: usize = 4;
+/// Bytes of a chunk's 256 columns, west to east then north to south.
+pub const CHUNK_COLUMN_BYTES: usize = 256 * COLUMN_BYTES;
+
+impl Column {
+    pub fn to_bytes(self) -> [u8; COLUMN_BYTES] {
+        let height = self.height.to_le_bytes();
+        [self.material.map_or(0, |material| material as u8), height[0], height[1], self.depth]
+    }
+
+    /// `None` for a material that does not exist. Read by the sidecar, not by the game.
+    #[allow(dead_code)]
+    pub fn from_bytes(bytes: [u8; COLUMN_BYTES]) -> Option<Column> {
+        let material = if bytes[0] == 0 { None } else { Some(Material::from_u8(bytes[0])?) };
+        Some(Column { material, height: i16::from_le_bytes([bytes[1], bytes[2]]), depth: bytes[3] })
+    }
+}
+
+/// How to look at a dimension from above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Survey {
+    /// Start at or below this height.
+    pub ceiling: i32,
+    /// Roofed: walk down out of the solid roof first, so the map shows the caves and not the top of the roof.
+    pub roofed: bool,
+}
+
+impl Survey {
+    pub fn of_dimension(dimension: &str) -> Survey {
+        if dimension == "minecraft:the_nether" {
+            Survey { ceiling: 126, roofed: true }
+        } else {
+            Survey { ceiling: i32::MAX, roofed: false }
+        }
+    }
+}
+
+/// Walks a column down from `top` to `bottom` and says what the map shows there. `material_at` is `None` where the map
+/// looks through.
+pub fn walk_column(
+    survey: Survey,
+    top: i32,
+    bottom: i32,
+    mut material_at: impl FnMut(i32) -> Option<Material>,
+) -> Column {
+    let mut in_roof = survey.roofed;
+    let mut water_top: Option<i32> = None;
+    let mut height = top.min(survey.ceiling);
+    while height >= bottom {
+        let material = material_at(height);
+        if in_roof {
+            in_roof = material.is_some();
+            height -= 1;
+            continue;
+        }
+        match (water_top, material) {
+            (None, None) => {}
+            (None, Some(Material::Water)) => water_top = Some(height),
+            (None, Some(found)) => return Column { material: Some(found), height: height as i16, depth: 0 },
+            (Some(_), Some(Material::Water) | None) => {}
+            (Some(surface), Some(_)) => {
+                let depth = (surface - height).clamp(1, i32::from(u8::MAX)) as u8;
+                return Column { material: Some(Material::Water), height: surface as i16, depth };
+            }
+        }
+        height -= 1;
+    }
+    match water_top {
+        Some(surface) => Column { material: Some(Material::Water), height: surface as i16, depth: u8::MAX },
+        None => Column::default(),
+    }
+}
+
+/// Natural things too small to see from above. Found by reading real region files: as "unlisted" they showed as buildings.
+fn is_small_growth(name: &str) -> bool {
+    [
+        "_sapling",
+        "_mushroom",
+        "_bush",
+        "_vine",
+        "_vines",
+        "_vines_plant",
+        "_dripleaf",
+        "_dripleaf_stem",
+        "_bud",
+        "_petals",
+        "_tulip",
+        "_litter",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+        || matches!(
+            name,
+            "glow_lichen" | "sculk_vein" | "amethyst_cluster" | "spore_blossom" | "hanging_roots" | "pointed_dripstone"
+        )
+}
+
+/// Which material a block shows as from above. `None` means the map looks through it. Unlisted blocks count as built:
+/// anything a player placed that is not listed should read as a structure, not as terrain.
+pub fn classify(name: &str) -> Option<Material> {
+    use Material::*;
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    Some(match name {
+        "air" | "cave_air" | "void_air" | "light" | "barrier" | "structure_void" | "short_grass" | "tall_grass"
+        | "fern" | "large_fern" | "dead_bush" | "seagrass" | "tall_seagrass" | "snow" | "dandelion" | "poppy"
+        | "blue_orchid" | "allium" | "azure_bluet" | "oxeye_daisy" | "cornflower" | "lily_of_the_valley"
+        | "sunflower" | "lilac" | "rose_bush" | "peony" | "sugar_cane" | "vine" | "torch" | "wall_torch" | "kelp"
+        | "kelp_plant" => {
+            return None;
+        }
+        "water" | "bubble_column" => Water,
+        "lava" => Lava,
+        "grass_block" | "moss_block" | "lily_pad" | "melon" | "pumpkin" | "hay_block" | "farmland" => Grass,
+        "sand" | "red_sand" | "sandstone" | "red_sandstone" | "suspicious_sand" | "cactus" => Sand,
+        "snow_block" | "powder_snow" => Snow,
+        "ice" | "packed_ice" | "blue_ice" | "frosted_ice" => Ice,
+        "dirt" | "coarse_dirt" | "podzol" | "rooted_dirt" | "mud" | "mycelium" | "clay" | "gravel"
+        | "suspicious_gravel" => Dirt,
+        "dirt_path" | "rail" | "powered_rail" | "detector_rail" | "activator_rail" => Path,
+        "stone" | "granite" | "diorite" | "andesite" | "deepslate" | "tuff" | "calcite" | "dripstone_block"
+        | "bedrock" | "obsidian" | "terracotta" | "coal_ore" | "iron_ore" | "copper_ore" | "gold_ore"
+        | "emerald_ore" => Stone,
+        "netherrack" | "basalt" | "blackstone" | "soul_sand" | "soul_soil" | "magma_block" | "glowstone"
+        | "nether_quartz_ore" | "nether_gold_ore" | "ancient_debris" => Netherrack,
+        "crimson_nylium" | "warped_nylium" | "nether_wart_block" | "warped_wart_block" | "shroomlight" => NetherGrowth,
+        "end_stone" | "end_stone_bricks" | "purpur_block" => EndStone,
+        "chorus_plant" | "chorus_flower" => Fungal,
+        "mushroom_stem" | "red_mushroom_block" | "brown_mushroom_block" | "azalea" | "flowering_azalea" | "bamboo" => {
+            Forest
+        }
+        other if is_small_growth(other) => return None,
+        other if other.ends_with("_leaves") || other.ends_with("_log") || other.ends_with("_wood") => Forest,
+        other if other.ends_with("_terracotta") => Stone,
+        _ => Built,
+    })
 }
 
 /// How a line of the route network is travelled. The numbers are on the wire.
@@ -626,6 +888,33 @@ fn put_edit(out: &mut Vec<u8>, edit: &NetworkEdit) {
             out.extend_from_slice(&line.to_le_bytes());
             out.push(u8::from(closed));
         }
+    }
+}
+
+fn put_network_page(out: &mut Vec<u8>, page: &NetworkPage) {
+    out.extend_from_slice(&page.since.to_le_bytes());
+    out.extend_from_slice(&page.to.to_le_bytes());
+    out.extend_from_slice(&page.latest.to_le_bytes());
+    out.push(u8::from(page.may_edit));
+    let (nodes, lines) = (page.nodes.len().min(MAX_NETWORK_PAGE), page.lines.len().min(MAX_NETWORK_PAGE));
+    out.extend_from_slice(&(nodes as u16).to_le_bytes());
+    out.extend_from_slice(&(lines as u16).to_le_bytes());
+    out.extend_from_slice(&page.render_done.to_le_bytes());
+    out.extend_from_slice(&page.render_total.to_le_bytes());
+    out.push(u8::from(page.rendering));
+    for node in &page.nodes[..nodes] {
+        out.extend_from_slice(&node.id.to_le_bytes());
+        out.extend_from_slice(&node.x.to_le_bytes());
+        out.extend_from_slice(&node.z.to_le_bytes());
+        out.push(u8::from(node.transfer));
+    }
+    for line in &page.lines[..lines] {
+        out.extend_from_slice(&line.id.to_le_bytes());
+        out.extend_from_slice(&line.a.to_le_bytes());
+        out.extend_from_slice(&line.b.to_le_bytes());
+        out.push(line.mode as u8);
+        out.push(u8::from(line.one_way));
+        out.push(u8::from(line.closed));
     }
 }
 
@@ -775,6 +1064,32 @@ impl<'a> Reader<'a> {
             3 => NetworkEdit::SetClosed { line: self.u64()?, closed: self.flag()? },
             _ => return Err(DecodeError::BadNumber),
         })
+    }
+
+    fn network_page(&mut self) -> Result<NetworkPage, DecodeError> {
+        let (since, to, latest) = (self.u64()?, self.u64()?, self.u64()?);
+        let may_edit = self.flag()?;
+        let (node_count, line_count) = (usize::from(self.u16()?), usize::from(self.u16()?));
+        if node_count > MAX_NETWORK_PAGE || line_count > MAX_NETWORK_PAGE {
+            return Err(DecodeError::TooMany);
+        }
+        let (render_done, render_total, rendering) = (self.u32()?, self.u32()?, self.flag()?);
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            nodes.push(NetworkNode { id: self.u64()?, x: self.i32()?, z: self.i32()?, transfer: self.flag()? });
+        }
+        let mut lines = Vec::with_capacity(line_count);
+        for _ in 0..line_count {
+            lines.push(NetworkLine {
+                id: self.u64()?,
+                a: self.u64()?,
+                b: self.u64()?,
+                mode: LineMode::from_u8(self.u8()?).ok_or(DecodeError::BadNumber)?,
+                one_way: self.flag()?,
+                closed: self.flag()?,
+            });
+        }
+        Ok(NetworkPage { since, to, latest, may_edit, render_done, render_total, rendering, nodes, lines })
     }
 
     fn u64(&mut self) -> Result<u64, DecodeError> {
@@ -1536,6 +1851,18 @@ mod tests {
             Message::NetworkEdit { token: 0, edit: NetworkEdit::SetClosed { line: 9, closed: false } },
             Message::NetworkEditResult { token: 7, status: EditStatus::Forbidden, id: 0 },
             Message::NetworkEditResult { token: 8, status: EditStatus::Done, id: 123_456 },
+            Message::NetworkWant { since: u64::MAX - 1, render: true },
+            Message::NetworkPage(NetworkPage {
+                since: 3,
+                to: 9,
+                latest: 40,
+                may_edit: true,
+                render_done: 7,
+                render_total: 242,
+                rendering: true,
+                nodes: vec![NetworkNode { id: 4, x: -30_000_000, z: 30_000_000, transfer: true }],
+                lines: vec![NetworkLine { id: 9, a: 4, b: 5, mode: LineMode::Train, one_way: true, closed: true }],
+            }),
             Message::Reject { reason: "Установите мод VexMap".into() },
             Message::Ping(42),
             Message::Pong(u64::MAX),
@@ -1939,6 +2266,73 @@ mod tests {
         gate.join(3, 0);
         assert_eq!(gate.poll(20_000), vec![]);
         assert_eq!(gate.features(3), Some(1));
+    }
+
+    #[test]
+    fn a_column_survives_the_feed_and_an_invented_material_does_not() {
+        let column = Column { material: Some(Material::Snow), height: -60, depth: 9 };
+        assert_eq!(Column::from_bytes(column.to_bytes()), Some(column));
+        assert_eq!(Column::from_bytes(Column::default().to_bytes()), Some(Column::default()));
+        assert_eq!(Column::from_bytes([16, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn walking_down_looks_through_plants_and_measures_water() {
+        let open = Survey::of_dimension("minecraft:overworld");
+        let world = |y: i32| match y {
+            70 => classify("minecraft:short_grass"),
+            69 => classify("minecraft:grass_block"),
+            _ => None,
+        };
+        let column = walk_column(open, 100, 0, world);
+        assert_eq!((column.material, column.height), (Some(Material::Grass), 69));
+
+        let lake = |y: i32| match y {
+            60..=63 => Some(Material::Water),
+            59 => Some(Material::Sand),
+            _ => None,
+        };
+        let column = walk_column(open, 100, 0, lake);
+        assert_eq!((column.material, column.height, column.depth), (Some(Material::Water), 63, 4));
+        assert_eq!(walk_column(open, 100, 0, |_| None), Column::default());
+    }
+
+    #[test]
+    fn a_roofed_dimension_is_walked_from_under_its_roof() {
+        let nether = Survey::of_dimension("minecraft:the_nether");
+        let world = |y: i32| match y {
+            110.. => Some(Material::Netherrack),
+            40 => Some(Material::NetherGrowth),
+            _ => None,
+        };
+        let column = walk_column(nether, 127, 0, world);
+        assert_eq!((column.material, column.height), (Some(Material::NetherGrowth), 40));
+    }
+
+    #[test]
+    fn a_full_network_page_is_one_frame_and_a_lying_count_is_refused() {
+        let line = NetworkLine { id: 1, a: 2, b: 3, mode: LineMode::Walk, one_way: false, closed: false };
+        let node = NetworkNode { id: 1, x: 0, z: 0, transfer: false };
+        let page = NetworkPage {
+            since: 0,
+            to: 1,
+            latest: 2,
+            may_edit: false,
+            render_done: 0,
+            render_total: 0,
+            rendering: false,
+            nodes: vec![node; MAX_NETWORK_PAGE],
+            lines: vec![line; MAX_NETWORK_PAGE],
+        };
+        let message = Message::NetworkPage(page);
+        let body = message.body();
+        assert!(body.len() + HEADER_LEN < MAX_S2C_FRAME);
+        assert_eq!(Message::decode(Kind::NetworkPage as u8, &body).unwrap(), message);
+
+        let mut lying = message.body();
+        lying[25..27].copy_from_slice(&(MAX_NETWORK_PAGE as u16 + 1).to_le_bytes());
+        assert_eq!(Message::decode(Kind::NetworkPage as u8, &lying), Err(DecodeError::TooMany));
+        assert_eq!(Message::decode(Kind::NetworkPage as u8, &body[..body.len() - 1]), Err(DecodeError::Truncated));
     }
 
     #[test]

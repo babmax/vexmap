@@ -1,11 +1,11 @@
-//! Routing over the hand-drawn network (roads, rails, sea lanes). Pure `std`: it runs on the client over a graph the
-//! server hands out, or on the sidecar for a request, with no change to the code.
-//!
-//! World coordinates are blocks, `x` east and `z` south. Costs are seconds. A route may change mode (walk, train, boat)
-//! only at a node marked as a transfer, and every change costs `Speeds::transfer_penalty`.
-//!
-//! Off the network, walking is a straight line (a bearing): the world has no roads there, a straight line is what a
-//! player would do, and the leg is marked `Direct` so the client can say "head 40 degrees" instead of inventing streets.
+// Routing over the hand-drawn network (roads, rails, sea lanes). Pure `std`: it runs on the client over a graph the
+// server hands out, or on the sidecar for a request, with no change to the code.
+//
+// World coordinates are blocks, `x` east and `z` south. Costs are seconds. A route may change mode (walk, train, boat)
+// only at a node marked as a transfer, and every change costs `Speeds::transfer_penalty`.
+//
+// Off the network, walking is a straight line (a bearing): the world has no roads there, a straight line is what a
+// player would do, and the leg is marked `Direct` so the client can say "head 40 degrees" instead of inventing streets.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -24,6 +24,8 @@ impl Mode {
         self as usize
     }
 
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::Walk => "walk",
@@ -32,6 +34,8 @@ impl Mode {
         }
     }
 
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn parse(value: &str) -> Option<Mode> {
         MODES.into_iter().find(|mode| mode.as_str() == value)
     }
@@ -191,10 +195,14 @@ impl Graph {
         }
     }
 
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn position(&self, node: NodeId) -> Option<Point> {
         self.nodes.get(node.0 as usize).map(|n| n.at)
     }
@@ -420,6 +428,8 @@ pub enum Turn {
 }
 
 impl Turn {
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Turn::Straight => "straight",
@@ -553,6 +563,363 @@ impl Deviation {
     /// After the player declines or a new route is built.
     pub fn reset(&mut self) {
         self.off = 0;
+    }
+}
+
+// ---------------------------------------------------------------- following a route
+
+/// Closer than this to the end of the route is having arrived.
+const ARRIVED_BLOCKS: f64 = 6.0;
+/// Position samples for speed and deviation: more often says nothing new.
+const SAMPLE_EVERY_MS: u64 = 1000;
+/// How far along the route the arrow in the world aims.
+const LOOK_AHEAD_BLOCKS: f64 = 12.0;
+/// Faster than this between two samples is a teleport, not travel.
+const MAX_SAMPLE_SPEED: f64 = 40.0;
+
+/// What to tell the player right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Guidance {
+    pub turn: Option<Turn>,
+    /// Blocks to that turn.
+    pub to_turn: f64,
+    pub remaining: f64,
+    pub seconds: f64,
+    /// On a stretch off the network: the bearing to hold, in degrees.
+    pub bearing: Option<f64>,
+}
+
+fn distance_text(blocks: f64, ru: bool) -> String {
+    if blocks < 1000.0 {
+        format!("{:.0} {}", blocks.max(0.0), if ru { "м" } else { "m" })
+    } else if ru {
+        format!("{:.1} км", blocks / 1000.0).replace('.', ",")
+    } else {
+        format!("{:.1} km", blocks / 1000.0)
+    }
+}
+
+fn time_text(seconds: f64, ru: bool) -> String {
+    if seconds < 60.0 {
+        format!("{:.0} {}", seconds.max(1.0), if ru { "с" } else { "s" })
+    } else {
+        format!("{:.0} {}", (seconds / 60.0).round(), if ru { "мин" } else { "min" })
+    }
+}
+
+fn turn_text(turn: Turn, ru: bool) -> &'static str {
+    match (turn, ru) {
+        (Turn::Straight, false) => "straight on",
+        (Turn::Straight, true) => "прямо",
+        (Turn::SlightLeft, false) => "bear left",
+        (Turn::SlightLeft, true) => "плавно налево",
+        (Turn::Left, false) => "turn left",
+        (Turn::Left, true) => "налево",
+        (Turn::SharpLeft, false) => "sharp left",
+        (Turn::SharpLeft, true) => "резко налево",
+        (Turn::SlightRight, false) => "bear right",
+        (Turn::SlightRight, true) => "плавно направо",
+        (Turn::Right, false) => "turn right",
+        (Turn::Right, true) => "направо",
+        (Turn::SharpRight, false) => "sharp right",
+        (Turn::SharpRight, true) => "резко направо",
+        (Turn::UTurn, false) => "turn back",
+        (Turn::UTurn, true) => "разворот",
+    }
+}
+
+impl Guidance {
+    /// One line for the screen.
+    pub fn describe(&self, ru: bool) -> String {
+        let what = if let Some(bearing) = self.bearing {
+            if ru { format!("Курс {bearing:.0}\u{b0}") } else { format!("Head {bearing:.0}\u{b0}") }
+        } else if let Some(turn) = self.turn {
+            let distance = distance_text(self.to_turn, ru);
+            if ru {
+                format!("Через {distance}: {}", turn_text(turn, ru))
+            } else {
+                format!("In {distance}: {}", turn_text(turn, ru))
+            }
+        } else if ru {
+            "Прямо до цели".to_owned()
+        } else {
+            "Straight to the end".to_owned()
+        };
+        format!("{what}  |  {}, {}", distance_text(self.remaining, ru), time_text(self.seconds, ru))
+    }
+}
+
+/// The route the player is following: where they are on it, how fast they really go, and whether they have left it.
+#[derive(Default)]
+pub struct Navigator {
+    route: Option<Route>,
+    /// Along the route: where each turn is.
+    turns: Vec<(f64, Turn)>,
+    destination: Option<Point>,
+    deviation: Deviation,
+    tracker: SpeedTracker,
+    last: Option<(Point, u64)>,
+    at: Option<Point>,
+    along: f64,
+    off_route: bool,
+}
+
+impl Navigator {
+    pub fn set_route(&mut self, destination: Point, route: Route) {
+        let mut along = 0.0;
+        self.turns = route
+            .hints()
+            .iter()
+            .map(|hint| {
+                along += hint.after;
+                (along, hint.turn)
+            })
+            .collect();
+        self.route = Some(route);
+        self.destination = Some(destination);
+        self.deviation.reset();
+        self.along = 0.0;
+        self.off_route = false;
+    }
+
+    /// Forgets the route. The speeds learned stay: they are the player's.
+    pub fn clear(&mut self) {
+        self.route = None;
+        self.turns.clear();
+        self.destination = None;
+        self.off_route = false;
+    }
+
+    pub fn route(&self) -> Option<&Route> {
+        self.route.as_ref()
+    }
+
+    pub fn destination(&self) -> Option<Point> {
+        self.destination
+    }
+
+    /// The player has left the route and may be offered a new one. Nothing is rebuilt until they say so.
+    pub fn off_route(&self) -> bool {
+        self.off_route
+    }
+
+    pub fn speeds(&self) -> Speeds {
+        self.tracker.speeds(Speeds::default())
+    }
+
+    fn leg_at(route: &Route, along: f64) -> Option<&Leg> {
+        let mut walked = 0.0;
+        for leg in &route.legs {
+            walked += leg.length;
+            if along <= walked {
+                return Some(leg);
+            }
+        }
+        route.legs.last()
+    }
+
+    /// Where the player is now. Returns `true` on arrival. Cheap to call every frame: it only works once a second.
+    pub fn sample(&mut self, at: Point, now_ms: u64) -> bool {
+        if self.last.is_some_and(|(_, then)| now_ms.saturating_sub(then) < SAMPLE_EVERY_MS) {
+            return false;
+        }
+        let previous = self.last.replace((at, now_ms));
+        let Some(route) = &self.route else { return false };
+        let (_, along) = route.locate(at);
+        self.at = Some(at);
+        self.along = along;
+        if let Some(((was, then), leg)) = previous.zip(Self::leg_at(route, along)) {
+            let (blocks, seconds) = (was.distance(at), now_ms.saturating_sub(then) as f64 / 1000.0);
+            if seconds > 0.0 && blocks / seconds < MAX_SAMPLE_SPEED && blocks > 0.2 {
+                self.tracker.record(leg.mode, blocks, seconds);
+            }
+        }
+        if self.destination.is_some_and(|end| end.distance(at) <= ARRIVED_BLOCKS)
+            || route.length - along <= ARRIVED_BLOCKS && route.locate(at).0 <= ARRIVED_BLOCKS
+        {
+            return true;
+        }
+        if self.deviation.sample(route, at) {
+            self.off_route = true;
+        }
+        false
+    }
+
+    /// Where to head right now, in degrees: towards the route a little further on, so the arrow leans into a bend before
+    /// the player reaches it. `None` without a route, before the first sample, or standing on the very point.
+    pub fn bearing_ahead(&self, here: Point) -> Option<f64> {
+        let route = self.route.as_ref()?;
+        self.at?;
+        let wanted = self.along + LOOK_AHEAD_BLOCKS;
+        let line = route.polyline();
+        let mut walked = 0.0;
+        for pair in line.windows(2) {
+            let length = pair[0].distance(pair[1]);
+            if length > 0.0 && walked + length >= wanted {
+                let t = (wanted - walked) / length;
+                let point =
+                    Point { x: pair[0].x + (pair[1].x - pair[0].x) * t, z: pair[0].z + (pair[1].z - pair[0].z) * t };
+                return (point.distance(here) > 0.5).then(|| heading(here, point));
+            }
+            walked += length;
+        }
+        let end = *line.last()?;
+        (end.distance(here) > 0.5).then(|| heading(here, end))
+    }
+
+    /// `None` without a route, or before the first sample.
+    pub fn guidance(&self) -> Option<Guidance> {
+        let route = self.route.as_ref()?;
+        let at = self.at?;
+        let speeds = self.speeds();
+        let mut walked = 0.0;
+        let mut seconds = 0.0;
+        let mut bearing = None;
+        for leg in &route.legs {
+            let left = (walked + leg.length - self.along.max(walked)).max(0.0);
+            seconds += left / speeds.of(leg.mode);
+            if bearing.is_none()
+                && leg.kind == LegKind::Direct
+                && self.along >= walked
+                && self.along < walked + leg.length
+                && let Some(end) = leg.points.last()
+            {
+                bearing = Some(heading(at, *end));
+            }
+            walked += leg.length;
+        }
+        let next = self.turns.iter().find(|(along, _)| *along > self.along + 1.0);
+        Some(Guidance {
+            turn: next.map(|(_, turn)| *turn),
+            to_turn: next.map_or(0.0, |(along, _)| along - self.along),
+            remaining: (route.length - self.along).max(0.0),
+            seconds,
+            bearing,
+        })
+    }
+}
+
+#[cfg(test)]
+mod navigator_tests {
+    use super::*;
+
+    fn p(x: f64, z: f64) -> Point {
+        Point { x, z }
+    }
+
+    /// East 100 blocks, then south 100.
+    fn corner() -> Route {
+        let mut graph = Graph::new();
+        let a = graph.add_node(0.0, 0.0, false);
+        let b = graph.add_node(100.0, 0.0, false);
+        let c = graph.add_node(100.0, 100.0, false);
+        graph.add_line(a, b, Mode::Walk, false).unwrap();
+        graph.add_line(b, c, Mode::Walk, false).unwrap();
+        graph.route(&[p(0.0, 0.0), p(100.0, 100.0)], &[Mode::Walk], &Speeds::default()).unwrap()
+    }
+
+    fn following() -> Navigator {
+        let mut navigator = Navigator::default();
+        navigator.set_route(p(100.0, 100.0), corner());
+        navigator
+    }
+
+    #[test]
+    fn the_next_turn_and_what_is_left_follow_the_player() {
+        let mut navigator = following();
+        assert_eq!(navigator.guidance(), None, "nothing to say before the first position");
+        navigator.sample(p(40.0, 0.0), 1000);
+        let guidance = navigator.guidance().unwrap();
+        assert_eq!(guidance.turn, Some(Turn::Right));
+        assert!((guidance.to_turn - 60.0).abs() < 1e-6);
+        assert!((guidance.remaining - 160.0).abs() < 1e-6);
+        navigator.sample(p(100.0, 40.0), 2000);
+        let guidance = navigator.guidance().unwrap();
+        assert_eq!(guidance.turn, None, "the corner is behind");
+        assert!((guidance.remaining - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_text_is_in_the_players_language() {
+        let guidance =
+            Guidance { turn: Some(Turn::Left), to_turn: 120.0, remaining: 1400.0, seconds: 180.0, bearing: None };
+        assert_eq!(guidance.describe(true), "Через 120 м: налево  |  1,4 км, 3 мин");
+        assert_eq!(guidance.describe(false), "In 120 m: turn left  |  1.4 km, 3 min");
+        let direct = Guidance { bearing: Some(40.0), ..guidance };
+        assert!(direct.describe(true).starts_with("Курс 40"));
+    }
+
+    #[test]
+    fn the_arrow_aims_along_the_route_and_leans_into_a_bend_early() {
+        let mut navigator = following();
+        assert_eq!(navigator.bearing_ahead(p(0.0, 0.0)), None, "nothing before the first position");
+        navigator.sample(p(40.0, 0.0), 1000);
+        assert!((navigator.bearing_ahead(p(40.0, 0.0)).unwrap() - 90.0).abs() < 1e-6, "due east");
+        navigator.sample(p(96.0, 0.0), 2000);
+        let leaning = navigator.bearing_ahead(p(96.0, 0.0)).unwrap();
+        assert!(leaning > 90.0 && leaning < 180.0, "already turning south: {leaning}");
+        navigator.sample(p(100.0, 50.0), 3000);
+        assert!((navigator.bearing_ahead(p(100.0, 50.0)).unwrap() - 180.0).abs() < 1e-6, "due south");
+    }
+
+    #[test]
+    fn near_the_end_the_arrow_aims_at_the_end() {
+        let mut navigator = following();
+        navigator.sample(p(100.0, 95.0), 1000);
+        assert!((navigator.bearing_ahead(p(100.0, 95.0)).unwrap() - 180.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arriving_ends_the_route() {
+        let mut navigator = following();
+        assert!(!navigator.sample(p(100.0, 50.0), 1000));
+        assert!(navigator.sample(p(100.0, 97.0), 2000));
+    }
+
+    #[test]
+    fn leaving_the_route_only_offers_a_new_one_after_a_while() {
+        let mut navigator = following();
+        for second in 1..=2 {
+            navigator.sample(p(50.0, 200.0), second * 1000);
+            assert!(!navigator.off_route());
+        }
+        navigator.sample(p(50.0, 200.0), 3000);
+        assert!(navigator.off_route());
+        assert!(navigator.route().is_some(), "the route stays until the player agrees to a new one");
+    }
+
+    #[test]
+    fn samples_closer_than_a_second_are_ignored() {
+        let mut navigator = following();
+        navigator.sample(p(10.0, 0.0), 1000);
+        navigator.sample(p(50.0, 0.0), 1500);
+        assert!((navigator.guidance().unwrap().remaining - 190.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_estimate_follows_how_fast_the_player_really_goes_and_ignores_a_teleport() {
+        let mut navigator = following();
+        let before = navigator.guidance();
+        assert_eq!(before, None);
+        navigator.sample(p(0.0, 0.0), 1000);
+        let usual = navigator.guidance().unwrap().seconds;
+        navigator.sample(p(8.0, 0.0), 2000); // 8 blocks a second: faster than a walk.
+        assert!(navigator.speeds().walk > Speeds::default().walk);
+        assert!(navigator.guidance().unwrap().seconds < usual);
+        let learned = navigator.speeds().walk;
+        navigator.sample(p(90.0, 0.0), 3000); // 82 blocks in a second.
+        assert_eq!(navigator.speeds().walk, learned);
+    }
+
+    #[test]
+    fn clearing_keeps_what_was_learned_about_the_player() {
+        let mut navigator = following();
+        navigator.sample(p(0.0, 0.0), 1000);
+        navigator.sample(p(8.0, 0.0), 2000);
+        let learned = navigator.speeds().walk;
+        navigator.clear();
+        assert!(navigator.route().is_none() && navigator.guidance().is_none());
+        assert_eq!(navigator.speeds().walk, learned);
     }
 }
 

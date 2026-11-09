@@ -133,6 +133,8 @@ const KIND_BATCH: u8 = 2;
 const KIND_DELIVERIES: u8 = 3;
 const KIND_TILE_REQUESTS: u8 = 4;
 const KIND_TILE_DELIVERIES: u8 = 5;
+const KIND_NETWORK_WANTS: u8 = 6;
+const KIND_LIVE_CHUNKS: u8 = 7;
 const FLAG_POSITIONS: u8 = 1;
 
 /// One player as the tick saw them.
@@ -587,6 +589,222 @@ pub fn is_tile_requests(body: &[u8]) -> bool {
     body.first() == Some(&KIND_TILE_REQUESTS)
 }
 
+/// A player asks what changed in the route network after version `since`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkWant {
+    pub viewer: u128,
+    pub since: u64,
+    /// Also asks for the whole map to be drawn at full speed.
+    pub render: bool,
+}
+
+const MAX_QUEUED_NETWORK_WANTS: usize = 512;
+
+/// Requests on their way to the sidecar. A full box drops the new one, and the client asks again.
+pub struct NetworkWantBox {
+    wants: Mutex<Vec<NetworkWant>>,
+}
+
+impl NetworkWantBox {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        NetworkWantBox { wants: Mutex::new(Vec::new()) }
+    }
+
+    pub fn try_push(&self, want: NetworkWant) -> bool {
+        let Ok(mut wants) = self.wants.lock() else { return false };
+        if wants.len() >= MAX_QUEUED_NETWORK_WANTS {
+            return false;
+        }
+        wants.push(want);
+        true
+    }
+
+    fn take(&self, into: &mut Vec<NetworkWant>) {
+        into.clear();
+        if let Ok(mut wants) = self.wants.lock() {
+            std::mem::swap(&mut *wants, into);
+        }
+    }
+}
+
+/// With its length prefix.
+pub fn encode_network_wants(wants: &[NetworkWant], out: &mut Vec<u8>) {
+    let start = begin_message(out, KIND_NETWORK_WANTS);
+    let wants = &wants[..wants.len().min(MAX_QUEUED_NETWORK_WANTS)];
+    out.extend_from_slice(&(wants.len() as u16).to_le_bytes());
+    for want in wants {
+        out.extend_from_slice(&want.viewer.to_le_bytes());
+        out.extend_from_slice(&want.since.to_le_bytes());
+        out.push(u8::from(want.render));
+    }
+    finish_message(out, start);
+}
+
+/// Without the length prefix. Bad bytes are an error, never a panic.
+#[allow(dead_code)]
+pub fn decode_network_wants(body: &[u8]) -> Result<Vec<NetworkWant>, FeedError> {
+    let mut reader = FeedReader { bytes: body };
+    if reader.u8()? != KIND_NETWORK_WANTS {
+        return Err(FeedError::BadHeader);
+    }
+    let count = usize::from(u16::from_le_bytes(reader.array()?));
+    if count > MAX_QUEUED_NETWORK_WANTS {
+        return Err(FeedError::TooManyPlayers);
+    }
+    let mut wants = Vec::with_capacity(count);
+    for _ in 0..count {
+        wants.push(NetworkWant {
+            viewer: u128::from_le_bytes(reader.array()?),
+            since: u64::from_le_bytes(reader.array()?),
+            render: reader.u8()? != 0,
+        });
+    }
+    reader.end()?;
+    Ok(wants)
+}
+
+/// Whether a message read from the feed (without its length prefix) is a list of network requests.
+#[allow(dead_code)]
+pub fn is_network_wants(body: &[u8]) -> bool {
+    body.first() == Some(&KIND_NETWORK_WANTS)
+}
+
+// ---------------------------------------------------------------- the map as it is right now
+
+/// Bytes of one chunk's columns. Same as `vexmap_proto::CHUNK_COLUMN_BYTES`, which this file cannot name.
+pub const LIVE_CHUNK_BYTES: usize = 1024;
+const MAX_QUEUED_LIVE_CHUNKS: usize = 2048;
+const MAX_LIVE_CHUNKS_PER_MESSAGE: usize = 256;
+/// One round of looking around the players, in chunks. A crowd gets a smaller circle each.
+const LIVE_CHUNKS_PER_ROUND: usize = 640;
+const MIN_LIVE_RADIUS: i32 = 2;
+const MAX_LIVE_RADIUS: i32 = 8;
+
+/// What a chunk looks like from above, as the game has it now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveChunk {
+    pub dimension: String,
+    pub x: i32,
+    pub z: i32,
+    pub columns: Vec<u8>,
+}
+
+/// Chunks on their way to the sidecar. A full box drops the new one: the worker tries it again in the next round.
+pub struct LiveChunkBox {
+    chunks: Mutex<Vec<LiveChunk>>,
+}
+
+impl LiveChunkBox {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        LiveChunkBox { chunks: Mutex::new(Vec::new()) }
+    }
+
+    pub fn try_push(&self, chunk: LiveChunk) -> bool {
+        let Ok(mut chunks) = self.chunks.lock() else { return false };
+        if chunks.len() >= MAX_QUEUED_LIVE_CHUNKS || chunk.columns.len() != LIVE_CHUNK_BYTES {
+            return false;
+        }
+        chunks.push(chunk);
+        true
+    }
+
+    fn take(&self, into: &mut Vec<LiveChunk>) {
+        into.clear();
+        if let Ok(mut chunks) = self.chunks.lock() {
+            std::mem::swap(&mut *chunks, into);
+        }
+    }
+}
+
+/// With its length prefix. Chunks past the message's limit are left out, so call with at most a message's worth.
+pub fn encode_live_chunks(chunks: &[LiveChunk], out: &mut Vec<u8>) {
+    let start = begin_message(out, KIND_LIVE_CHUNKS);
+    let chunks = &chunks[..chunks.len().min(MAX_LIVE_CHUNKS_PER_MESSAGE)];
+    out.extend_from_slice(&(chunks.len() as u16).to_le_bytes());
+    for chunk in chunks {
+        put_short_str(out, &chunk.dimension);
+        out.extend_from_slice(&chunk.x.to_le_bytes());
+        out.extend_from_slice(&chunk.z.to_le_bytes());
+        out.extend_from_slice(&chunk.columns);
+    }
+    finish_message(out, start);
+}
+
+/// Without the length prefix. Bad bytes are an error, never a panic.
+#[allow(dead_code)]
+pub fn decode_live_chunks(body: &[u8]) -> Result<Vec<LiveChunk>, FeedError> {
+    let mut reader = FeedReader { bytes: body };
+    if reader.u8()? != KIND_LIVE_CHUNKS {
+        return Err(FeedError::BadHeader);
+    }
+    let count = usize::from(u16::from_le_bytes(reader.array()?));
+    if count > MAX_LIVE_CHUNKS_PER_MESSAGE {
+        return Err(FeedError::TooManyPlayers);
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for _ in 0..count {
+        chunks.push(LiveChunk {
+            dimension: reader.short_str(MAX_DIMENSION)?,
+            x: i32::from_le_bytes(reader.array()?),
+            z: i32::from_le_bytes(reader.array()?),
+            columns: reader.take(LIVE_CHUNK_BYTES)?.to_vec(),
+        });
+    }
+    reader.end()?;
+    Ok(chunks)
+}
+
+/// Whether a message read from the feed (without its length prefix) is a list of live chunks.
+#[allow(dead_code)]
+pub fn is_live_chunks(body: &[u8]) -> bool {
+    body.first() == Some(&KIND_LIVE_CHUNKS)
+}
+
+/// Which chunks to look at next: around every player, the nearest first, each once a round.
+#[derive(Default)]
+pub struct LivePlan {
+    queue: VecDeque<(String, [i32; 2])>,
+}
+
+impl LivePlan {
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn pop(&mut self) -> Option<(String, [i32; 2])> {
+        self.queue.pop_front()
+    }
+
+    /// Starts a round from where the players are now: `(dimension, x, z)` in blocks.
+    pub fn refill(&mut self, players: &[(String, f64, f64)]) {
+        self.queue.clear();
+        if players.is_empty() {
+            return;
+        }
+        let side = (LIVE_CHUNKS_PER_ROUND as f64 / players.len() as f64).sqrt() as i32;
+        let radius = ((side - 1) / 2).clamp(MIN_LIVE_RADIUS, MAX_LIVE_RADIUS);
+        let mut seen = std::collections::HashSet::new();
+        for ring in 0..=radius {
+            for (dimension, x, z) in players {
+                let center = [(*x as i32) >> 4, (*z as i32) >> 4];
+                for dx in -ring..=ring {
+                    for dz in -ring..=ring {
+                        if dx.abs().max(dz.abs()) != ring {
+                            continue;
+                        }
+                        let chunk = [center[0] + dx, center[1] + dz];
+                        if seen.insert((dimension.as_str(), chunk)) {
+                            self.queue.push_back((dimension.clone(), chunk));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Tile frames for the region, with their length prefix.
 #[allow(dead_code)]
 pub fn encode_tile_deliveries(deliveries: &[Delivery], out: &mut Vec<u8>) {
@@ -673,11 +891,15 @@ pub struct FeedBoxes {
     pub deliveries: &'static DeliveryBox,
     pub tile_requests: &'static TileRequestBox,
     pub tiles: &'static TileDeliveryBox,
+    pub network_wants: &'static NetworkWantBox,
+    pub live_chunks: &'static LiveChunkBox,
 }
 
 fn write_batches(mut stream: &TcpStream, config: &FeedConfig, boxes: FeedBoxes) -> std::io::Result<()> {
     let mut batch = Vec::new();
     let mut requests = Vec::new();
+    let mut network_wants = Vec::new();
+    let mut live_chunks = Vec::new();
     let mut out = Vec::new();
     loop {
         if let Some((seq, positions)) = boxes.players.take(&mut batch) {
@@ -689,6 +911,18 @@ fn write_batches(mut stream: &TcpStream, config: &FeedConfig, boxes: FeedBoxes) 
         if !requests.is_empty() {
             out.clear();
             encode_tile_requests(&requests, &mut out);
+            stream.write_all(&out)?;
+        }
+        boxes.network_wants.take(&mut network_wants);
+        if !network_wants.is_empty() {
+            out.clear();
+            encode_network_wants(&network_wants, &mut out);
+            stream.write_all(&out)?;
+        }
+        boxes.live_chunks.take(&mut live_chunks);
+        for batch in live_chunks.chunks(MAX_LIVE_CHUNKS_PER_MESSAGE) {
+            out.clear();
+            encode_live_chunks(batch, &mut out);
             stream.write_all(&out)?;
         }
         std::thread::sleep(config.poll);

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -12,12 +13,103 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 use vexmap_core::{Core, CoreError, RouteMode};
+use vexmap_link::{Delivery, NetworkWant, encode_tile_deliveries};
+use vexmap_proto::{LineMode, MAX_NETWORK_PAGE, MAX_S2C_FRAME, Message, NetworkLine, NetworkNode, NetworkPage, Outbox};
 use vexmap_routing::{Graph, LegKind, Mode, Point, RouteError, Speeds};
+use vexmap_tiler::store::RenderProgress;
 
+use crate::feed::PositionStore;
 use crate::{ApiError, ApiResult, AppState, command_context};
+
+/// Players waiting for a page of the network. Past this they are dropped, and their clients ask again.
+const WANT_QUEUE: usize = 1024;
+
+pub struct RegionWant {
+    pub region: String,
+    pub want: NetworkWant,
+}
+
+/// The rows after `since` for one player. A `since` past what the database can hold is simply past the newest version.
+pub async fn page_for(core: &Core, want: NetworkWant, render: &RenderProgress) -> Result<NetworkPage, CoreError> {
+    let changes = core.route_network_changes(i64::try_from(want.since).unwrap_or(i64::MAX), MAX_NETWORK_PAGE).await?;
+    let may_edit = core.may_edit_network(Uuid::from_u128(want.viewer)).await?;
+    if want.render && may_edit {
+        render.request_full();
+    }
+    let nodes = changes
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let (x, z) = (i32::try_from(node.x).ok()?, i32::try_from(node.z).ok()?);
+            Some(NetworkNode { id: node.id as u64, x, z, transfer: node.transfer })
+        })
+        .collect();
+    let lines = changes
+        .lines
+        .iter()
+        .map(|line| NetworkLine {
+            id: line.id as u64,
+            a: line.a as u64,
+            b: line.b as u64,
+            mode: match line.mode {
+                RouteMode::Walk => LineMode::Walk,
+                RouteMode::Boat => LineMode::Boat,
+                RouteMode::Train => LineMode::Train,
+            },
+            one_way: line.one_way,
+            closed: line.closed,
+        })
+        .collect();
+    Ok(NetworkPage {
+        since: want.since,
+        to: changes.to as u64,
+        latest: changes.latest as u64,
+        may_edit,
+        render_done: render.done.load(Ordering::Relaxed),
+        render_total: render.total.load(Ordering::Relaxed),
+        rendering: render.fast.load(Ordering::Relaxed),
+        nodes,
+        lines,
+    })
+}
+
+/// Reads one page at a time, so a crowd of clients costs the database one query at a time. The answers take the tiles'
+/// way back: they are for one player, and the server limits how many bytes of them one tick sends.
+async fn serve_pages(
+    mut wants: mpsc::Receiver<RegionWant>,
+    core: Core,
+    positions: Arc<PositionStore>,
+    render: Arc<RenderProgress>,
+) {
+    let mut outbox = Outbox::default();
+    while let Some(RegionWant { region, want }) = wants.recv().await {
+        let page = match page_for(&core, want, &render).await {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!("network page: {error}");
+                continue;
+            }
+        };
+        let Ok(frames) = outbox.frames(&Message::NetworkPage(page), MAX_S2C_FRAME) else { continue };
+        let deliveries: Vec<Delivery> =
+            frames.into_iter().map(|frame| Delivery { viewers: vec![want.viewer], frame }).collect();
+        let mut bytes = Vec::new();
+        encode_tile_deliveries(&deliveries, &mut bytes);
+        if !positions.deliver_tiles(&region, bytes) {
+            tracing::debug!(region, "network page dropped: the region's queue is full or it is gone");
+        }
+    }
+}
+
+/// Starts the worker and returns where requests go.
+pub fn start_pages(core: Core, positions: Arc<PositionStore>, render: Arc<RenderProgress>) -> mpsc::Sender<RegionWant> {
+    let (sender, receiver) = mpsc::channel(WANT_QUEUE);
+    tokio::spawn(serve_pages(receiver, core, positions, render));
+    sender
+}
 
 /// The graph for one network version.
 #[derive(Default)]

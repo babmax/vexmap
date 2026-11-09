@@ -11,30 +11,14 @@ use horizon_world::chunk::PalettedContainer;
 use horizon_world::nbt::{Limits, Tag};
 use horizon_world::region::RegionFile;
 
+pub use vexmap_proto::Survey;
+use vexmap_proto::walk_column;
+
 use crate::{Column, Material, REGION_BLOCKS, RegionColumns, classify};
 
 const SECTION_BLOCKS: usize = 4096;
 const BLOCK_STATE_MIN_BITS: u8 = 4;
 const FULL_STATUS: &str = "minecraft:full";
-
-/// How to look at a dimension from above.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Survey {
-    /// Start at or below this height.
-    pub ceiling: i32,
-    /// Roofed: walk down out of the solid roof first, so the map shows the caves and not the top of the roof.
-    pub roofed: bool,
-}
-
-impl Survey {
-    pub fn of_dimension(dimension: &str) -> Survey {
-        if dimension == "minecraft:the_nether" {
-            Survey { ceiling: 126, roofed: true }
-        } else {
-            Survey { ceiling: i32::MAX, roofed: false }
-        }
-    }
-}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReadReport {
@@ -71,7 +55,14 @@ fn sections_of(root: &Tag) -> io::Result<Vec<Section>> {
 
 fn lookup(section: &Section, index: usize, names: &mut Names) -> io::Result<Option<Material>> {
     let state = section.blocks.get(index)?;
-    let Some(Tag::String(name)) = state.get("Name").or_else(|| state.get("id")) else { return Ok(None) };
+    // A block with no properties is stored as just its name. It is most of the world: stone, dirt, still water.
+    let name = match state {
+        Tag::String(name) => name,
+        _ => match state.get("Name").or_else(|| state.get("id")) {
+            Some(Tag::String(name)) => name,
+            _ => return Ok(None),
+        },
+    };
     if let Some(known) = names.get(name.0.as_slice()) {
         return Ok(*known);
     }
@@ -81,38 +72,27 @@ fn lookup(section: &Section, index: usize, names: &mut Names) -> io::Result<Opti
 }
 
 fn column_of(sections: &[Section], x: usize, z: usize, survey: Survey, names: &mut Names) -> io::Result<Column> {
-    let mut in_roof = survey.roofed;
-    let mut water_top: Option<i32> = None;
-    for section in sections {
-        let base = section.y * 16;
-        if base > survey.ceiling {
-            continue;
+    let (Some(first), Some(last)) = (sections.first(), sections.last()) else { return Ok(Column::default()) };
+    let (top, bottom) = (first.y * 16 + 15, last.y * 16);
+    let mut failure = None;
+    // Heights only go down, so the section in hand only moves forward.
+    let mut at = 0;
+    let column = walk_column(survey, top, bottom, |height| {
+        let wanted = height.div_euclid(16);
+        while sections.get(at).is_some_and(|section| section.y > wanted) {
+            at += 1;
         }
-        let highest = survey.ceiling.saturating_sub(base).min(15);
-        for local in (0..=highest).rev() {
-            let index = (local as usize) << 8 | z << 4 | x;
-            let material = lookup(section, index, names)?;
-            if in_roof {
-                in_roof = material.is_some();
-                continue;
-            }
-            let height = base + local;
-            match (water_top, material) {
-                (None, None) => {}
-                (None, Some(Material::Water)) => water_top = Some(height),
-                (None, Some(found)) => return Ok(Column { material: Some(found), height: height as i16, depth: 0 }),
-                (Some(_), Some(Material::Water) | None) => {}
-                (Some(surface), Some(_)) => {
-                    let depth = (surface - height).clamp(1, i32::from(u8::MAX)) as u8;
-                    return Ok(Column { material: Some(Material::Water), height: surface as i16, depth });
-                }
-            }
-        }
+        let section = sections.get(at).filter(|section| section.y == wanted)?;
+        let index = (height.rem_euclid(16) as usize) << 8 | z << 4 | x;
+        lookup(section, index, names).unwrap_or_else(|error| {
+            failure = Some(error);
+            None
+        })
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(column),
     }
-    Ok(match water_top {
-        Some(surface) => Column { material: Some(Material::Water), height: surface as i16, depth: u8::MAX },
-        None => Column::default(),
-    })
 }
 
 fn draw_chunk(
@@ -176,6 +156,19 @@ mod tests {
     }
 
     const OPEN: Survey = Survey { ceiling: i32::MAX, roofed: false };
+
+    /// The three ways a palette entry is written, oldest first. Real files mix the last two within one section.
+    #[test]
+    fn every_form_of_a_palette_entry_is_understood() {
+        let name = |text: &str| Tag::String(JavaString::from(text));
+        let forms =
+            [block("minecraft:stone"), Tag::compound([("id", name("minecraft:stone"))]), name("minecraft:stone")];
+        for form in forms {
+            let blocks = PalettedContainer::uniform(form.clone(), SECTION_BLOCKS, BLOCK_STATE_MIN_BITS).unwrap();
+            let column = column(&[Section { y: 4, blocks }], OPEN);
+            assert_eq!(column.material, Some(Material::Stone), "{form:?}");
+        }
+    }
 
     #[test]
     fn a_column_below_zero_is_found() {

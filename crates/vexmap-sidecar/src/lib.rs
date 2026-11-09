@@ -86,9 +86,12 @@ pub async fn run(config: Config) -> Result<(), String> {
         tokio::net::TcpListener::bind(config.feed_addr).await.map_err(|error| format!("bind feed: {error}"))?;
     tracing::info!("VexMap API on http://{}, player feed on {}", config.addr, config.feed_addr);
     let positions = Arc::new(PositionStore::default());
-    let tile_requests =
-        tiles::start(config.tiles.clone(), positions.clone()).map_err(|error| format!("tiles: {error}"))?;
-    tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone(), tile_requests));
+    let render = Arc::new(vexmap_tiler::store::RenderProgress::default());
+    let (tile_requests, live_chunks) = tiles::start(config.tiles.clone(), positions.clone(), render.clone())
+        .map_err(|error| format!("tiles: {error}"))?;
+    let network_requests = network::start_pages(core.clone(), positions.clone(), render);
+    let requests = feed::Requests { tiles: tile_requests, network: network_requests, live: live_chunks };
+    tokio::spawn(feed::serve(feed_listener, core.clone(), positions.clone(), requests));
     tokio::spawn(fanout::run(core.clone(), positions.clone()));
     axum::serve(listener, router(core, config.rate, positions))
         .with_graceful_shutdown(async {

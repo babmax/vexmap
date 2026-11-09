@@ -28,6 +28,20 @@ file = "crates/horizon-client/src/game.rs"
 name = "vexmap_ui"
 source = "ui.rs"
 
+# Also the `vexmap-routing` crate.
+[[module]]
+id = "routing"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_routing"
+source = "routing.rs"
+
+# Also the `vexmap-editor` crate.
+[[module]]
+id = "editor"
+file = "crates/horizon-client/src/game.rs"
+name = "vexmap_editor"
+source = "editor.rs"
+
 [[module]]
 id = "screen"
 file = "crates/horizon-client/src/game.rs"
@@ -55,6 +69,14 @@ hook_version = 1
 kind = "HEAD"
 helper = "hooks/hand_drawn.rs"
 bindings = [{ name = "hand", ty = "&mut crate::gfx::native_render::HandDrawn<'_>", value = "&mut *hand" }]
+
+[[injection]]
+id = "world-drawn"
+hook = "world_drawn"
+hook_version = 1
+kind = "HEAD"
+helper = "hooks/world_drawn.rs"
+bindings = [{ name = "world", ty = "&mut crate::gfx::native_render::WorldDrawn<'_>", value = "&mut *world" }]
 
 # ---- server
 

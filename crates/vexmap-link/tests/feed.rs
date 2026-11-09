@@ -8,16 +8,21 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use vexmap_core::{Actor, ClientName, CommandContext, Core, CountryId, RegionId, RequestId, Role};
+use vexmap_core::{Actor, ClientName, CommandContext, Core, CountryId, Outcome, RegionId, RequestId, Role, RouteMode};
 use vexmap_link::{
-    Delivery, DeliveryBox, FeedBoxes, FeedConfig, FeedError, FeedPosition, MAX_BATCH_PLAYERS, Mailbox, PlayerSample,
-    TileDeliveryBox, TileRequest, TileRequestBox, decode_batch, decode_deliveries, decode_hello, decode_tile_requests,
-    encode_batch, encode_deliveries, encode_hello, encode_tile_requests, is_tile_requests, start_feed,
+    Delivery, DeliveryBox, FeedBoxes, FeedConfig, FeedError, FeedPosition, LIVE_CHUNK_BYTES, LiveChunk, LiveChunkBox,
+    LivePlan, MAX_BATCH_PLAYERS, Mailbox, NetworkWant, NetworkWantBox, PlayerSample, TileDeliveryBox, TileRequest,
+    TileRequestBox, decode_batch, decode_deliveries, decode_hello, decode_live_chunks, decode_network_wants,
+    decode_tile_requests, encode_batch, encode_deliveries, encode_hello, encode_live_chunks, encode_network_wants,
+    encode_tile_requests, is_live_chunks, is_network_wants, is_tile_requests, start_feed,
 };
-use vexmap_proto::{Message, TILE_AREA, TileId, TileWant, decode_tile, parse_frame};
+use vexmap_proto::{
+    Column, LineMode, Material, Message, NetworkLine, NetworkNode, TILE_AREA, TileId, TileWant, decode_tile,
+    parse_frame,
+};
 use vexmap_sidecar::PositionStore;
 use vexmap_sidecar::fanout::run as run_fanout;
-use vexmap_sidecar::feed::serve;
+use vexmap_sidecar::feed::{Requests, serve};
 use vexmap_sidecar::tiles::{TileConfig, start as start_tiles};
 use vexmap_tiler::store::TileStore;
 
@@ -212,7 +217,7 @@ async fn sidecar() -> Sidecar {
     let store = Arc::new(PositionStore::default());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, core.clone(), store.clone(), tokio::sync::mpsc::channel(1).0));
+    tokio::spawn(serve(listener, core.clone(), store.clone(), no_requests()));
     tokio::spawn(run_fanout(core.clone(), store.clone()));
     Sidecar { core, store, addr, _dir: dir }
 }
@@ -230,8 +235,18 @@ fn feed_config(addr: SocketAddr, region: &str) -> FeedConfig {
     FeedConfig { retry: Duration::from_millis(20), poll: Duration::from_millis(5), ..parsed }
 }
 
+fn no_requests() -> Requests {
+    Requests {
+        tiles: tokio::sync::mpsc::channel(1).0,
+        network: tokio::sync::mpsc::channel(1).0,
+        live: tokio::sync::mpsc::channel(1).0,
+    }
+}
+
 fn boxes(players: &'static Mailbox) -> FeedBoxes {
     FeedBoxes {
+        network_wants: Box::leak(Box::new(NetworkWantBox::new())),
+        live_chunks: Box::leak(Box::new(LiveChunkBox::new())),
         players,
         deliveries: Box::leak(Box::new(DeliveryBox::new())),
         tile_requests: Box::leak(Box::new(TileRequestBox::new())),
@@ -451,9 +466,10 @@ async fn a_tile_request_crosses_the_real_socket_and_the_tile_comes_back() {
     pixels.fill(0x82);
     TileStore::new(dir.path().join("tiles")).write(OVERWORLD, id, 11, &pixels).unwrap();
     let config = TileConfig { worlds: Vec::new(), store: dir.path().join("tiles") };
-    let requests = start_tiles(config, store.clone()).unwrap();
+    let (requests, live) = start_tiles(config, store.clone(), Arc::default()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let requests = Requests { tiles: requests, network: tokio::sync::mpsc::channel(1).0, live };
     tokio::spawn(serve(listener, core.clone(), store.clone(), requests));
     let boxes = boxes(leaked_mailbox());
     start_feed(feed_config(addr, "a"), boxes).unwrap();
@@ -477,6 +493,72 @@ async fn a_tile_request_crosses_the_real_socket_and_the_tile_comes_back() {
     assert_eq!(decoded, pixels);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_network_request_crosses_the_real_socket_and_a_page_comes_back_to_that_player() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display()).replace('\\', "/");
+    let core = Core::connect(&url).await.unwrap();
+    let store = Arc::new(PositionStore::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Requests {
+        tiles: tokio::sync::mpsc::channel(1).0,
+        network: vexmap_sidecar::network::start_pages(core.clone(), store.clone(), Arc::default()),
+        live: tokio::sync::mpsc::channel(1).0,
+    };
+    tokio::spawn(serve(listener, core.clone(), store.clone(), requests));
+    let boxes = boxes(leaked_mailbox());
+    start_feed(feed_config(addr, "a"), boxes).unwrap();
+    eventually("the region connected", async || !store.snapshot(None).is_empty()).await;
+
+    let admin = Uuid::new_v4();
+    core.set_role(&system_context("role"), admin, Role::Admin, Default::default()).await.unwrap();
+    let node = |outcome| match outcome {
+        Outcome::Applied { seq } => seq,
+        other => panic!("{other:?}"),
+    };
+    let first = node(core.add_route_node(&system_context("n1"), -5, 6, true).await.unwrap());
+    let second = node(core.add_route_node(&system_context("n2"), 7, 8, false).await.unwrap());
+    let line = node(core.add_route_line(&system_context("l1"), first, second, RouteMode::Train, true).await.unwrap());
+
+    let ask = async |viewer: u128, since: u64| {
+        assert!(boxes.network_wants.try_push(NetworkWant { viewer, since, render: false }));
+        let mut received = Vec::new();
+        eventually("the page arrived", async || boxes.tiles.try_take(&mut received, 1 << 20)).await;
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].viewers, vec![viewer], "the answer is for who asked");
+        let (header, body) = parse_frame(&received[0].frame).unwrap();
+        let Message::NetworkPage(page) = Message::decode(header.kind, body).unwrap() else { panic!("a page") };
+        page
+    };
+
+    let page = ask(admin.as_u128(), 0).await;
+    assert!(page.may_edit);
+    assert_eq!((page.since, page.to, page.latest), (0, line as u64, line as u64));
+    assert_eq!(page.nodes[0], NetworkNode { id: first as u64, x: -5, z: 6, transfer: true });
+    assert_eq!(
+        page.lines,
+        vec![NetworkLine {
+            id: line as u64,
+            a: first as u64,
+            b: second as u64,
+            mode: LineMode::Train,
+            one_way: true,
+            closed: false,
+        }]
+    );
+
+    // An ordinary player gets the same network and no editor. A current copy gets an empty page, so polling stays cheap.
+    let page = ask(Uuid::new_v4().as_u128(), line as u64).await;
+    assert!(!page.may_edit);
+    assert_eq!(page.to, line as u64);
+    assert!(page.nodes.is_empty() && page.lines.is_empty());
+
+    // A `since` no database can hold is past the newest version, and does no harm.
+    let page = ask(admin.as_u128(), u64::MAX).await;
+    assert!(page.latest < page.since);
+}
+
 #[test]
 fn the_tile_queues_are_bounded_and_hand_out_a_tick_at_a_time() {
     let tiles = TileDeliveryBox::new();
@@ -493,6 +575,91 @@ fn the_tile_queues_are_bounded_and_hand_out_a_tick_at_a_time() {
     assert!((0..512).all(|_| requests.try_push(request.clone())));
     assert!(!requests.try_push(request), "a full queue drops instead of growing");
     assert!(!requests.try_push(TileRequest { viewer: 1, body: vec![0; 2000] }), "nor does it take an oversized body");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunk_from_the_running_game_crosses_the_socket_and_is_drawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display()).replace('\\', "/");
+    let core = Core::connect(&url).await.unwrap();
+    let store = Arc::new(PositionStore::default());
+    let config = TileConfig { worlds: Vec::new(), store: dir.path().join("tiles") };
+    let (tiles, live) = start_tiles(config, store.clone(), Arc::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Requests { tiles, network: tokio::sync::mpsc::channel(1).0, live };
+    tokio::spawn(serve(listener, core, store.clone(), requests));
+    let boxes = boxes(leaked_mailbox());
+    start_feed(feed_config(addr, "a"), boxes).unwrap();
+    eventually("the region connected", async || !store.snapshot(None).is_empty()).await;
+
+    let column = Column { material: Some(Material::Snow), height: 90, depth: 0 }.to_bytes();
+    let columns = column.repeat(256);
+    assert!(boxes.live_chunks.try_push(LiveChunk { dimension: OVERWORLD.into(), x: 2, z: 0, columns }));
+
+    let stored = TileStore::new(dir.path().join("tiles"));
+    let id = TileId { level: 0, x: 0, z: 0 };
+    eventually("the chunk was drawn", async || stored.read(OVERWORLD, id).unwrap().is_some()).await;
+}
+
+#[test]
+fn live_chunks_survive_the_wire_and_garbage_does_not() {
+    let chunk = LiveChunk { dimension: OVERWORLD.into(), x: -3, z: 9, columns: vec![5; LIVE_CHUNK_BYTES] };
+    let mut bytes = Vec::new();
+    encode_live_chunks(std::slice::from_ref(&chunk), &mut bytes);
+    assert!(is_live_chunks(&bytes[4..]));
+    assert!(!is_network_wants(&bytes[4..]));
+    assert_eq!(decode_live_chunks(&bytes[4..]).unwrap(), vec![chunk.clone()]);
+    assert_eq!(decode_live_chunks(&bytes[4..bytes.len() - 1]), Err(FeedError::Truncated));
+    let chunks = LiveChunkBox::new();
+    assert!(!chunks.try_push(LiveChunk { columns: vec![0; 3], ..chunk.clone() }), "a short chunk never gets in");
+    assert!((0..2048).all(|_| chunks.try_push(chunk.clone())));
+    assert!(!chunks.try_push(chunk), "a full box drops instead of growing");
+}
+
+#[test]
+fn a_round_goes_nearest_first_and_a_crowd_gets_smaller_circles() {
+    let at = |x: f64| ("minecraft:overworld".to_owned(), x, 0.0);
+    let mut plan = LivePlan::default();
+    plan.refill(&[at(-1.0)]);
+    assert_eq!(plan.pop(), Some(("minecraft:overworld".to_owned(), [-1, 0])), "the player's own chunk first");
+    let mut count = 1;
+    while plan.pop().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 17 * 17, "radius 8");
+
+    // Players close together share chunks instead of queueing them twice.
+    plan.refill(&[at(0.0), at(16.0)]);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(next) = plan.pop() {
+        assert!(seen.insert(next), "each chunk once a round");
+    }
+
+    let crowd: Vec<_> = (0..40).map(|index| at(f64::from(index) * 10_000.0)).collect();
+    plan.refill(&crowd);
+    let mut count = 0;
+    while plan.pop().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 40 * 25, "the smallest circle");
+
+    plan.refill(&[]);
+    assert!(plan.is_empty());
+}
+
+#[test]
+fn network_wants_survive_the_wire_and_garbage_does_not() {
+    let wants = vec![
+        NetworkWant { viewer: 7, since: 0, render: true },
+        NetworkWant { viewer: u128::MAX, since: u64::MAX, render: false },
+    ];
+    let mut bytes = Vec::new();
+    encode_network_wants(&wants, &mut bytes);
+    assert!(is_network_wants(&bytes[4..]));
+    assert!(!is_tile_requests(&bytes[4..]));
+    assert_eq!(decode_network_wants(&bytes[4..]).unwrap(), wants);
+    assert_eq!(decode_network_wants(&bytes[4..bytes.len() - 1]), Err(FeedError::Truncated));
 }
 
 #[test]
@@ -522,7 +689,7 @@ async fn the_thread_connects_once_the_sidecar_appears() {
     let core = Core::connect(&url).await.unwrap();
     let store = Arc::new(PositionStore::default());
     let listener = TcpListener::bind(addr).await.unwrap();
-    tokio::spawn(serve(listener, core, store.clone(), tokio::sync::mpsc::channel(1).0));
+    tokio::spawn(serve(listener, core, store.clone(), no_requests()));
 
     eventually("the newest batch arrives", async || player_count(&store) == 1).await;
 }

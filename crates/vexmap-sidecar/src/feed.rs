@@ -17,12 +17,13 @@ use tokio::time::timeout;
 use uuid::Uuid;
 use vexmap_core::{Actor, ClientName, CommandContext, Core, RegionId, RequestId};
 use vexmap_link::{
-    FeedBatch, FeedPlayer, MAX_FEED_MESSAGE, TileRequest, decode_batch, decode_hello, decode_tile_requests,
-    is_tile_requests,
+    FeedBatch, FeedPlayer, LiveChunk, MAX_FEED_MESSAGE, TileRequest, decode_batch, decode_hello, decode_live_chunks,
+    decode_network_wants, decode_tile_requests, is_live_chunks, is_network_wants, is_tile_requests,
 };
 use vexmap_proto::Marker;
 
 use crate::fanout::Online;
+use crate::network::RegionWant;
 use crate::tiles::RegionRequest;
 
 const MAX_CONNECTIONS: usize = 256;
@@ -33,6 +34,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_BATCH_GAP: Duration = Duration::from_millis(50);
 /// Messages of finished tiles waiting for one region. Past this the service drops them, and clients ask again.
 const TILE_QUEUE: usize = 256;
+
+/// Where requests from players go. Each kind has its own worker, and a full queue drops the request.
+#[derive(Clone)]
+pub struct Requests {
+    pub tiles: mpsc::Sender<RegionRequest>,
+    pub network: mpsc::Sender<RegionWant>,
+    /// What chunks look like right now. Drawn by the tile thread.
+    pub live: mpsc::Sender<LiveChunk>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlayerPosition {
@@ -181,12 +191,7 @@ fn position_of(player: &FeedPlayer) -> Option<PlayerPosition> {
 
 /// Accepts region servers until the listener fails. Connection ids start from the clock, so the request ids built from
 /// them are not replays of an earlier run of the sidecar.
-pub async fn serve(
-    listener: TcpListener,
-    core: Core,
-    store: Arc<PositionStore>,
-    tile_requests: mpsc::Sender<RegionRequest>,
-) {
+pub async fn serve(listener: TcpListener, core: Core, store: Arc<PositionStore>, requests: Requests) {
     let start = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as u64);
     let connections = AtomicU64::new(start);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -204,10 +209,10 @@ pub async fn serve(
             continue;
         };
         let connection = connections.fetch_add(1, Ordering::Relaxed);
-        let (core, store, tile_requests) = (core.clone(), store.clone(), tile_requests.clone());
+        let (core, store, requests) = (core.clone(), store.clone(), requests.clone());
         tokio::spawn(async move {
             let _slot = slot;
-            handle(stream, connection, core, store, tile_requests).await;
+            handle(stream, connection, core, store, requests).await;
         });
     }
 }
@@ -255,13 +260,7 @@ async fn write_deliveries(
     }
 }
 
-async fn handle(
-    stream: TcpStream,
-    connection: u64,
-    core: Core,
-    store: Arc<PositionStore>,
-    tile_requests: mpsc::Sender<RegionRequest>,
-) {
+async fn handle(stream: TcpStream, connection: u64, core: Core, store: Arc<PositionStore>, requests: Requests) {
     let (mut reader, writer) = stream.into_split();
     let mut buffer = Vec::new();
     let region = match read_message(&mut reader, &mut buffer).await.and_then(|()| hello_region(&buffer)) {
@@ -274,7 +273,7 @@ async fn handle(
     let (outbox, tiles) = store.claim(region.as_str(), connection);
     let writing = tokio::spawn(write_deliveries(writer, outbox, tiles));
     tracing::info!(region = region.as_str(), "feed: region connected");
-    let reason = run_connection(&mut reader, &region, connection, &core, &store, &tile_requests, &mut buffer).await;
+    let reason = run_connection(&mut reader, &region, connection, &core, &store, &requests, &mut buffer).await;
     writing.abort();
     store.release(region.as_str(), connection);
     tracing::info!(region = region.as_str(), "feed: region gone: {reason}");
@@ -292,7 +291,7 @@ async fn run_connection(
     connection: u64,
     core: &Core,
     store: &PositionStore,
-    tile_requests: &mpsc::Sender<RegionRequest>,
+    requests: &Requests,
     buffer: &mut Vec<u8>,
 ) -> String {
     let mut recorded = HashMap::new();
@@ -303,8 +302,30 @@ async fn run_connection(
         }
         if is_tile_requests(buffer) {
             match decode_tile_requests(buffer) {
-                Ok(requests) => forward_tile_requests(region, requests, tile_requests),
+                Ok(tiles) => forward_tile_requests(region, tiles, &requests.tiles),
                 Err(error) => return format!("bad tile requests: {error:?}"),
+            }
+            continue;
+        }
+        if is_live_chunks(buffer) {
+            match decode_live_chunks(buffer) {
+                Ok(chunks) => {
+                    for chunk in chunks {
+                        let _ = requests.live.try_send(chunk);
+                    }
+                }
+                Err(error) => return format!("bad live chunks: {error:?}"),
+            }
+            continue;
+        }
+        if is_network_wants(buffer) {
+            match decode_network_wants(buffer) {
+                Ok(wants) => {
+                    for want in wants {
+                        let _ = requests.network.try_send(RegionWant { region: region.as_str().to_owned(), want });
+                    }
+                }
+                Err(error) => return format!("bad network requests: {error:?}"),
             }
             continue;
         }

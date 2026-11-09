@@ -29,3 +29,15 @@ fn the_uniform_buffer_has_the_size_of_the_shader_struct() {
     assert!(source.contains("const UNIFORM_BYTES: usize = 8 * 16 + 16 * 16;"));
     assert_eq!(params, 8 * 16 + 16 * 16);
 }
+
+#[test]
+fn the_shader_of_the_route_in_the_world_is_valid_wgsl() {
+    let source = include_str!("../../../mods/vexmap/mixins/vexmap/render.rs");
+    let from = source.find("const MARK_SHADER").expect("the shader");
+    let start = from + source[from..].find("r#\"").expect("its string") + 3;
+    let length = source[start..].find("\"#").expect("the end of its string");
+    let module = naga::front::wgsl::parse_str(&source[start..start + length]).expect("WGSL that parses");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module)
+        .expect("WGSL that validates");
+}

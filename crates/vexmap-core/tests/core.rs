@@ -278,6 +278,49 @@ fn seq_of(outcome: Outcome) -> i64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reader_follows_the_network_page_by_page() {
+    use vexmap_core::RouteMode;
+    on_every_backend(|core| async move {
+        let empty = core.route_network_changes(0, 10).await.unwrap();
+        assert_eq!((empty.to, empty.latest, empty.nodes.len()), (0, 0, 0));
+        let a = seq_of(core.add_route_node(&ctx(system(), "p1"), 0, 0, false).await.unwrap());
+        let b = seq_of(core.add_route_node(&ctx(system(), "p2"), 9, 0, true).await.unwrap());
+        let c = seq_of(core.add_route_node(&ctx(system(), "p3"), 9, 9, false).await.unwrap());
+        let line = seq_of(core.add_route_line(&ctx(system(), "p4"), a, b, RouteMode::Boat, true).await.unwrap());
+
+        // Two rows at a time: nothing is lost or repeated across the pages.
+        let first = core.route_network_changes(0, 2).await.unwrap();
+        assert_eq!((first.to, first.latest), (b, line));
+        assert_eq!(first.nodes.iter().map(|n| n.id).collect::<Vec<_>>(), vec![a, b]);
+        assert!(first.lines.is_empty());
+        let second = core.route_network_changes(first.to, 2).await.unwrap();
+        assert_eq!(second.to, line);
+        assert_eq!(second.nodes.iter().map(|n| n.id).collect::<Vec<_>>(), vec![c]);
+        assert_eq!(second.lines.iter().map(|l| l.id).collect::<Vec<_>>(), vec![line]);
+        let done = core.route_network_changes(second.to, 2).await.unwrap();
+        assert_eq!((done.to, done.nodes.len(), done.lines.len()), (line, 0, 0));
+
+        // A closed line comes again with its new state, and only it.
+        let closed = seq_of(core.set_route_line_closed(&ctx(system(), "p5"), line, true).await.unwrap());
+        let changed = core.route_network_changes(line, 10).await.unwrap();
+        assert_eq!(changed.to, closed);
+        assert!(changed.nodes.is_empty());
+        assert!(changed.lines[0].closed && changed.lines[0].id == line);
+
+        // A reader from a newer database learns the version went backwards.
+        let ahead = core.route_network_changes(closed + 100, 10).await.unwrap();
+        assert_eq!(ahead.latest, closed);
+        assert!(ahead.to < closed + 100);
+
+        let (plain, admin) = (Uuid::new_v4(), Uuid::new_v4());
+        core.set_role(&ctx(system(), "p6"), admin, Role::Admin, BTreeSet::new()).await.unwrap();
+        assert!(!core.may_edit_network(plain).await.unwrap(), "a player unknown to the database has no powers");
+        assert!(core.may_edit_network(admin).await.unwrap());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_route_network_is_drawn_closed_and_journaled() {
     use vexmap_core::RouteMode;
     on_every_backend(|core| async move {
