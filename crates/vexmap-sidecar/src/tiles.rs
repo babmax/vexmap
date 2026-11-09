@@ -146,13 +146,23 @@ fn scan(mut scanner: Scanner) {
 pub fn start(config: TileConfig, positions: Arc<PositionStore>) -> std::io::Result<mpsc::Sender<RegionRequest>> {
     let (sender, receiver) = mpsc::channel(REQUEST_QUEUE);
     let service = TileService::new(TileStore::new(config.store.clone()));
+    let focus = Arc::clone(&positions);
     std::thread::Builder::new()
         .name("vexmap-tile-serve".to_owned())
         .spawn(move || serve(receiver, service, positions))?;
     if config.worlds.is_empty() {
         tracing::info!("VEXMAP_WORLD_DIRS is not set: the tile store is served as it is and not redrawn");
     } else {
-        let scanner = Scanner::new(config.worlds, config.store, SCAN_DUTY);
+        let scanner = Scanner::new(config.worlds, config.store, SCAN_DUTY).with_focus(Box::new(move || {
+            focus
+                .online()
+                .into_iter()
+                .map(|player| {
+                    let region = |eighths: i32| eighths.div_euclid(8 * 512); // 1/8 of a block
+                    (player.marker.dimension, region(player.marker.x), region(player.marker.z))
+                })
+                .collect()
+        }));
         std::thread::Builder::new().name("vexmap-tile-scan".to_owned()).spawn(move || scan(scanner))?;
     }
     Ok(sender)

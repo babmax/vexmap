@@ -122,6 +122,22 @@ struct Found {
 }
 
 type RegionKey = (String, i32, i32);
+/// Regions where players are standing now.
+pub type FocusFn = Box<dyn Fn() -> Vec<RegionKey> + Send>;
+
+/// The order to redraw regions in: those nearest a player first, so what players see is current before the far corners
+/// of a big world are. Regions in a dimension nobody is in come last, in key order.
+fn by_focus(todo: &mut [(&RegionKey, &Found)], focus: &[RegionKey]) {
+    let distance = |key: &RegionKey| {
+        focus
+            .iter()
+            .filter(|spot| spot.0 == key.0)
+            .map(|spot| i64::from(spot.1 - key.1).pow(2) + i64::from(spot.2 - key.2).pow(2))
+            .min()
+            .unwrap_or(i64::MAX)
+    };
+    todo.sort_by_key(|(key, _)| distance(key));
+}
 
 /// `<world>/dimensions/<namespace>/<name>/region/r.X.Z.mca` in every world folder. When several servers hold the same
 /// region, the file written last is the one drawn.
@@ -190,6 +206,8 @@ pub struct Scanner {
     root: PathBuf,
     done: HashMap<RegionKey, u64>,
     attempts: HashMap<RegionKey, u8>,
+    /// Where players are, as `(dimension, region x, region z)`. Asked once per pass.
+    focus: Option<FocusFn>,
     /// Works this fraction of the time and sleeps the rest, so a full scan never takes a core from the game.
     duty: f64,
 }
@@ -204,8 +222,15 @@ impl Scanner {
             root,
             done,
             attempts: HashMap::new(),
+            focus: None,
             duty: duty.clamp(0.05, 1.0),
         }
+    }
+
+    /// Redraws regions near these places first.
+    pub fn with_focus(mut self, focus: FocusFn) -> Scanner {
+        self.focus = Some(focus);
+        self
     }
 
     fn pause_after(&self, took: Duration) {
@@ -218,10 +243,11 @@ impl Scanner {
         let version = now_version();
         let found = scan_worlds(&self.worlds);
         let mut dirty: BTreeMap<String, BTreeSet<TileId>> = BTreeMap::new();
-        for (key, file) in &found {
-            if self.done.get(key) == Some(&file.modified) {
-                continue;
-            }
+        let mut todo: Vec<_> = found.iter().filter(|(key, file)| self.done.get(*key) != Some(&file.modified)).collect();
+        if let Some(focus) = &self.focus {
+            by_focus(&mut todo, &focus());
+        }
+        for (key, file) in todo {
             let started = std::time::Instant::now();
             let (dimension, x, z) = (&key.0, key.1, key.2);
             let Ok((columns, read)) = read_region(&file.path, Survey::of_dimension(dimension)) else { continue };
@@ -358,6 +384,29 @@ mod tests {
         let path = directory.path().join("public/minecraft~overworld/0/1.1.vxt");
         std::fs::write(&path, [1, 0, 0, 0, 200]).unwrap();
         assert!(store.write_if_changed(world, id, 13, &pixels).unwrap());
+    }
+
+    #[test]
+    fn regions_near_players_are_redrawn_first() {
+        let found = Found { path: PathBuf::new(), modified: 1 };
+        let keys: Vec<RegionKey> = vec![
+            ("minecraft:overworld".into(), -9, 0),
+            ("minecraft:overworld".into(), 0, 0),
+            ("minecraft:overworld".into(), 5, 5),
+            ("minecraft:the_nether".into(), 0, 0),
+        ];
+        let mut todo: Vec<_> = keys.iter().map(|key| (key, &found)).collect();
+        by_focus(&mut todo, &[("minecraft:overworld".into(), 4, 4), ("minecraft:the_nether".into(), 0, 1)]);
+        let order: Vec<_> = todo.iter().map(|(key, _)| (key.0.as_str(), key.1)).collect();
+        assert_eq!(
+            order,
+            [
+                ("minecraft:the_nether", 0),
+                ("minecraft:overworld", 5),
+                ("minecraft:overworld", 0),
+                ("minecraft:overworld", -9)
+            ]
+        );
     }
 
     #[test]
