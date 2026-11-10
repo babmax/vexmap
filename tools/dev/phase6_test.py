@@ -31,9 +31,14 @@ phase4.CONFIG = s5.RUN / "client-game" / "config" / "vexmap.cfg"
 BUTTON = (72, 14)
 PANEL_TOP = 40
 # The panel's buttons, in the order of `EDITOR_BUTTONS` in editor.rs.
-TOGGLE, NODE, LINE, CLOSE, WALK, BOAT, TRAIN, ONE_WAY, STATION = range(9)
+TOGGLE, NODE, LINE, CLOSE, WALK, BOAT, TRAIN, ONE_WAY, STATION, HISTORY = range(10)
 # The panel with the editor closed: route for everyone, then what only an admin gets.
 ROUTE, OPEN_EDITOR, LOAD_MAP = range(3)
+# With a route on the map: the route button, then these.
+ADD_STOP, REMOVE_STOP = 1, 2
+# The history panel, as `Ui::history_layout` places it.
+HISTORY_WIDTH, HISTORY_ROW, HISTORY_UNDO_WIDTH = 270, 14, 48
+WATER = 1
 # Blocks per GUI pixel when the map opens.
 BLOCKS_PER_PIXEL = 2.0
 
@@ -124,6 +129,13 @@ def player_state():
     if isinstance(position, dict):
         return position["x"], position["z"]
     return position[0], position[2]
+
+
+def player_height():
+    state = json.loads(s5.ctl("state").stdout)
+    player = state.get("player", state)
+    position = player.get("position") or player.get("pos")
+    return position["y"] if isinstance(position, dict) else position[1]
 
 
 def player_uuid():
@@ -276,6 +288,235 @@ def client_log(needle):
     return admission.lines(admission.CLIENT_LOG, needle)
 
 
+def history_row(row, size, undo):
+    """The centre of a row of the history panel in a full-screen map: its undo button, or its text."""
+    x, y = panel_button(HISTORY, size)
+    top = y + BUTTON[1] // 2 + 16
+    left = size[0] - HISTORY_WIDTH - 6
+    row_y = top + 16 + row * HISTORY_ROW + 6
+    return left + HISTORY_WIDTH - HISTORY_UNDO_WIDTH // 2 - 2 if undo else left + 40, row_y
+
+
+def click_history(row, size, undo=True):
+    x, y = history_row(row, size, undo)
+    s5.ctl("click-at", str(x), str(y))
+    time.sleep(0.8)
+
+
+def network_history(limit=20):
+    return admission.api("GET", f"/v1/network/history?limit={limit}")["entries"]
+
+
+def wait_history(check, seconds=8):
+    """Until the list the client would show says what is wanted. The client's own copy follows within one answer."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check(network_history()):
+            time.sleep(0.8)
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def history_panel(results, size):
+    """Who changed what, undoing an edit, undoing the undo, and a refusal, each read back from the database."""
+    s5.ctl("key", "m", "tap")
+    phase4.wait_screen("mod")
+    time.sleep(1)
+    size = gui_size()
+    press(OPEN_EDITOR, size)
+    press(HISTORY, size)
+    time.sleep(1.5)
+    phase4.shot("20-history")
+
+    newest = network_history()[0]
+    results["history_newest"] = newest["kind"]
+    was_closed = network()["lines"][0]["closed"]
+    click_history(0, size)
+    undone, state = wait_network(lambda net: net["lines"][0]["closed"] != was_closed)
+    results["history_undo_changes_a_line"] = undone
+    wait_history(lambda entries: entries[1]["seq"] == newest["seq"] and entries[1]["undone"])
+    phase4.shot("21-history-undone")
+
+    lines_before, nodes_before = len(state["lines"]), len(state["nodes"])
+    row = next(i for i, entry in enumerate(network_history()) if entry["kind"] == "route.line_added" and not entry["undone"]
+               and i < 10)
+    target = network_history()[row]
+    click_history(row, size)
+    removed, _ = wait_network(lambda net: len(net["lines"]) == lines_before - 1)
+    results["history_undo_removes_a_line"] = removed
+    results["history_client_drops_the_line_s"] = wait_client((nodes_before, lines_before - 1, True), 10)
+    wait_history(lambda entries: entries[0]["kind"] == "route.line_removed")
+    phase4.shot("22-history-line-gone")
+
+    click_history(0, size)
+    restored, state = wait_network(lambda net: len(net["lines"]) == lines_before)
+    results["history_undo_of_an_undo_restores"] = restored and any(line["id"] == int(target["object_id"]) for line in state["lines"])
+    results["history_client_gets_it_back_s"] = wait_client((nodes_before, lines_before, True), 10)
+    wait_history(lambda entries: entries[0]["kind"] == "route.line_restored")
+
+    # A node with a line on it stays, and the player is told.
+    entries = network_history()
+    row = next((i for i, entry in enumerate(entries[:10]) if entry["kind"] == "route.node_added" and not entry["undone"]
+                and any(entry["object_id"] in (line["a"], line["b"]) for line in network()["lines"])), None)
+    results["history_node_row"] = row
+    if row is not None:
+        click_history(row, size)
+        time.sleep(1)
+        phase4.shot("23-history-refused")
+        results["history_refuses_a_node_with_lines"] = len(network()["nodes"]) == nodes_before
+
+    # Paging, then a click on a row's text moves the map.
+    click_history(1, size, undo=False)
+    time.sleep(0.8)
+    phase4.shot("24-history-shows-a-place")
+
+    s5.ctl("key", "esc", "tap")
+    time.sleep(0.4)
+    results["escape_closes_the_history_first"] = phase4.screen_id() == "mod"
+    s5.ctl("key", "esc", "tap")
+    time.sleep(0.4)
+    s5.ctl("key", "esc", "tap")
+    results["map_closed_after_history"] = phase4.wait_screen("playing")
+
+
+def route_lines():
+    """`(stops, points, length)` of every route the client built, from its log."""
+    found = []
+    for line in client_log("[vexmap] route:"):
+        match = re.search(r"length=(\d+) stops=(\d+) points=(\d+)", line)
+        if match:
+            found.append((int(match.group(2)), int(match.group(3)), int(match.group(1))))
+    return found
+
+
+def wait_route(before, seconds=8):
+    """The route built after the `before`-th, or None."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        lines = route_lines()
+        if len(lines) > before:
+            return lines[-1]
+        time.sleep(0.1)
+    return None
+
+
+def stops(results, server):
+    """A route through several stops: added, removed on the map and with the button, then walked by teleporting."""
+    server.stdin.write("gamemode creative @a\n")
+    server.stdin.flush()
+    s5.ctl("key", "m", "tap")
+    phase4.wait_screen("mod")
+    time.sleep(1)
+    size = gui_size()
+    center = player_state()
+    x, z = center
+    spots = [(x + 60, z + 40), (x + 130, z + 40), (x + 130, z + 110)]
+
+    count = len(route_lines())
+    press(ROUTE, size)
+    click_world(size, center, spots[0])
+    results["stops_first"] = wait_route(count)
+    count = len(route_lines())
+    press(ADD_STOP, size)
+    click_world(size, center, spots[1])
+    results["stops_second"] = wait_route(count)
+    count = len(route_lines())
+    click_world(size, center, spots[2])
+    results["stops_third"] = wait_route(count)
+    time.sleep(1)
+    phase4.shot("30-three-stops")
+
+    # A click on a stop removes it, and adding is still on.
+    count = len(route_lines())
+    click_world(size, center, spots[1])
+    results["stops_click_removes"] = wait_route(count)
+    press(ADD_STOP, size)  # Enough adding.
+    count = len(route_lines())
+    press(REMOVE_STOP, size)
+    results["stops_button_removes"] = wait_route(count)
+
+    # Back to two, then walked. Teleporting is not counted as speed, and each stop is met within a second.
+    count = len(route_lines())
+    press(ADD_STOP, size)
+    click_world(size, center, spots[2])
+    press(ADD_STOP, size)
+    results["stops_two_again"] = wait_route(count)
+    time.sleep(0.5)
+    s5.ctl("key", "esc", "tap")
+    phase4.wait_screen("playing")
+    y = player_height()
+
+    def teleport(where):
+        server.stdin.write(f"tp @a {where[0]} {y + 4} {where[1]}\n")
+        server.stdin.flush()
+    reached = len(client_log("[vexmap] stop reached"))
+    teleport(spots[0])
+    results["stop_reached_s"] = first_true(lambda: len(client_log("[vexmap] stop reached")) > reached, 6)
+    results["stop_reached_line"] = (client_log("[vexmap] stop reached") or [""])[-1][-20:]
+    time.sleep(1.2)
+    phase4.shot("31-stop-reached")
+    arrived = len(client_log("[vexmap] arrived"))
+    teleport(spots[2])
+    results["arrived_at_the_last_s"] = first_true(lambda: len(client_log("[vexmap] arrived")) > arrived, 6)
+    teleport((round(x), round(z)))
+    time.sleep(2)
+
+
+def terrain(results, server):
+    """A lake on the way changes the walk. The world is hilly, so the walk may already bend before there is any lake."""
+    s5.ctl("key", "m", "tap")
+    phase4.wait_screen("mod")
+    time.sleep(1)
+    time.sleep(4)  # The tiles of the whole view, or the first walk knows less than the second.
+    size = gui_size()
+    center = player_state()
+    x, z = (round(value) for value in center)
+    goal = (x + 200, z)
+    count = len(route_lines())
+    press(ROUTE, size)
+    click_world(size, center, goal)
+    results["terrain_before"] = wait_route(count)
+    time.sleep(0.5)
+    press(ROUTE, size)  # Dropped.
+    s5.ctl("key", "esc", "tap")
+    phase4.wait_screen("playing")
+
+    # Water with dry land on both sides: a walk has to have a way around it, or the straight line is the right answer.
+    box = (x + 60, z - 50, x + 140, z + 50)
+    server.stdin.write(f"fill {box[0]} 250 {box[1]} {box[2]} 250 {box[3]} minecraft:water\n")
+    # Finer tiles are only looked at again near the player, so the player goes and looks.
+    y = player_height()
+    server.stdin.write(f"tp @a {x + 100} {y + 4} {z}\n")
+    server.stdin.flush()
+    cached = s5.RUN / "client-game" / "config" / "tiles" / "minecraft~overworld"
+    # Several points: water left by an earlier run must not pass for the new lake.
+    spots = [(x + 70, z - 40), (x + 130, z - 40), (x + 100, z), (x + 70, z + 40), (x + 130, z + 40)]
+    results["terrain_lake_in_client_s"] = first_true(
+        lambda: all(material_at(cached, 0, spot[0], spot[1]) == WATER for spot in spots), 30)
+    server.stdin.write(f"tp @a {x} {y + 4} {z}\n")
+    server.stdin.flush()
+    time.sleep(2)
+
+    s5.ctl("key", "m", "tap")
+    phase4.wait_screen("mod")
+    time.sleep(1)
+    time.sleep(3)
+    center = player_state()
+    count = len(route_lines())
+    press(ROUTE, size)
+    click_world(size, center, goal)
+    results["terrain_around_the_lake"] = wait_route(count)
+    time.sleep(1)
+    phase4.shot("40-around-the-lake")
+    press(ROUTE, size)
+    time.sleep(0.4)
+    server.stdin.write(f"fill {box[0] - 8} 250 {box[1] - 8} {box[2] + 8} 250 {box[3] + 8} minecraft:air\n")
+    server.stdin.flush()
+    s5.ctl("key", "esc", "tap")
+    results["map_closed_after_terrain"] = phase4.wait_screen("playing")
+
+
 def follow_route(results, uuid):
     """Asks for a route on the map, and has the sidecar told to hurry by the load button."""
     s5.ctl("key", "m", "tap")
@@ -313,6 +554,8 @@ def run():
     os.environ["VEXMAP_DIAG"] = "1"
     os.environ["VEXMAP_TILE_DIR"] = str(s5.RUN / "tiles")
     shutil.rmtree(s5.RUN / "tiles", ignore_errors=True)
+    # A tile kept from an earlier run would answer "the client has it" before it does.
+    shutil.rmtree(s5.RUN / "client-game" / "config" / "tiles", ignore_errors=True)
     sidecar = admission.start_sidecar()
     admission.api("PUT", "/v1/features/routing", "bench-routing", {"enabled": True})
     pack_dir, sha1 = phase4.make_pack()
@@ -330,9 +573,11 @@ def run():
         processes.append(proxy)
         time.sleep(6)
         before = len(admission.lines(logs["a"], "Loaded"))
+        # Counted before the launch: the client can be in the game by the time the launch returns.
+        logins = len(admission.lines(logs["a"], "logged in"))
         admission.CLIENT_LOG.unlink(missing_ok=True)
         admission.launch(admission.MODDED)
-        results["join_s"] = admission.join(logs)
+        results["join_s"] = admission.wait_for(logs["a"], "logged in", logins, 120)
         results["pack_loaded_s"], _ = phase4.accept_prompt_until(logs["a"], "Loaded", before, 60)
         s5.ctl("wait-ready", "60", timeout=90)
         time.sleep(3)
@@ -366,6 +611,9 @@ def run():
 
         live_map(results, processes[0])
         follow_route(results, uuid)
+        stops(results, processes[0])
+        terrain(results, processes[0])
+        history_panel(results, size)
 
         s5.ctl("key", "m", "tap")  # Open again: the copy and the view survive.
         phase4.wait_screen("mod")
@@ -393,12 +641,23 @@ def run():
     checks = ("routing_granted", "map_opens", "seed_reaches_client_s", "admin_seen_by_client_s", "node_tool_places",
               "node_within_snap", "no_second_node_on_a_node", "line_tool_joins_nodes", "chain_places_node_then_line",
               "escape_keeps_the_map", "close_tool_closes", "drag_draws_nothing", "escape_leaves_the_editor",
-              "escape_then_closes_the_map", "map_reopened", "map_closed_after_route", "live_change_in_store_s", "live_change_in_client_s")
+              "escape_then_closes_the_map", "map_reopened", "map_closed_after_route", "live_change_in_store_s", "live_change_in_client_s",
+              "stops_first", "stops_second", "stops_third", "stops_click_removes", "stops_button_removes", "stops_two_again",
+              "stop_reached_s", "arrived_at_the_last_s", "terrain_before", "terrain_around_the_lake", "map_closed_after_terrain",
+              "history_undo_changes_a_line", "history_undo_removes_a_line", "history_undo_of_an_undo_restores",
+              "history_refuses_a_node_with_lines", "escape_closes_the_history_first", "map_closed_after_history")
     timings = ("seed_reaches_client_s", "admin_seen_by_client_s", "route_built_s", "live_change_in_store_s", "live_change_in_client_s", "live_removal_in_store_s", "live_removal_in_client_s")
     results["failed"] = [key for key in checks if not results.get(key) and key not in timings]
     results["failed"] += [key for key in timings if results.get(key) is None]
     if results.get("live_ice_before"):
         results["failed"].append("live_ice_before")
+    expected_stops = {"stops_first": 1, "stops_second": 2, "stops_third": 3, "stops_click_removes": 2,
+                      "stops_button_removes": 1, "stops_two_again": 2}
+    results["failed"] += [key for key, wanted in expected_stops.items() if results.get(key) and results[key][0] != wanted]
+    if results.get("terrain_lake_in_client_s") is None:
+        results["failed"].append("terrain_lake_in_client_s")
+    if results.get("terrain_before") == results.get("terrain_around_the_lake"):
+        results["failed"].append("terrain_lake_changes_the_walk")
     results["passed"] = not results["failed"] and results.get("kicks") == 0
     (s5.RUN / "results.json").write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(results, indent=1, ensure_ascii=False))

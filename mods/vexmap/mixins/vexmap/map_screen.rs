@@ -468,7 +468,12 @@ fn collect_search(client: &mut runtime::Client, now_ms: u64) {
     match answer {
         Ok(route) => {
             if client.diagnostics {
-                eprintln!("[vexmap] route: legs={} length={:.0}", route.legs.len(), route.length);
+                let (legs, points) = (route.legs.len(), route.polyline().len());
+                eprintln!(
+                    "[vexmap] route: legs={legs} length={:.0} stops={} points={points}",
+                    route.length,
+                    stops.len()
+                );
             }
             client.navigator.set_route(stops, route);
         }
@@ -505,6 +510,9 @@ fn navigate(game: &crate::game::Game<'_>, client: &mut runtime::Client, now_ms: 
     };
     match client.navigator.sample(at, now_ms) {
         routing::Progress::Arrived => {
+            if client.diagnostics {
+                eprintln!("[vexmap] arrived");
+            }
             client.navigator.clear();
             show_route(client);
             client.workspace.tell(editor::Notice::Arrived, now_ms);
@@ -512,6 +520,9 @@ fn navigate(game: &crate::game::Game<'_>, client: &mut runtime::Client, now_ms: 
             return;
         }
         routing::Progress::StopReached => {
+            if client.diagnostics {
+                eprintln!("[vexmap] stop reached: left={}", client.navigator.stops().len());
+            }
             show_route(client);
             client.workspace.tell(editor::Notice::StopReached, now_ms);
         }
