@@ -522,7 +522,7 @@ async fn a_network_request_crosses_the_real_socket_and_a_page_comes_back_to_that
     let line = node(core.add_route_line(&system_context("l1"), first, second, RouteMode::Train, true).await.unwrap());
 
     let ask = async |viewer: u128, since: u64| {
-        assert!(boxes.network_wants.try_push(NetworkWant { viewer, since, render: false }));
+        assert!(boxes.network_wants.try_push(NetworkWant { viewer, since, render: false, history: false }));
         let mut received = Vec::new();
         eventually("the page arrived", async || boxes.tiles.try_take(&mut received, 1 << 20)).await;
         assert_eq!(received.len(), 1);
@@ -651,8 +651,8 @@ fn a_round_goes_nearest_first_and_a_crowd_gets_smaller_circles() {
 #[test]
 fn network_wants_survive_the_wire_and_garbage_does_not() {
     let wants = vec![
-        NetworkWant { viewer: 7, since: 0, render: true },
-        NetworkWant { viewer: u128::MAX, since: u64::MAX, render: false },
+        NetworkWant { viewer: 7, since: 0, render: true, history: false },
+        NetworkWant { viewer: u128::MAX, since: u64::MAX, render: false, history: true },
     ];
     let mut bytes = Vec::new();
     encode_network_wants(&wants, &mut bytes);

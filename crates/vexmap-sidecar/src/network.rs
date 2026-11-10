@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -17,7 +18,10 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 use vexmap_core::{Core, CoreError, RouteMode};
 use vexmap_link::{Delivery, NetworkWant, encode_tile_deliveries};
-use vexmap_proto::{LineMode, MAX_NETWORK_PAGE, MAX_S2C_FRAME, Message, NetworkLine, NetworkNode, NetworkPage, Outbox};
+use vexmap_proto::{
+    HistoryEntry, HistoryKind, LineMode, MAX_HISTORY_PAGE, MAX_NETWORK_PAGE, MAX_S2C_FRAME, Message, NetworkHistory,
+    NetworkLine, NetworkNode, NetworkPage, Outbox,
+};
 use vexmap_routing::{Graph, LegKind, Mode, Point, RouteError, Speeds};
 use vexmap_tiler::store::RenderProgress;
 
@@ -73,7 +77,47 @@ pub async fn page_for(core: &Core, want: NetworkWant, render: &RenderProgress) -
         rendering: render.fast.load(Ordering::Relaxed),
         nodes,
         lines,
+        removed_nodes: changes.removed_nodes.iter().map(|id| *id as u64).collect(),
+        removed_lines: changes.removed_lines.iter().map(|id| *id as u64).collect(),
     })
+}
+
+fn history_kind(kind: &str, closed: Option<bool>) -> Option<HistoryKind> {
+    Some(match kind {
+        "route.node_added" | "route.node_restored" => HistoryKind::NodeAdded,
+        "route.line_added" | "route.line_restored" => HistoryKind::LineAdded,
+        "route.line_closed_changed" if closed == Some(true) => HistoryKind::LineClosed,
+        "route.line_closed_changed" => HistoryKind::LineOpened,
+        "route.node_removed" => HistoryKind::NodeRemoved,
+        "route.line_removed" => HistoryKind::LineRemoved,
+        _ => return None,
+    })
+}
+
+/// A page of the network's history for one player, or `None` when the database would not let them edit.
+pub async fn history_for(core: &Core, want: NetworkWant) -> Result<Option<NetworkHistory>, CoreError> {
+    if !core.may_edit_network(Uuid::from_u128(want.viewer)).await? {
+        return Ok(None);
+    }
+    let before = i64::try_from(want.since).unwrap_or(i64::MAX);
+    let history = core.route_history(before, MAX_HISTORY_PAGE as i64).await?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as i64);
+    let entries = history
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            Some(HistoryEntry {
+                seq: entry.seq as u64,
+                age_seconds: u32::try_from((now - entry.at_ms).max(0) / 1000).unwrap_or(u32::MAX),
+                actor: entry.actor_name.clone().unwrap_or_default(),
+                kind: history_kind(&entry.kind, entry.closed)?,
+                object: entry.object_id as u64,
+                place: entry.place.and_then(|(x, z)| Some((i32::try_from(x).ok()?, i32::try_from(z).ok()?))),
+                undone: entry.undone,
+            })
+        })
+        .collect();
+    Ok(Some(NetworkHistory { before: want.since, more: history.more, entries }))
 }
 
 /// Reads one page at a time, so a crowd of clients costs the database one query at a time. The answers take the tiles'
@@ -86,14 +130,20 @@ async fn serve_pages(
 ) {
     let mut outbox = Outbox::default();
     while let Some(RegionWant { region, want }) = wants.recv().await {
-        let page = match page_for(&core, want, &render).await {
-            Ok(page) => page,
+        let answer = if want.history {
+            history_for(&core, want).await.map(|history| history.map(Message::NetworkHistory))
+        } else {
+            page_for(&core, want, &render).await.map(|page| Some(Message::NetworkPage(page)))
+        };
+        let message = match answer {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
             Err(error) => {
                 tracing::warn!("network page: {error}");
                 continue;
             }
         };
-        let Ok(frames) = outbox.frames(&Message::NetworkPage(page), MAX_S2C_FRAME) else { continue };
+        let Ok(frames) = outbox.frames(&message, MAX_S2C_FRAME) else { continue };
         let deliveries: Vec<Delivery> =
             frames.into_iter().map(|frame| Delivery { viewers: vec![want.viewer], frame }).collect();
         let mut bytes = Vec::new();
@@ -211,6 +261,38 @@ pub(crate) async fn put_line_closed(
 ) -> ApiResult<impl IntoResponse> {
     let ctx = command_context(&headers, body.actor)?;
     Ok(Json(state.core.set_route_line_closed(&ctx, id, body.closed).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryQuery {
+    /// Entries older than this journal number. Missing starts from the newest.
+    before: Option<i64>,
+    limit: Option<i64>,
+}
+
+pub(crate) async fn get_history(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let limit = query.limit.unwrap_or(vexmap_core::MAX_ROUTE_HISTORY_PAGE);
+    Ok(Json(state.core.route_history(query.before.unwrap_or(0), limit).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostRevert {
+    actor: Option<Uuid>,
+}
+
+pub(crate) async fn post_revert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(seq): Path<i64>,
+    Json(body): Json<PostRevert>,
+) -> ApiResult<impl IntoResponse> {
+    let ctx = command_context(&headers, body.actor)?;
+    Ok(Json(state.core.revert_route_edit(&ctx, seq).await?))
 }
 
 #[derive(Deserialize)]

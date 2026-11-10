@@ -238,6 +238,41 @@ async fn a_network_is_drawn_and_a_route_is_built_over_it() {
 }
 
 #[tokio::test]
+async fn the_history_of_the_network_can_be_read_and_an_edit_undone() {
+    let (core, _dir) = core().await;
+    let app = router(core, OPEN, Default::default());
+    let a = draw(&app, "n1", "/v1/network/nodes", json!({"x": 0, "z": 0})).await;
+    let b = draw(&app, "n2", "/v1/network/nodes", json!({"x": 100, "z": 0})).await;
+    let line = draw(&app, "l1", "/v1/network/lines", json!({"a": a, "b": b, "mode": "walk"})).await;
+
+    let (status, history) = send(&app, request("GET", "/v1/network/history?limit=2", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(history["more"], true);
+    assert_eq!(history["entries"][0]["seq"], line);
+    assert_eq!(history["entries"][0]["kind"], "route.line_added");
+    let older = format!("/v1/network/history?before={b}");
+    let (_, history) = send(&app, request("GET", &older, None, None)).await;
+    assert_eq!(history["entries"].as_array().unwrap().len(), 1);
+
+    let revert = format!("/v1/network/history/{line}/revert");
+    let (status, undone) = send(&app, request("POST", &revert, Some("r1"), Some(json!({})))).await;
+    assert_eq!((status, undone["outcome"].as_str()), (StatusCode::OK, Some("applied")));
+    let (_, network) = send(&app, request("GET", "/v1/network", None, None)).await;
+    assert_eq!(network["lines"].as_array().unwrap().len(), 0);
+
+    // A route no longer finds the road, so the cached graph followed the rollback.
+    let ask = json!({"stops": [{"x": 0, "z": 0}, {"x": 100, "z": 0}], "modes": ["train"]});
+    assert_eq!(send(&app, request("POST", "/v1/route", None, Some(ask))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let nobody = json!({"actor": Uuid::new_v4()});
+    let refuse = format!("/v1/network/history/{a}/revert");
+    assert_eq!(send(&app, request("POST", &refuse, Some("r2"), Some(nobody))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(send(&app, request("POST", &refuse, None, Some(json!({})))).await.0, StatusCode::BAD_REQUEST);
+    let missing = "/v1/network/history/424242/revert";
+    assert_eq!(send(&app, request("POST", missing, Some("r3"), Some(json!({})))).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn the_network_api_refuses_what_it_should() {
     let (core, _dir) = core().await;
     let app = router(core, OPEN, Default::default());

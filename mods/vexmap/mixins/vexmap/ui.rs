@@ -44,6 +44,7 @@ const ROAD_HOT: u32 = 0xFFFF_FFFF;
 const ROUTE: u32 = 0xFF2F_80ED;
 const ROUTE_CASING: u32 = 0xFF0B_2A5B;
 const ROUTE_END: u32 = 0xFFE5_3935;
+const ROUTE_STOP: u32 = 0xFF1B_5FBF;
 const ROAD_STOP: u32 = 0xFFE5_3935;
 const ROAD_NODE: u32 = 0xFFF2_F2F2;
 const BUTTON_LIT: u32 = 0xFF2E_7D4F;
@@ -516,6 +517,50 @@ pub struct Overlay {
     pub counts: Option<(usize, usize, bool)>,
     /// Regions of the world drawn so far and how many there are, while the map is being drawn.
     pub progress: Option<(u32, u32)>,
+    /// Who changed what in the network, while that panel is up.
+    pub history: Option<HistoryPanel>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HistoryPanel {
+    pub rows: Vec<HistoryLine>,
+    pub older: bool,
+    pub newer: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryLine {
+    pub text: String,
+    /// It no longer stands: drawn dim and without a button.
+    pub undone: bool,
+    /// A click on the text shows the place.
+    pub placed: bool,
+}
+
+const HISTORY_WIDTH: f32 = 270.0;
+const HISTORY_ROW: f32 = 14.0;
+const HISTORY_ROWS: usize = 10;
+const HISTORY_UNDO_WIDTH: f32 = 48.0;
+/// The game's font is about 6 pixels a letter.
+const TEXT_PIXELS_PER_LETTER: f32 = 6.0;
+
+/// Where each part of the history panel is. Rows that do not fit a small window are left out.
+struct HistoryLayout {
+    panel: [f32; 4],
+    rows: Vec<([f32; 4], [f32; 4])>,
+    older: [f32; 4],
+    newer: [f32; 4],
+}
+
+/// `text` cut to fit `width` pixels.
+fn fit_text(text: &str, width: f32) -> String {
+    let letters = (width / TEXT_PIXELS_PER_LETTER).max(1.0) as usize;
+    if text.chars().count() <= letters {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(letters.saturating_sub(2)).collect();
+    cut.push_str("..");
+    cut
 }
 
 /// The local player, read from the client and never asked of the server.
@@ -1024,6 +1069,12 @@ pub enum Press {
     Close,
     /// This button of `Overlay::buttons`.
     Button(u8),
+    /// Undo the edit on this line of the history panel.
+    HistoryRevert(u8),
+    /// Show on the map where the edit on this line happened.
+    HistoryShow(u8),
+    HistoryOlder,
+    HistoryNewer,
     /// Escape while editing: the editor decides what it means.
     Back,
 }
@@ -1066,6 +1117,8 @@ pub struct Ui {
     pub overlay: Overlay,
     /// The route being followed, for the map and the minimap.
     pub route: Vec<RouteStep>,
+    /// The stops on the way, in order, without the destination.
+    pub stops: Vec<[f64; 2]>,
     pub destination: Option<[f64; 2]>,
     /// What the route says to do next, on top of the screen.
     pub banner: Option<String>,
@@ -1103,6 +1156,7 @@ impl Ui {
             night: 0.0,
             overlay: Overlay::default(),
             route: Vec::new(),
+            stops: Vec::new(),
             destination: None,
             banner: None,
             saved_view: None,
@@ -1319,6 +1373,104 @@ impl Ui {
         rects
     }
 
+    /// Under the panel's buttons, at the right of the window. `None` when the window has no room for a single row.
+    fn history_layout(&self, rect: [f32; 4]) -> Option<HistoryLayout> {
+        self.overlay.history.as_ref()?;
+        let top = self.panel_rects(rect).last().map_or(rect[1] + PANEL_TOP, |last| last[1] + last[3] + 16.0);
+        let width = HISTORY_WIDTH.min(rect[2] - 12.0);
+        let left = rect[0] + rect[2] - width - 6.0;
+        let bottom = rect[1] + rect[3] - 4.0;
+        let room = ((bottom - top - 36.0) / HISTORY_ROW).floor().max(0.0) as usize;
+        if room == 0 {
+            return None;
+        }
+        let shown = room.min(HISTORY_ROWS);
+        let mut rows = Vec::with_capacity(shown);
+        for index in 0..shown {
+            let y = top + 16.0 + index as f32 * HISTORY_ROW;
+            let undo = [left + width - HISTORY_UNDO_WIDTH - 2.0, y, HISTORY_UNDO_WIDTH, HISTORY_ROW - 1.0];
+            rows.push(([left + 2.0, y, width - HISTORY_UNDO_WIDTH - 6.0, HISTORY_ROW - 1.0], undo));
+        }
+        let nav = top + 16.0 + shown as f32 * HISTORY_ROW + 2.0;
+        Some(HistoryLayout {
+            panel: [left, top, width, nav + 16.0 - top],
+            rows,
+            older: [left + 2.0, nav, 72.0, 14.0],
+            newer: [left + width - 74.0, nav, 72.0, 14.0],
+        })
+    }
+
+    fn draw_history(&self, ops: &mut Vec<Op>, rect: [f32; 4], mouse: [f32; 2]) {
+        let (Some(layout), Some(history)) = (self.history_layout(rect), &self.overlay.history) else { return };
+        let language = self.settings.language;
+        ops.push(Op::Fill { rect: layout.panel, argb: PANEL });
+        let title = language.pick(("Who changed the network", "Кто менял сеть")).to_owned();
+        ops.push(Op::Text { text: title, at: [layout.panel[0] + 4.0, layout.panel[1] + 4.0], rgb: WHITE });
+        if history.rows.is_empty()
+            && let Some((text, _)) = layout.rows.first()
+        {
+            let empty = language.pick(("Nothing yet", "Пока пусто")).to_owned();
+            ops.push(Op::Text { text: empty, at: [text[0] + 2.0, text[1] + 3.0], rgb: MUTED });
+        }
+        for ((text_rect, undo_rect), line) in layout.rows.iter().zip(&history.rows) {
+            if line.placed && !line.undone && inside(*text_rect, mouse) {
+                ops.push(Op::Fill { rect: *text_rect, argb: BUTTON_HOVER });
+            }
+            ops.push(Op::Text {
+                text: fit_text(&line.text, text_rect[2] - 4.0),
+                at: [text_rect[0] + 2.0, text_rect[1] + 3.0],
+                rgb: if line.undone { MUTED } else { WHITE },
+            });
+            if !line.undone {
+                let label = language.pick(("Undo", "Откат")).to_owned();
+                self.history_button(ops, *undo_rect, label, mouse);
+            }
+        }
+        if history.older {
+            self.history_button(ops, layout.older, language.pick(("Older", "Раньше")).to_owned(), mouse);
+        }
+        if history.newer {
+            self.history_button(ops, layout.newer, language.pick(("Newer", "Новее")).to_owned(), mouse);
+        }
+    }
+
+    fn history_button(&self, ops: &mut Vec<Op>, rect: [f32; 4], label: String, mouse: [f32; 2]) {
+        ops.push(Op::Fill { rect, argb: if inside(rect, mouse) { BUTTON_HOVER } else { BUTTON } });
+        ops.push(Op::TextCentered { text: label, at: [rect[0] + rect[2] / 2.0, rect[1] + 3.0], rgb: WHITE });
+    }
+
+    /// What a press on the history panel means. `None` when it is somewhere else.
+    fn press_history(&self, rect: [f32; 4], mouse: [f32; 2]) -> Option<Press> {
+        let (layout, history) = (self.history_layout(rect)?, self.overlay.history.as_ref()?);
+        if !inside(layout.panel, mouse) {
+            return None;
+        }
+        for (index, ((text, undo), line)) in layout.rows.iter().zip(&history.rows).enumerate() {
+            if !line.undone && inside(*undo, mouse) {
+                return Some(Press::HistoryRevert(index as u8));
+            }
+            if line.placed && inside(*text, mouse) {
+                return Some(Press::HistoryShow(index as u8));
+            }
+        }
+        if history.older && inside(layout.older, mouse) {
+            return Some(Press::HistoryOlder);
+        }
+        if history.newer && inside(layout.newer, mouse) {
+            return Some(Press::HistoryNewer);
+        }
+        Some(Press::Taken)
+    }
+
+    /// Moves the map to look at this block, at the scale it is at.
+    pub fn center_on(&mut self, world: [f64; 2]) {
+        self.view.center = world;
+        self.view.clamp_center();
+        let disc = self.world;
+        self.globe.look_at(&disc, world);
+        self.map_stale = true;
+    }
+
     fn draw_roads(&self, ops: &mut Vec<Op>, rect: [f32; 4], clips: &[Clip]) {
         let overlay = &self.overlay;
         for road in &overlay.lines {
@@ -1384,6 +1536,14 @@ impl Ui {
         }
         for (a, b, direct) in &pieces {
             line(ops, clips, *a, *b, if *direct { 1.5 } else { 2.5 }, ROUTE);
+        }
+        for (index, stop) in self.stops.iter().enumerate() {
+            if let Some(at) = project(*stop)
+                && shown(at)
+            {
+                marker(ops, at, 9.0, ROUTE_STOP);
+                ops.push(Op::TextCentered { text: (index + 1).to_string(), at: [at[0], at[1] - 3.5], rgb: WHITE });
+            }
         }
         if let Some(at) = self.destination.and_then(&project)
             && shown(at)
@@ -1685,6 +1845,7 @@ impl Ui {
         button(&mut ops, mode, mode_label, mouse);
         button(&mut ops, close, "x", mouse);
         self.draw_panel(&mut ops, rect, mouse);
+        self.draw_history(&mut ops, rect, mouse);
         // At the bottom: the top of the map is taken by its buttons.
         self.banner_ops(size, rect[1] + rect[3] - 18.0, &mut ops);
 
@@ -1953,6 +2114,9 @@ impl Ui {
                 self.grab = Some(Grab::Move);
                 return Press::Taken;
             }
+        }
+        if let Some(press) = self.press_history(rect, mouse) {
+            return press;
         }
         if let Some(index) = self.panel_rects(rect).iter().position(|button| inside(*button, mouse)) {
             return Press::Button(index as u8);
@@ -3627,6 +3791,81 @@ mod tests {
         here.dimension = "minecraft:the_nether".to_owned();
         ui.rebuild_minimap(SIZE, &here, None, &[], &[]);
         assert_eq!(quads_colored(ui.minimap_ops(), ROUTE), 0);
+    }
+
+    #[test]
+    fn stops_on_the_way_are_numbered_and_the_end_keeps_its_own_mark() {
+        let mut ui = editing_ui();
+        ui.route = vec![RouteStep { a: [-40.0, 0.0], b: [40.0, 0.0], direct: false }];
+        ui.stops = vec![[-20.0, 0.0], [10.0, 0.0]];
+        ui.destination = Some([40.0, 0.0]);
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        let marks = ui.map_ops().iter().filter(|op| matches!(op, Op::Fill { argb, .. } if *argb == ROUTE_STOP)).count();
+        assert_eq!(marks, 2);
+        assert!(ui.map_ops().iter().any(|op| matches!(op, Op::TextCentered { text, .. } if text == "2")));
+        assert!(ui.map_ops().iter().any(|op| matches!(op, Op::Fill { argb, .. } if *argb == ROUTE_END)));
+    }
+
+    fn history_ui() -> Ui {
+        let mut ui = editing_ui();
+        ui.overlay.history = Some(HistoryPanel {
+            rows: vec![
+                HistoryLine { text: "first".into(), undone: false, placed: true },
+                HistoryLine { text: "second".into(), undone: true, placed: true },
+            ],
+            older: true,
+            newer: false,
+        });
+        ui.rebuild_map(SIZE, [0.0, 0.0], None, None, &[], &[]);
+        ui
+    }
+
+    #[test]
+    fn the_history_panel_answers_by_row() {
+        let mut ui = history_ui();
+        let layout = ui.history_layout(FULL).unwrap();
+        assert_eq!(press_on(&mut ui, layout.rows[0].1), Press::HistoryRevert(0));
+        assert_eq!(press_on(&mut ui, layout.rows[0].0), Press::HistoryShow(0));
+        assert_eq!(press_on(&mut ui, layout.rows[1].1), Press::Taken, "nothing to undo on this one");
+        assert_eq!(press_on(&mut ui, layout.rows[5].0), Press::Taken, "an empty row is still not the map");
+        assert_eq!(press_on(&mut ui, layout.older), Press::HistoryOlder);
+        assert_eq!(press_on(&mut ui, layout.newer), Press::Taken, "no newer page");
+    }
+
+    #[test]
+    fn a_click_on_the_history_panel_is_not_a_click_on_the_map() {
+        let mut ui = history_ui();
+        let layout = ui.history_layout(FULL).unwrap();
+        press_on(&mut ui, layout.panel);
+        assert_eq!(ui.release(), None);
+    }
+
+    #[test]
+    fn the_history_panel_sits_below_the_buttons_and_inside_the_window() {
+        let mut ui = editing_ui();
+        ui.overlay.buttons = vec![PanelButton { label: ("A", "А"), lit: false }; 10];
+        ui.overlay.history = Some(HistoryPanel::default());
+        let layout = ui.history_layout(FULL).unwrap();
+        let last = *ui.panel_rects(FULL).last().unwrap();
+        assert!(layout.panel[1] >= last[1] + last[3]);
+        assert!(layout.panel[1] + layout.panel[3] <= FULL[1] + FULL[3]);
+        assert!(ui.history_layout([0.0, 0.0, 200.0, 140.0]).is_none(), "the buttons fill a window this small");
+        ui.overlay.buttons.truncate(2);
+        let layout = ui.history_layout([0.0, 0.0, 200.0, 140.0]).unwrap();
+        assert!(layout.panel[0] >= 0.0 && layout.panel[1] + layout.panel[3] <= 140.0, "{:?}", layout.panel);
+    }
+
+    #[test]
+    fn long_text_is_cut_to_the_row() {
+        assert_eq!(fit_text("short", 100.0), "short");
+        assert_eq!(fit_text("абвгдежзик", 36.0), "абвг..");
+    }
+
+    #[test]
+    fn showing_a_place_moves_the_map_there() {
+        let mut ui = history_ui();
+        ui.center_on([120.0, -50.0]);
+        assert_eq!(ui.view.center, [120.0, -50.0]);
     }
 
     #[test]

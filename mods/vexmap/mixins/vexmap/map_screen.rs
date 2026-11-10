@@ -21,6 +21,7 @@ const MAX_DRAWN_LINES: usize = 6000;
 const MAX_DRAWN_NODES: usize = 2000;
 /// Zoomed out past this, single nodes are a blur.
 const MAX_NODE_BLOCKS_PER_PIXEL: f64 = 8.0;
+const _: () = assert!(editor::MAX_ROUTE_STOPS + 1 == routing::MAX_STOPS);
 
 fn is_open(game: &crate::game::Game<'_>) -> bool {
     game.native_mod_screen() == Some(MOD_ID)
@@ -127,6 +128,9 @@ pub(super) fn tile_arrived(
     if !encoded.is_empty() && proto::decode_tile(encoded, &mut pixels).is_err() {
         return;
     }
+    if !encoded.is_empty() && dimension == NETWORK_DIMENSION {
+        client.terrain.store(id.level, id.x, id.z, &pixels[..]);
+    }
     let key = to_key(id);
     if let Some(slot) = client.tiles.answered(key, version, !encoded.is_empty(), now_ms) {
         horizon_client_render::gfx::vexmap_render::queue_tile(slot, pixels);
@@ -151,6 +155,9 @@ fn disk_tiles(client: &mut runtime::Client, now_ms: u64) {
         let mut pixels = Box::new([0_u8; proto::TILE_AREA]);
         if proto::decode_tile(&tile.encoded, &mut pixels).is_err() {
             continue;
+        }
+        if tile.dimension == NETWORK_DIMENSION {
+            client.terrain.store(tile.key.level, tile.key.x, tile.key.z, &pixels[..]);
         }
         if let Some(slot) = client.tiles.answered(tile.key, tile.version, true, now_ms) {
             horizon_client_render::gfx::vexmap_render::queue_tile(slot, pixels);
@@ -290,6 +297,7 @@ fn edit_to_wire(edit: editor::Edit) -> proto::NetworkEdit {
             proto::NetworkEdit::AddLine { a, b, mode: mode_to_wire(mode), one_way }
         }
         editor::Edit::SetClosed { line, closed } => proto::NetworkEdit::SetClosed { line, closed },
+        editor::Edit::Revert { seq } => proto::NetworkEdit::Revert { seq },
     }
 }
 
@@ -318,8 +326,34 @@ pub(super) fn network_page(client: &mut runtime::Client, page: &proto::NetworkPa
         rendering: page.rendering,
         nodes,
         lines,
+        removed_nodes: page.removed_nodes.clone(),
+        removed_lines: page.removed_lines.clone(),
     };
     client.workspace.page(&page, now_ms);
+}
+
+/// A page of the network's history from the server.
+pub(super) fn network_history(client: &mut runtime::Client, history: &proto::NetworkHistory) {
+    let rows = history
+        .entries
+        .iter()
+        .map(|entry| editor::HistoryRow {
+            seq: entry.seq,
+            age_seconds: entry.age_seconds,
+            actor: entry.actor.clone(),
+            kind: match entry.kind {
+                proto::HistoryKind::NodeAdded => editor::HistoryKind::NodeAdded,
+                proto::HistoryKind::LineAdded => editor::HistoryKind::LineAdded,
+                proto::HistoryKind::LineClosed => editor::HistoryKind::LineClosed,
+                proto::HistoryKind::LineOpened => editor::HistoryKind::LineOpened,
+                proto::HistoryKind::NodeRemoved => editor::HistoryKind::NodeRemoved,
+                proto::HistoryKind::LineRemoved => editor::HistoryKind::LineRemoved,
+            },
+            place: entry.place,
+            undone: entry.undone,
+        })
+        .collect();
+    client.workspace.history_page(history.before, history.more, rows);
 }
 
 /// What became of one of our edits.
@@ -340,6 +374,9 @@ fn sync_network(game: &mut crate::game::Game<'_>, client: &mut runtime::Client, 
         let render = client.workspace.take_want_render();
         runtime::send_message(game, client, &proto::Message::NetworkWant { since, render });
     }
+    if let Some(before) = client.workspace.history_due(now_ms) {
+        runtime::send_message(game, client, &proto::Message::NetworkHistoryWant { before });
+    }
     for (token, edit) in client.workspace.take_outbox() {
         let message = proto::Message::NetworkEdit { token, edit: edit_to_wire(edit) };
         runtime::send_message(game, client, &message);
@@ -348,7 +385,7 @@ fn sync_network(game: &mut crate::game::Game<'_>, client: &mut runtime::Client, 
 
 /// A search under way on its own thread: a large network must not cost a frame.
 pub(super) struct RouteSearch {
-    destination: routing::Point,
+    stops: Vec<routing::Point>,
     answer: std::sync::mpsc::Receiver<Result<routing::Route, routing::RouteError>>,
 }
 
@@ -360,10 +397,15 @@ fn routing_mode(mode: editor::Mode) -> routing::Mode {
     }
 }
 
-fn start_search(client: &mut runtime::Client, from: routing::Point, to: routing::Point) {
+/// Builds a route from `from` through `stops`, in order.
+fn start_search(client: &mut runtime::Client, from: routing::Point, stops: Vec<routing::Point>) {
     let nodes = client.workspace.network.nodes().to_vec();
     let lines = client.workspace.network.lines().to_vec();
     let speeds = client.navigator.speeds();
+    let terrain = client.terrain.clone();
+    let mut through = Vec::with_capacity(stops.len() + 1);
+    through.push(from);
+    through.extend_from_slice(&stops);
     let (sender, answer) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("vexmap-route".to_owned()).spawn(move || {
         let mut graph = routing::Graph::new();
@@ -381,11 +423,14 @@ fn start_search(client: &mut runtime::Client, from: routing::Point, to: routing:
             }
         }
         let modes = [routing::Mode::Walk, routing::Mode::Boat, routing::Mode::Train];
-        let _ = sender.send(graph.route(&[from, to], &modes, &speeds));
+        let _ = sender.send(graph.route_over(&through, &modes, &speeds, &terrain));
     });
     match spawned {
-        Ok(_) => client.route_search = Some(RouteSearch { destination: to, answer }),
-        Err(error) => eprintln!("[vexmap] route search did not start: {error}"),
+        Ok(_) => client.route_search = Some(RouteSearch { stops, answer }),
+        Err(error) => {
+            eprintln!("[vexmap] route search did not start: {error}");
+            show_route(client);
+        }
     }
 }
 
@@ -404,7 +449,10 @@ fn show_route(client: &mut runtime::Client) {
         }
     }
     client.ui.route = steps;
+    let stops = client.navigator.stops();
+    client.ui.stops = stops[..stops.len().saturating_sub(1)].iter().map(|stop| [stop.x, stop.z]).collect();
     client.ui.destination = client.navigator.destination().map(|end| [end.x, end.z]);
+    client.workspace.route_stops = stops.iter().map(|stop| (stop.x, stop.z)).collect();
     client.workspace.route_shown = client.navigator.route().is_some();
     client.workspace.off_route = false;
     if client.navigator.route().is_none() {
@@ -415,14 +463,14 @@ fn show_route(client: &mut runtime::Client) {
 fn collect_search(client: &mut runtime::Client, now_ms: u64) {
     let Some(search) = &client.route_search else { return };
     let Ok(answer) = search.answer.try_recv() else { return };
-    let destination = search.destination;
+    let stops = search.stops.clone();
     client.route_search = None;
     match answer {
         Ok(route) => {
             if client.diagnostics {
                 eprintln!("[vexmap] route: legs={} length={:.0}", route.legs.len(), route.length);
             }
-            client.navigator.set_route(destination, route);
+            client.navigator.set_route(stops, route);
         }
         Err(_) => client.workspace.tell(editor::Notice::NoRoute, now_ms),
     }
@@ -441,24 +489,33 @@ fn navigate(game: &crate::game::Game<'_>, client: &mut runtime::Client, now_ms: 
         client.navigator.clear();
         show_route(client);
     }
-    if let (Some((x, z)), Some(from)) = (client.workspace.take_route_request(), here) {
-        start_search(client, from, routing::Point { x, z });
+    if let (Some(stops), Some(from)) = (client.workspace.take_route_request(), here) {
+        start_search(client, from, stops.into_iter().map(|(x, z)| routing::Point { x, z }).collect());
     }
     if client.workspace.take_route_again()
-        && let (Some(to), Some(from)) = (client.navigator.destination(), here)
+        && let Some(from) = here
+        && !client.navigator.stops().is_empty()
     {
-        start_search(client, from, to);
+        let stops = client.navigator.stops().to_vec();
+        start_search(client, from, stops);
     }
     let (Some(at), true) = (here, client.navigator.route().is_some()) else {
         horizon_client_render::gfx::vexmap_render::set_marks(Default::default());
         return;
     };
-    if client.navigator.sample(at, now_ms) {
-        client.navigator.clear();
-        show_route(client);
-        client.workspace.tell(editor::Notice::Arrived, now_ms);
-        horizon_client_render::gfx::vexmap_render::set_marks(Default::default());
-        return;
+    match client.navigator.sample(at, now_ms) {
+        routing::Progress::Arrived => {
+            client.navigator.clear();
+            show_route(client);
+            client.workspace.tell(editor::Notice::Arrived, now_ms);
+            horizon_client_render::gfx::vexmap_render::set_marks(Default::default());
+            return;
+        }
+        routing::Progress::StopReached => {
+            show_route(client);
+            client.workspace.tell(editor::Notice::StopReached, now_ms);
+        }
+        routing::Progress::Travelling => {}
     }
     let map_covers_the_world = is_open(game);
     let marks = player.as_ref().filter(|_| !map_covers_the_world).map_or_else(Default::default, |player| {
@@ -466,7 +523,7 @@ fn navigate(game: &crate::game::Game<'_>, client: &mut runtime::Client, now_ms: 
             arrow: client.navigator.bearing_ahead(at).map_or_else(Vec::new, ui::arrow_mesh),
             beam: client
                 .navigator
-                .destination()
+                .next_stop()
                 .map_or_else(Vec::new, |end| ui::beam_mesh([player.x, player.z], [end.x, end.z])),
             origin: [player.x, player.y, player.z],
         }
@@ -482,7 +539,13 @@ fn on_network_dimension(player: Option<&ui::Player>) -> bool {
 }
 
 /// Copies what the editor shows into the map's overlay, for the rebuild that follows.
-fn update_overlay(client: &mut runtime::Client, size: [f32; 2], mouse: [f32; 2], player: Option<&ui::Player>, now: u64) {
+fn update_overlay(
+    client: &mut runtime::Client,
+    size: [f32; 2],
+    mouse: [f32; 2],
+    player: Option<&ui::Player>,
+    now: u64,
+) {
     let workspace = &client.workspace;
     let (drawn, total, rendering) = workspace.render;
     let mut overlay = ui::Overlay {
@@ -496,6 +559,22 @@ fn update_overlay(client: &mut runtime::Client, size: [f32; 2], mouse: [f32; 2],
             .collect(),
         ..ui::Overlay::default()
     };
+    if workspace.editing && workspace.history_open {
+        let russian = client.ui.settings.language == ui::Language::Ru;
+        overlay.history = Some(ui::HistoryPanel {
+            rows: workspace
+                .history
+                .iter()
+                .map(|row| ui::HistoryLine {
+                    text: row.describe(russian),
+                    undone: row.undone,
+                    placed: row.place.is_some(),
+                })
+                .collect(),
+            older: workspace.history_has_older(),
+            newer: workspace.history_has_newer(),
+        });
+    }
     if workspace.editing {
         let network = &workspace.network;
         overlay.counts = Some((network.len_nodes(), network.lines().len(), workspace.syncing()));
@@ -543,10 +622,12 @@ fn update_overlay(client: &mut runtime::Client, size: [f32; 2], mouse: [f32; 2],
         }
     }
     if workspace.picking_route {
-        overlay.notice = Some(if on_network_dimension(player) {
-            editor::Notice::PickDestination.text()
-        } else {
+        overlay.notice = Some(if !on_network_dimension(player) {
             editor::Notice::WrongDimension.text()
+        } else if workspace.adding_stops() {
+            editor::Notice::PickStop.text()
+        } else {
+            editor::Notice::PickDestination.text()
         });
     }
     client.ui.overlay = overlay;
@@ -753,6 +834,24 @@ pub(super) fn mouse_pressed(
             }
             *canceled = true;
         }
+        ui::Press::HistoryRevert(row) => {
+            client.workspace.revert(usize::from(row));
+            *canceled = true;
+        }
+        ui::Press::HistoryShow(row) => {
+            if let Some((x, z)) = client.workspace.history_place(usize::from(row)) {
+                client.ui.center_on([f64::from(x), f64::from(z)]);
+            }
+            *canceled = true;
+        }
+        ui::Press::HistoryOlder => {
+            client.workspace.history_older();
+            *canceled = true;
+        }
+        ui::Press::HistoryNewer => {
+            client.workspace.history_newer();
+            *canceled = true;
+        }
         ui::Press::Back => {}
     });
 }
@@ -809,7 +908,12 @@ pub(super) fn key_pressed(game: &crate::game::Game<'_>, key: &str, repeat: bool,
     }
     let now = runtime::now_ms();
     runtime::with_client(|client| match client.ui.key(key, now) {
-        ui::Press::Ignored | ui::Press::Button(_) => {}
+        ui::Press::Ignored
+        | ui::Press::Button(_)
+        | ui::Press::HistoryRevert(_)
+        | ui::Press::HistoryShow(_)
+        | ui::Press::HistoryOlder
+        | ui::Press::HistoryNewer => {}
         ui::Press::Taken => *canceled = true,
         ui::Press::Close => {
             client.close_requested = true;

@@ -321,6 +321,121 @@ async fn a_reader_follows_the_network_page_by_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn edits_of_the_network_are_rolled_back_and_so_are_the_rollbacks() {
+    use vexmap_core::RouteMode;
+    on_every_backend(|core| async move {
+        let a = seq_of(core.add_route_node(&ctx(system(), "a"), 0, 0, false).await.unwrap());
+        let b = seq_of(core.add_route_node(&ctx(system(), "b"), 50, 0, true).await.unwrap());
+        let line = seq_of(core.add_route_line(&ctx(system(), "l"), a, b, RouteMode::Train, true).await.unwrap());
+        let closed = seq_of(core.set_route_line_closed(&ctx(system(), "c"), line, true).await.unwrap());
+
+        let history = core.route_history(0, 50).await.unwrap();
+        assert_eq!(history.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![closed, line, b, a]);
+        assert!(!history.more && history.entries.iter().all(|e| !e.undone));
+        assert_eq!(history.entries[0].closed, Some(true));
+        assert_eq!(history.entries[0].place, Some((0, 0)));
+        assert_eq!(history.entries[2].place, Some((50, 0)));
+
+        // Paging: each page starts where the last one stopped.
+        let first = core.route_history(0, 3).await.unwrap();
+        assert!(first.more);
+        let rest = core.route_history(first.entries.last().unwrap().seq, 3).await.unwrap();
+        assert_eq!(rest.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![a]);
+        assert!(!rest.more);
+
+        // A node with a line on it stays. Nothing changes and nothing is journaled.
+        let head = core.journal_head().await.unwrap();
+        let refused = core.revert_route_edit(&ctx(system(), "r0"), a).await;
+        assert!(matches!(refused, Err(CoreError::Invalid(_))), "{refused:?}");
+        assert_eq!(core.route_network().await.unwrap().nodes.len(), 2);
+        assert_eq!(core.journal(head, 10).await.unwrap().len(), 0);
+
+        // Closing undone: the line is open again, and the entry says it no longer stands.
+        let opened = seq_of(core.revert_route_edit(&ctx(system(), "r1"), closed).await.unwrap());
+        assert!(!core.route_network().await.unwrap().lines[0].closed);
+        let history = core.route_history(0, 50).await.unwrap();
+        assert_eq!(history.entries[0].seq, opened);
+        assert_eq!(history.entries[0].closed, Some(false));
+        assert!(history.entries[1].undone);
+        assert_eq!(core.revert_route_edit(&ctx(system(), "r2"), closed).await.unwrap(), Outcome::Unchanged);
+
+        // A line undone: gone for readers of the whole network and of the changes, and the version moved on.
+        let version = core.route_network_version().await.unwrap();
+        let removed = seq_of(core.revert_route_edit(&ctx(system(), "r3"), line).await.unwrap());
+        assert!(core.route_network().await.unwrap().lines.is_empty());
+        assert_eq!(core.route_network_version().await.unwrap(), removed);
+        let changes = core.route_network_changes(version, 10).await.unwrap();
+        assert_eq!((changes.to, changes.removed_lines.clone()), (removed, vec![line]));
+        assert!(changes.lines.is_empty() && changes.removed_nodes.is_empty());
+        assert_eq!(core.revert_route_edit(&ctx(system(), "r4"), line).await.unwrap(), Outcome::Unchanged);
+        let entry = core.route_history(0, 1).await.unwrap().entries.remove(0);
+        assert_eq!((entry.kind.as_str(), entry.place, entry.undone), ("route.line_removed", Some((0, 0)), false));
+
+        // The removal undone: the same line, as it was, comes back to the same readers.
+        let restored = seq_of(core.revert_route_edit(&ctx(system(), "r5"), removed).await.unwrap());
+        let network = core.route_network().await.unwrap();
+        assert_eq!(
+            (network.lines[0].id, network.lines[0].mode, network.lines[0].one_way),
+            (line, RouteMode::Train, true)
+        );
+        let changes = core.route_network_changes(removed, 10).await.unwrap();
+        assert_eq!((changes.to, changes.lines[0].id), (restored, line));
+        assert!(changes.removed_lines.is_empty());
+        let history = core.route_history(0, 50).await.unwrap();
+        assert!(history.entries.iter().find(|e| e.seq == removed).unwrap().undone);
+
+        // The restore undone, then a new line drawn over the pair: the old one cannot come back on top of it.
+        let again = seq_of(core.revert_route_edit(&ctx(system(), "r6"), restored).await.unwrap());
+        let other = seq_of(core.add_route_line(&ctx(system(), "l2"), b, a, RouteMode::Train, false).await.unwrap());
+        let doubled = core.revert_route_edit(&ctx(system(), "r7"), again).await;
+        assert!(matches!(doubled, Err(CoreError::Invalid(_))), "{doubled:?}");
+        seq_of(core.revert_route_edit(&ctx(system(), "r8"), other).await.unwrap());
+
+        // A node undone frees its block; once something else stands there it cannot come back.
+        let node_gone = seq_of(core.revert_route_edit(&ctx(system(), "r9"), b).await.unwrap());
+        let changes = core.route_network_changes(node_gone - 1, 10).await.unwrap();
+        assert_eq!(changes.removed_nodes, vec![b]);
+        let usurper = seq_of(core.add_route_node(&ctx(system(), "b2"), 50, 0, false).await.unwrap());
+        let taken = core.revert_route_edit(&ctx(system(), "r10"), node_gone).await;
+        assert!(matches!(taken, Err(CoreError::Invalid(_))), "{taken:?}");
+        seq_of(core.revert_route_edit(&ctx(system(), "r11"), usurper).await.unwrap());
+        seq_of(core.revert_route_edit(&ctx(system(), "r12"), node_gone).await.unwrap());
+        let network = core.route_network().await.unwrap();
+        assert_eq!(network.nodes.iter().map(|n| n.id).collect::<Vec<_>>(), vec![a, b]);
+        assert!(network.nodes[1].transfer, "as it was");
+
+        // A line cannot come back without its nodes.
+        let line3 = seq_of(core.add_route_line(&ctx(system(), "l3"), a, b, RouteMode::Boat, false).await.unwrap());
+        let line_gone = seq_of(core.revert_route_edit(&ctx(system(), "r13"), line3).await.unwrap());
+        seq_of(core.revert_route_edit(&ctx(system(), "r14"), b).await.unwrap());
+        let orphan = core.revert_route_edit(&ctx(system(), "r15"), line_gone).await;
+        assert!(matches!(orphan, Err(CoreError::Invalid(_))), "{orphan:?}");
+
+        // A retried request does not undo twice.
+        let retried = core.revert_route_edit(&ctx(system(), "r3"), a).await.unwrap();
+        assert_eq!(retried, Outcome::Replayed { seq: removed });
+
+        // Only edits of the network, only real entries, only who may edit.
+        let role =
+            seq_of(core.set_role(&ctx(system(), "role"), Uuid::new_v4(), Role::Admin, BTreeSet::new()).await.unwrap());
+        assert!(matches!(core.revert_route_edit(&ctx(system(), "x1"), role).await, Err(CoreError::Invalid(_))));
+        assert!(matches!(core.revert_route_edit(&ctx(system(), "x2"), 999_999).await, Err(CoreError::Invalid(_))));
+        let player = Uuid::new_v4();
+        let forbidden = core.revert_route_edit(&ctx(Actor::Player(player), "x3"), a).await;
+        assert!(matches!(forbidden, Err(CoreError::Forbidden(_))), "{forbidden:?}");
+
+        // An editor's name shows in the history.
+        let admin = Uuid::new_v4();
+        core.set_role(&ctx(system(), "a1"), admin, Role::Admin, BTreeSet::new()).await.unwrap();
+        core.record_player(&ctx(system(), "a2"), admin, "Builder").await.unwrap();
+        core.add_route_node(&ctx(Actor::Player(admin), "a3"), 700, 700, false).await.unwrap();
+        let entry = core.route_history(0, 1).await.unwrap().entries.remove(0);
+        assert_eq!(entry.actor_name.as_deref(), Some("Builder"));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_route_network_is_drawn_closed_and_journaled() {
     use vexmap_core::RouteMode;
     on_every_backend(|core| async move {

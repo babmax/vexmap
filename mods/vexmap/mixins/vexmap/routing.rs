@@ -4,11 +4,13 @@
 // World coordinates are blocks, `x` east and `z` south. Costs are seconds. A route may change mode (walk, train, boat)
 // only at a node marked as a transfer, and every change costs `Speeds::transfer_penalty`.
 //
-// Off the network, walking is a straight line (a bearing): the world has no roads there, a straight line is what a
-// player would do, and the leg is marked `Direct` so the client can say "head 40 degrees" instead of inventing streets.
+// Off the network, walking is a line by bearing, marked `Direct` so the client can say "head 40 degrees" instead of
+// inventing streets. It is straight unless the map knows of water or a cliff in the way: then it bends around them. What
+// the map has not shown yet counts as open ground.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -241,6 +243,8 @@ pub struct Leg {
     pub points: Vec<Point>,
     pub length: f64,
     pub seconds: f64,
+    /// How many times longer a block of this leg takes than a block of flat ground. 1 on the network.
+    pub effort: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,6 +252,8 @@ pub struct Route {
     pub legs: Vec<Leg>,
     pub length: f64,
     pub seconds: f64,
+    /// How far along the route each stop after the start lies, in order. The last is `length`.
+    pub stop_ends: Vec<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,7 +344,20 @@ impl Graph {
 
     /// A route through `stops` in order, using only `allowed` modes. Each stop snaps to the network within
     /// `SNAP_BLOCKS`; farther away the walk to it is a straight `Direct` leg.
+    // Read by the sidecar, not by the game.
+    #[allow(dead_code)]
     pub fn route(&self, stops: &[Point], allowed: &[Mode], speeds: &Speeds) -> Result<Route, RouteError> {
+        self.route_over(stops, allowed, speeds, &NoTerrain)
+    }
+
+    /// `route`, with the walks off the network going around what `terrain` knows of.
+    pub fn route_over(
+        &self,
+        stops: &[Point],
+        allowed: &[Mode],
+        speeds: &Speeds,
+        terrain: &dyn Terrain,
+    ) -> Result<Route, RouteError> {
         if !speeds.valid() {
             return Err(RouteError::BadSpeeds);
         }
@@ -348,24 +367,29 @@ impl Graph {
         if stops.len() > MAX_STOPS {
             return Err(RouteError::TooManyStops);
         }
-        let mut legs = Vec::new();
+        let mut legs: Vec<Leg> = Vec::new();
+        let mut stop_ends = Vec::with_capacity(stops.len() - 1);
         for (index, pair) in stops.windows(2).enumerate() {
-            self.route_pair(pair[0], pair[1], allowed, speeds, &mut legs).ok_or(RouteError::Unreachable(index + 1))?;
+            self.route_pair(pair[0], pair[1], allowed, speeds, terrain, &mut legs)
+                .ok_or(RouteError::Unreachable(index + 1))?;
+            stop_ends.push(legs.iter().map(|l| l.length).sum());
         }
         let length = legs.iter().map(|l| l.length).sum();
         let seconds = legs.iter().map(|l| l.seconds).sum();
-        Ok(Route { legs, length, seconds })
+        Ok(Route { legs, length, seconds, stop_ends })
     }
 
-    fn route_pair(&self, a: Point, b: Point, allowed: &[Mode], speeds: &Speeds, legs: &mut Vec<Leg>) -> Option<()> {
+    fn route_pair(
+        &self,
+        a: Point,
+        b: Point,
+        allowed: &[Mode],
+        speeds: &Speeds,
+        terrain: &dyn Terrain,
+        legs: &mut Vec<Leg>,
+    ) -> Option<()> {
         let walk = allowed.contains(&Mode::Walk);
-        let direct = |p: Point, q: Point| Leg {
-            mode: Mode::Walk,
-            kind: LegKind::Direct,
-            points: vec![p, q],
-            length: p.distance(q),
-            seconds: p.distance(q) / speeds.walk,
-        };
+        let direct = |p: Point, q: Point| walk_leg(p, q, terrain, speeds);
         let (Some(start), Some(end)) = (self.snap(a, allowed), self.snap(b, allowed)) else {
             // Nothing near one end: walking straight is the only honest answer, and only if walking is allowed.
             return walk.then(|| legs.push(direct(a, b)));
@@ -394,6 +418,7 @@ impl Graph {
                 points: vec![p0],
                 length: 0.0,
                 seconds: 0.0,
+                effort: 1.0,
             });
             let d = p0.distance(p1);
             leg.points.push(p1);
@@ -413,6 +438,308 @@ impl Graph {
             self.nodes[x.0 as usize].at.distance(at).total_cmp(&self.nodes[y.0 as usize].at.distance(at))
         })
     }
+}
+
+// ---------------------------------------------------------------- walking off the network
+
+/// What the ground is like to walk over, as far as the map can tell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ground {
+    /// The map has not shown this place. Treated as open: guessing an obstacle would send people around nothing.
+    #[default]
+    Unknown,
+    Land,
+    /// Cliffs or slopes too steep to simply walk up.
+    Steep,
+    Water,
+}
+
+impl Ground {
+    /// How much a block of this is worth avoiding, against flat ground.
+    fn avoidance(self) -> f64 {
+        match self {
+            Ground::Unknown | Ground::Land => 1.0,
+            // Unlike water it cannot be pushed through: a thin cliff must cost more than a real detour.
+            Ground::Steep => 12.0,
+            Ground::Water => 8.0,
+        }
+    }
+
+    /// How many times longer a block of this takes. Swimming is about 2 blocks a second against a walk's 4.3.
+    fn effort(self) -> f64 {
+        match self {
+            Ground::Unknown | Ground::Land => 1.0,
+            Ground::Steep => 1.5,
+            Ground::Water => 2.2,
+        }
+    }
+
+    fn in_the_way(self) -> bool {
+        matches!(self, Ground::Steep | Ground::Water)
+    }
+}
+
+pub trait Terrain {
+    fn ground(&self, at: Point) -> Ground;
+}
+
+/// Open ground everywhere. For whoever has no map to look at, such as the sidecar.
+#[allow(dead_code)]
+pub struct NoTerrain;
+
+impl Terrain for NoTerrain {
+    fn ground(&self, _at: Point) -> Ground {
+        Ground::Unknown
+    }
+}
+
+/// `vexmap_proto::Material` numbers. They are stored in tiles and never renumbered.
+const MATERIAL_UNKNOWN: u8 = 0;
+const MATERIAL_WATER: u8 = 1;
+const MATERIAL_FOREST: u8 = 3;
+const MATERIAL_BUILT: u8 = 9;
+const MATERIAL_LAVA: u8 = 11;
+/// The tiler's shade of level ground. It is lit from the north-west, so distance from this is how steep the ground is.
+const NEUTRAL_SHADE: i32 = 8;
+const STEEP_SHADE: i32 = 4;
+
+/// A tile pixel: the material in the low four bits and the shade in the high four. A tree top or a roof shades like a
+/// cliff, so forests and buildings do not count as steep.
+pub fn ground_of_tile_pixel(pixel: u8) -> Ground {
+    match pixel & 0x0F {
+        MATERIAL_UNKNOWN => Ground::Unknown,
+        MATERIAL_WATER | MATERIAL_LAVA => Ground::Water,
+        MATERIAL_FOREST | MATERIAL_BUILT => Ground::Land,
+        _ if (i32::from(pixel >> 4) - NEUTRAL_SHADE).abs() >= STEEP_SHADE => Ground::Steep,
+        _ => Ground::Land,
+    }
+}
+
+/// Cells on a side of a tile's summary.
+const TERRAIN_CELLS: usize = 16;
+/// Pixels on a side of a tile, `vexmap_proto::TILE_SIZE`.
+const TILE_PIXELS: usize = 256;
+const TERRAIN_PIXELS_PER_CELL: usize = TILE_PIXELS / TERRAIN_CELLS;
+/// About 2 MB. The oldest tile goes first.
+const TERRAIN_MAX_TILES: usize = 8192;
+
+type TerrainCells = [Ground; TERRAIN_CELLS * TERRAIN_CELLS];
+
+/// What the tiles this client has seen say about the ground, boiled down to 16 by 16 cells a tile. Cheap to clone: a
+/// search takes its own copy to its own thread.
+#[derive(Clone, Default)]
+pub struct TerrainMap {
+    tiles: HashMap<(u8, i32, i32), Arc<TerrainCells>>,
+    order: VecDeque<(u8, i32, i32)>,
+    /// Bit `n`: there are tiles of level `n`.
+    levels: u32,
+}
+
+impl TerrainMap {
+    /// Remembers a decoded tile. `pixels` is `TILE_PIXELS` squared, row by row; anything else is ignored.
+    pub fn store(&mut self, level: u8, x: i32, z: i32, pixels: &[u8]) {
+        if pixels.len() != TILE_PIXELS * TILE_PIXELS || level >= 31 {
+            return;
+        }
+        let mut cells = [Ground::Unknown; TERRAIN_CELLS * TERRAIN_CELLS];
+        for (index, cell) in cells.iter_mut().enumerate() {
+            *cell = summarize_cell(pixels, index % TERRAIN_CELLS, index / TERRAIN_CELLS);
+        }
+        if cells.iter().all(|cell| *cell == Ground::Unknown) {
+            return;
+        }
+        let key = (level, x, z);
+        if self.tiles.insert(key, Arc::new(cells)).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > TERRAIN_MAX_TILES
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.tiles.remove(&oldest);
+            }
+        }
+        self.levels |= 1 << level;
+    }
+}
+
+fn summarize_cell(pixels: &[u8], cell_x: usize, cell_z: usize) -> Ground {
+    let (mut known, mut water, mut steep) = (0_usize, 0_usize, 0_usize);
+    for z in 0..TERRAIN_PIXELS_PER_CELL {
+        let row = (cell_z * TERRAIN_PIXELS_PER_CELL + z) * TILE_PIXELS + cell_x * TERRAIN_PIXELS_PER_CELL;
+        for pixel in &pixels[row..row + TERRAIN_PIXELS_PER_CELL] {
+            match ground_of_tile_pixel(*pixel) {
+                Ground::Unknown => continue,
+                Ground::Land => {}
+                Ground::Steep => steep += 1,
+                Ground::Water => water += 1,
+            }
+            known += 1;
+        }
+    }
+    match known {
+        0 => Ground::Unknown,
+        _ if water * 10 >= known * 4 => Ground::Water,
+        // A cliff is a thin line through a cell, so a few of its pixels are enough.
+        _ if steep * 20 >= known => Ground::Steep,
+        _ => Ground::Land,
+    }
+}
+
+impl Terrain for TerrainMap {
+    /// The finest tile that knows this place.
+    fn ground(&self, at: Point) -> Ground {
+        for level in 0..31_u8 {
+            if self.levels & (1 << level) == 0 {
+                continue;
+            }
+            let span = (TILE_PIXELS as f64) * f64::from(1_u32 << level);
+            let (tile_x, tile_z) = ((at.x / span).floor(), (at.z / span).floor());
+            let Some(cells) = self.tiles.get(&(level, tile_x as i32, tile_z as i32)) else { continue };
+            let cell = span / TERRAIN_CELLS as f64;
+            let across = (((at.x - tile_x * span) / cell) as usize).min(TERRAIN_CELLS - 1);
+            let down = (((at.z - tile_z * span) / cell) as usize).min(TERRAIN_CELLS - 1);
+            let ground = cells[down * TERRAIN_CELLS + across];
+            if ground != Ground::Unknown {
+                return ground;
+            }
+        }
+        Ground::Unknown
+    }
+}
+
+/// The finest grid is one summary cell of a level 0 tile: looking closer would find nothing new.
+const WALK_MIN_STEP: f64 = 16.0;
+/// Bounds a search at about 160 000 cells, whatever the distance.
+const WALK_MAX_SIDE: f64 = 400.0;
+/// A walk may swing this far to the side, as a share of its length, but always at least `WALK_MIN_MARGIN` blocks.
+const WALK_MARGIN: f64 = 0.5;
+const WALK_MIN_MARGIN: f64 = 64.0;
+/// Past this many bends ahead a shortcut is not worth looking for.
+const WALK_SHORTCUT_REACH: usize = 64;
+const WALK_MAX_SAMPLES: usize = 2048;
+/// A shortcut may cost this much more than the steps it replaces: it buys a line a person can actually follow.
+const WALK_SHORTCUT_SLACK: f64 = 1.02;
+const WALK_NEIGHBOURS: [(i32, i32); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// Calls `visit` with the ground at the middle of each short piece of a straight line, and the piece's length.
+fn along_line(a: Point, b: Point, terrain: &dyn Terrain, mut visit: impl FnMut(Ground, f64)) {
+    let length = a.distance(b);
+    if length <= 0.0 {
+        return;
+    }
+    let samples = ((length / 8.0).ceil() as usize).clamp(1, WALK_MAX_SAMPLES);
+    let piece = length / samples as f64;
+    for index in 0..samples {
+        let t = (index as f64 + 0.5) / samples as f64;
+        visit(terrain.ground(Point { x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t }), piece);
+    }
+}
+
+fn avoidance_of_line(a: Point, b: Point, terrain: &dyn Terrain) -> f64 {
+    let mut cost = 0.0;
+    along_line(a, b, terrain, |ground, piece| cost += piece * ground.avoidance());
+    cost
+}
+
+fn walk_leg(a: Point, b: Point, terrain: &dyn Terrain, speeds: &Speeds) -> Leg {
+    let mut clear = true;
+    along_line(a, b, terrain, |ground, _| clear &= !ground.in_the_way());
+    let points = if clear { vec![a, b] } else { walk_around(a, b, terrain).unwrap_or_else(|| vec![a, b]) };
+    let length: f64 = points.windows(2).map(|pair| pair[0].distance(pair[1])).sum();
+    let mut effort = 0.0;
+    for pair in points.windows(2) {
+        along_line(pair[0], pair[1], terrain, |ground, piece| effort += piece * ground.effort());
+    }
+    let effort = if length > 0.0 { (effort / length).max(1.0) } else { 1.0 };
+    Leg { mode: Mode::Walk, kind: LegKind::Direct, points, length, seconds: length * effort / speeds.walk, effort }
+}
+
+/// The way from `a` to `b` over a grid around them, cheapest first. Nothing is forbidden: if water or cliffs fill the
+/// whole box the answer goes through them, and the time reflects that. `None` when the two are too close for a grid.
+fn walk_around(a: Point, b: Point, terrain: &dyn Terrain) -> Option<Vec<Point>> {
+    let margin = (a.distance(b) * WALK_MARGIN).max(WALK_MIN_MARGIN);
+    let origin = Point { x: a.x.min(b.x) - margin, z: a.z.min(b.z) - margin };
+    let (width, height) = ((a.x - b.x).abs() + 2.0 * margin, (a.z - b.z).abs() + 2.0 * margin);
+    let step = (width.max(height) / WALK_MAX_SIDE).max(WALK_MIN_STEP);
+    let (across, down) = ((width / step).ceil() as i32 + 1, (height / step).ceil() as i32 + 1);
+    let cell_of = |p: Point| {
+        let x = (((p.x - origin.x) / step).round() as i32).clamp(0, across - 1);
+        let z = (((p.z - origin.z) / step).round() as i32).clamp(0, down - 1);
+        (x, z)
+    };
+    let (start, end) = (cell_of(a), cell_of(b));
+    if start == end {
+        return None;
+    }
+    let index = |(x, z): (i32, i32)| z as usize * across as usize + x as usize;
+    let cell_at = |slot: usize| ((slot % across as usize) as i32, (slot / across as usize) as i32);
+    let centre = |(x, z): (i32, i32)| Point { x: origin.x + f64::from(x) * step, z: origin.z + f64::from(z) * step };
+    let goal = centre(end);
+    let cells = across as usize * down as usize;
+    let mut best = vec![f64::INFINITY; cells];
+    let mut came = vec![u32::MAX; cells];
+    let mut heap = BinaryHeap::new();
+    best[index(start)] = 0.0;
+    heap.push(Item { f: centre(start).distance(goal), g: 0.0, node: index(start) as u32, mode: 0 });
+    while let Some(Item { g, node, .. }) = heap.pop() {
+        if g > best[node as usize] {
+            continue;
+        }
+        let here = cell_at(node as usize);
+        if here == end {
+            break;
+        }
+        let from = centre(here);
+        for (dx, dz) in WALK_NEIGHBOURS {
+            let next = (here.0 + dx, here.1 + dz);
+            if next.0 < 0 || next.1 < 0 || next.0 >= across || next.1 >= down {
+                continue;
+            }
+            let to = centre(next);
+            let middle = Point { x: (from.x + to.x) / 2.0, z: (from.z + to.z) / 2.0 };
+            let cost = g + from.distance(to) * terrain.ground(middle).avoidance();
+            let slot = index(next);
+            if cost < best[slot] {
+                best[slot] = cost;
+                came[slot] = node;
+                heap.push(Item { f: cost + to.distance(goal), g: cost, node: slot as u32, mode: 0 });
+            }
+        }
+    }
+    if !best[index(end)].is_finite() {
+        return None;
+    }
+    let mut path = vec![b];
+    let mut at = index(end);
+    while came[at] != u32::MAX {
+        at = came[at] as usize;
+        if at != index(start) {
+            path.push(centre(cell_at(at)));
+        }
+    }
+    path.push(a);
+    path.reverse();
+    Some(shortcut(&path, terrain))
+}
+
+/// The grid only knows eight directions. This takes every long straight cut that costs no more than the steps it skips.
+fn shortcut(path: &[Point], terrain: &dyn Terrain) -> Vec<Point> {
+    let mut spent = vec![0.0; path.len()];
+    for index in 1..path.len() {
+        spent[index] = spent[index - 1] + avoidance_of_line(path[index - 1], path[index], terrain);
+    }
+    let mut out = vec![path[0]];
+    let mut at = 0;
+    while at + 1 < path.len() {
+        let mut next = (at + WALK_SHORTCUT_REACH).min(path.len() - 1);
+        while next > at + 1
+            && avoidance_of_line(path[at], path[next], terrain) > (spent[next] - spent[at]) * WALK_SHORTCUT_SLACK
+        {
+            next -= 1;
+        }
+        out.push(path[next]);
+        at = next;
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,20 +847,31 @@ impl Route {
 
     /// Where `at` is against the route: the distance from the line and how far along it the closest point lies.
     pub fn locate(&self, at: Point) -> (f64, f64) {
+        self.locate_between(at, 0.0, self.length)
+    }
+
+    /// `locate`, on the stretch from `from` to `to` blocks along the route only. A route that goes out to a stop and
+    /// back over the same road passes every point twice, and only the player's current stretch says which time this is.
+    pub fn locate_between(&self, at: Point, from: f64, to: f64) -> (f64, f64) {
         let line = self.polyline();
-        let mut best = (f64::INFINITY, 0.0);
+        let mut best = (f64::INFINITY, from);
         let mut walked = 0.0;
         for w in line.windows(2) {
             let (a, b) = (w[0], w[1]);
             let (dx, dz) = (b.x - a.x, b.z - a.z);
             let len2 = dx * dx + dz * dz;
-            let t = if len2 == 0.0 { 0.0 } else { (((at.x - a.x) * dx + (at.z - a.z) * dz) / len2).clamp(0.0, 1.0) };
-            let nearest = Point { x: a.x + t * dx, z: a.z + t * dz };
-            let d = nearest.distance(at);
-            if d < best.0 {
-                best = (d, walked + t * len2.sqrt());
+            let length = len2.sqrt();
+            if walked + length >= from && walked <= to && length > 0.0 {
+                let first = ((from - walked) / length).max(0.0);
+                let last = ((to - walked) / length).min(1.0).max(first);
+                let t = (((at.x - a.x) * dx + (at.z - a.z) * dz) / len2).clamp(first, last);
+                let nearest = Point { x: a.x + t * dx, z: a.z + t * dz };
+                let d = nearest.distance(at);
+                if d < best.0 {
+                    best = (d, walked + t * length);
+                }
             }
-            walked += len2.sqrt();
+            walked += length;
         }
         best
     }
@@ -587,6 +925,17 @@ pub struct Guidance {
     pub seconds: f64,
     /// On a stretch off the network: the bearing to hold, in degrees.
     pub bearing: Option<f64>,
+    /// Stops still ahead, the last one included.
+    pub stops_left: usize,
+}
+
+/// What a position sample found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    Travelling,
+    /// A stop on the way was reached; the route goes on.
+    StopReached,
+    Arrived,
 }
 
 fn distance_text(blocks: f64, ru: bool) -> String {
@@ -645,7 +994,15 @@ impl Guidance {
         } else {
             "Straight to the end".to_owned()
         };
-        format!("{what}  |  {}, {}", distance_text(self.remaining, ru), time_text(self.seconds, ru))
+        let mut line = format!("{what}  |  {}, {}", distance_text(self.remaining, ru), time_text(self.seconds, ru));
+        if self.stops_left > 1 {
+            line.push_str(&if ru {
+                format!("  |  остановок: {}", self.stops_left)
+            } else {
+                format!("  |  stops: {}", self.stops_left)
+            });
+        }
+        line
     }
 }
 
@@ -655,7 +1012,11 @@ pub struct Navigator {
     route: Option<Route>,
     /// Along the route: where each turn is.
     turns: Vec<(f64, Turn)>,
-    destination: Option<Point>,
+    /// The stops still ahead, in order. The last is the destination.
+    stops: Vec<Point>,
+    /// Stops already passed, and how far along the route the last of them lies.
+    passed: usize,
+    section_start: f64,
     deviation: Deviation,
     tracker: SpeedTracker,
     last: Option<(Point, u64)>,
@@ -665,7 +1026,8 @@ pub struct Navigator {
 }
 
 impl Navigator {
-    pub fn set_route(&mut self, destination: Point, route: Route) {
+    /// `stops`: where this route still goes, in order, without the place it starts from.
+    pub fn set_route(&mut self, stops: Vec<Point>, route: Route) {
         let mut along = 0.0;
         self.turns = route
             .hints()
@@ -676,7 +1038,9 @@ impl Navigator {
             })
             .collect();
         self.route = Some(route);
-        self.destination = Some(destination);
+        self.stops = stops;
+        self.passed = 0;
+        self.section_start = 0.0;
         self.deviation.reset();
         self.along = 0.0;
         self.off_route = false;
@@ -686,7 +1050,7 @@ impl Navigator {
     pub fn clear(&mut self) {
         self.route = None;
         self.turns.clear();
-        self.destination = None;
+        self.stops.clear();
         self.off_route = false;
     }
 
@@ -694,8 +1058,18 @@ impl Navigator {
         self.route.as_ref()
     }
 
+    /// The stops still ahead, in order.
+    pub fn stops(&self) -> &[Point] {
+        &self.stops
+    }
+
+    /// Where the player is heading right now.
+    pub fn next_stop(&self) -> Option<Point> {
+        self.stops.first().copied()
+    }
+
     pub fn destination(&self) -> Option<Point> {
-        self.destination
+        self.stops.last().copied()
     }
 
     /// The player has left the route and may be offered a new one. Nothing is rebuilt until they say so.
@@ -718,14 +1092,15 @@ impl Navigator {
         route.legs.last()
     }
 
-    /// Where the player is now. Returns `true` on arrival. Cheap to call every frame: it only works once a second.
-    pub fn sample(&mut self, at: Point, now_ms: u64) -> bool {
+    /// Where the player is now. Cheap to call every frame: it only works once a second.
+    pub fn sample(&mut self, at: Point, now_ms: u64) -> Progress {
         if self.last.is_some_and(|(_, then)| now_ms.saturating_sub(then) < SAMPLE_EVERY_MS) {
-            return false;
+            return Progress::Travelling;
         }
         let previous = self.last.replace((at, now_ms));
-        let Some(route) = &self.route else { return false };
-        let (_, along) = route.locate(at);
+        let Some(route) = &self.route else { return Progress::Travelling };
+        let section_end = route.stop_ends.get(self.passed).copied().unwrap_or(route.length);
+        let (off, along) = route.locate_between(at, self.section_start, section_end);
         self.at = Some(at);
         self.along = along;
         if let Some(((was, then), leg)) = previous.zip(Self::leg_at(route, along)) {
@@ -734,15 +1109,23 @@ impl Navigator {
                 self.tracker.record(leg.mode, blocks, seconds);
             }
         }
-        if self.destination.is_some_and(|end| end.distance(at) <= ARRIVED_BLOCKS)
-            || route.length - along <= ARRIVED_BLOCKS && route.locate(at).0 <= ARRIVED_BLOCKS
+        if self.stops.first().is_some_and(|stop| stop.distance(at) <= ARRIVED_BLOCKS)
+            || section_end - along <= ARRIVED_BLOCKS && off <= ARRIVED_BLOCKS
         {
-            return true;
+            if self.stops.len() <= 1 {
+                return Progress::Arrived;
+            }
+            self.stops.remove(0);
+            self.passed += 1;
+            self.section_start = section_end;
+            self.deviation.reset();
+            self.off_route = false;
+            return Progress::StopReached;
         }
         if self.deviation.sample(route, at) {
             self.off_route = true;
         }
-        false
+        Progress::Travelling
     }
 
     /// Where to head right now, in degrees: towards the route a little further on, so the arrow leans into a bend before
@@ -777,14 +1160,14 @@ impl Navigator {
         let mut bearing = None;
         for leg in &route.legs {
             let left = (walked + leg.length - self.along.max(walked)).max(0.0);
-            seconds += left / speeds.of(leg.mode);
+            seconds += left / speeds.of(leg.mode) * leg.effort;
             if bearing.is_none()
                 && leg.kind == LegKind::Direct
                 && self.along >= walked
                 && self.along < walked + leg.length
-                && let Some(end) = leg.points.last()
+                && let Some(next) = next_bend(leg, self.along - walked)
             {
-                bearing = Some(heading(at, *end));
+                bearing = Some(heading(at, next));
             }
             walked += leg.length;
         }
@@ -795,8 +1178,21 @@ impl Navigator {
             remaining: (route.length - self.along).max(0.0),
             seconds,
             bearing,
+            stops_left: self.stops.len(),
         })
     }
+}
+
+/// The first bend of a leg past `along` blocks into it, so the bearing shown is the one to hold now.
+fn next_bend(leg: &Leg, along: f64) -> Option<Point> {
+    let mut walked = 0.0;
+    for pair in leg.points.windows(2) {
+        walked += pair[0].distance(pair[1]);
+        if walked > along + 1.0 {
+            return Some(pair[1]);
+        }
+    }
+    leg.points.last().copied()
 }
 
 #[cfg(test)]
@@ -820,7 +1216,7 @@ mod navigator_tests {
 
     fn following() -> Navigator {
         let mut navigator = Navigator::default();
-        navigator.set_route(p(100.0, 100.0), corner());
+        navigator.set_route(vec![p(100.0, 100.0)], corner());
         navigator
     }
 
@@ -841,12 +1237,104 @@ mod navigator_tests {
 
     #[test]
     fn the_text_is_in_the_players_language() {
-        let guidance =
-            Guidance { turn: Some(Turn::Left), to_turn: 120.0, remaining: 1400.0, seconds: 180.0, bearing: None };
+        let guidance = Guidance {
+            turn: Some(Turn::Left),
+            to_turn: 120.0,
+            remaining: 1400.0,
+            seconds: 180.0,
+            bearing: None,
+            stops_left: 1,
+        };
         assert_eq!(guidance.describe(true), "Через 120 м: налево  |  1,4 км, 3 мин");
         assert_eq!(guidance.describe(false), "In 120 m: turn left  |  1.4 km, 3 min");
         let direct = Guidance { bearing: Some(40.0), ..guidance };
         assert!(direct.describe(true).starts_with("Курс 40"));
+        let more = Guidance { stops_left: 3, ..guidance };
+        assert_eq!(more.describe(true), "Через 120 м: налево  |  1,4 км, 3 мин  |  остановок: 3");
+    }
+
+    /// Out along a straight road to a stop and back over the same road to one near the start.
+    fn out_and_back() -> (Vec<Point>, Route) {
+        let mut graph = Graph::new();
+        let a = graph.add_node(0.0, 0.0, false);
+        let b = graph.add_node(200.0, 0.0, false);
+        graph.add_line(a, b, Mode::Walk, false).unwrap();
+        let stops = vec![p(200.0, 0.0), p(0.0, 0.0)];
+        let route = graph.route(&[p(0.0, 0.0), stops[0], stops[1]], &[Mode::Walk], &Speeds::default()).unwrap();
+        (stops, route)
+    }
+
+    #[test]
+    fn a_stop_on_the_way_is_passed_and_the_route_goes_on() {
+        let (stops, route) = out_and_back();
+        let mut navigator = Navigator::default();
+        navigator.set_route(stops, route);
+        assert_eq!(navigator.sample(p(100.0, 0.0), 1000), Progress::Travelling);
+        assert_eq!(navigator.guidance().unwrap().stops_left, 2);
+        assert_eq!(navigator.next_stop(), Some(p(200.0, 0.0)));
+        assert_eq!(navigator.sample(p(198.0, 0.0), 2000), Progress::StopReached);
+        assert_eq!(navigator.next_stop(), Some(p(0.0, 0.0)));
+        assert_eq!(navigator.guidance().unwrap().stops_left, 1);
+        assert_eq!(navigator.sample(p(3.0, 0.0), 3000), Progress::Arrived);
+    }
+
+    #[test]
+    fn coming_back_over_the_same_road_counts_as_progress() {
+        let (stops, route) = out_and_back();
+        let mut navigator = Navigator::default();
+        navigator.set_route(stops, route);
+        navigator.sample(p(198.0, 0.0), 1000);
+        navigator.sample(p(150.0, 0.0), 2000);
+        let left = navigator.guidance().unwrap().remaining;
+        assert!((left - 150.0).abs() < 1e-6, "{left}: the second pass, not the first");
+    }
+
+    #[test]
+    fn the_stops_can_be_read_back_to_build_a_new_route() {
+        let (stops, route) = out_and_back();
+        let mut navigator = Navigator::default();
+        navigator.set_route(stops.clone(), route);
+        assert_eq!(navigator.stops(), stops);
+        navigator.sample(p(198.0, 0.0), 1000);
+        assert_eq!(navigator.stops(), [stops[1]], "only what is still ahead");
+        assert_eq!(navigator.destination(), Some(stops[1]));
+    }
+
+    #[test]
+    fn a_harder_walk_takes_longer_in_the_estimate() {
+        let leg = Leg {
+            mode: Mode::Walk,
+            kind: LegKind::Direct,
+            points: vec![p(0.0, 0.0), p(100.0, 0.0)],
+            length: 100.0,
+            seconds: 0.0,
+            effort: 2.0,
+        };
+        let route = Route { legs: vec![leg], length: 100.0, seconds: 0.0, stop_ends: vec![100.0] };
+        let mut navigator = Navigator::default();
+        navigator.set_route(vec![p(100.0, 0.0)], route);
+        navigator.sample(p(0.0, 0.0), 1000);
+        let seconds = navigator.guidance().unwrap().seconds;
+        assert!((seconds - 100.0 / Speeds::default().walk * 2.0).abs() < 1e-6, "{seconds}");
+    }
+
+    #[test]
+    fn the_bearing_on_a_bent_walk_is_to_the_next_bend_not_the_end() {
+        let leg = Leg {
+            mode: Mode::Walk,
+            kind: LegKind::Direct,
+            points: vec![p(0.0, 0.0), p(100.0, 0.0), p(100.0, 100.0)],
+            length: 200.0,
+            seconds: 0.0,
+            effort: 1.0,
+        };
+        let route = Route { legs: vec![leg], length: 200.0, seconds: 0.0, stop_ends: vec![200.0] };
+        let mut navigator = Navigator::default();
+        navigator.set_route(vec![p(100.0, 100.0)], route);
+        navigator.sample(p(10.0, 0.0), 1000);
+        assert!((navigator.guidance().unwrap().bearing.unwrap() - 90.0).abs() < 1e-6);
+        navigator.sample(p(100.0, 10.0), 2000);
+        assert!((navigator.guidance().unwrap().bearing.unwrap() - 180.0).abs() < 1e-6);
     }
 
     #[test]
@@ -872,8 +1360,8 @@ mod navigator_tests {
     #[test]
     fn arriving_ends_the_route() {
         let mut navigator = following();
-        assert!(!navigator.sample(p(100.0, 50.0), 1000));
-        assert!(navigator.sample(p(100.0, 97.0), 2000));
+        assert_eq!(navigator.sample(p(100.0, 50.0), 1000), Progress::Travelling);
+        assert_eq!(navigator.sample(p(100.0, 97.0), 2000), Progress::Arrived);
     }
 
     #[test]
@@ -920,6 +1408,193 @@ mod navigator_tests {
         navigator.clear();
         assert!(navigator.route().is_none() && navigator.guidance().is_none());
         assert_eq!(navigator.speeds().walk, learned);
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    use super::*;
+
+    fn p(x: f64, z: f64) -> Point {
+        Point { x, z }
+    }
+
+    fn walk(a: Point, b: Point, terrain: &dyn Terrain) -> Leg {
+        walk_leg(a, b, terrain, &Speeds::default())
+    }
+
+    /// This ground wherever the function says, land everywhere else.
+    struct Shape<F: Fn(Point) -> bool>(Ground, F);
+
+    impl<F: Fn(Point) -> bool> Terrain for Shape<F> {
+        fn ground(&self, at: Point) -> Ground {
+            if (self.1)(at) { self.0 } else { Ground::Land }
+        }
+    }
+
+    fn blocked_length(points: &[Point], terrain: &dyn Terrain) -> f64 {
+        let mut blocked = 0.0;
+        for pair in points.windows(2) {
+            along_line(pair[0], pair[1], terrain, |ground, piece| {
+                if ground.in_the_way() {
+                    blocked += piece;
+                }
+            });
+        }
+        blocked
+    }
+
+    #[test]
+    fn open_ground_stays_a_straight_line() {
+        let leg = walk(p(0.0, 0.0), p(1000.0, 400.0), &Shape(Ground::Water, |_| false));
+        assert_eq!(leg.points, vec![p(0.0, 0.0), p(1000.0, 400.0)]);
+        assert!((leg.effort - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn what_the_map_has_not_shown_is_not_avoided() {
+        assert_eq!(walk(p(0.0, 0.0), p(1000.0, 0.0), &NoTerrain).points.len(), 2);
+    }
+
+    #[test]
+    fn a_lake_is_walked_around() {
+        let lake = Shape(Ground::Water, |at: Point| p(500.0, 0.0).distance(at) < 150.0);
+        let leg = walk(p(0.0, 0.0), p(1000.0, 0.0), &lake);
+        assert!(leg.points.len() > 2);
+        assert_eq!(blocked_length(&leg.points, &lake), 0.0, "{:?}", leg.points);
+        assert!(leg.length > 1000.0 && leg.length < 1200.0, "{}", leg.length);
+        assert_eq!((leg.points[0], *leg.points.last().unwrap()), (p(0.0, 0.0), p(1000.0, 0.0)));
+    }
+
+    #[test]
+    fn a_cliff_is_passed_at_its_gap() {
+        let cliff = Shape(Ground::Steep, |at: Point| (at.x - 500.0).abs() < 12.0 && (at.z < 100.0 || at.z > 240.0));
+        let leg = walk(p(0.0, 400.0), p(1000.0, 400.0), &cliff);
+        assert_eq!(blocked_length(&leg.points, &cliff), 0.0, "{:?}", leg.points);
+    }
+
+    #[test]
+    fn a_sea_too_wide_to_go_around_is_crossed_and_takes_longer() {
+        let sea = Shape(Ground::Water, |at: Point| at.x > 100.0 && at.x < 900.0);
+        let leg = walk(p(0.0, 0.0), p(1000.0, 0.0), &sea);
+        assert!(leg.effort > 1.5, "{}", leg.effort);
+        assert!((leg.seconds - leg.length * leg.effort / Speeds::default().walk).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_long_walk_has_few_bends_and_a_bounded_search() {
+        let lake = Shape(Ground::Water, |at: Point| p(15_000.0, 0.0).distance(at) < 3000.0);
+        let started = std::time::Instant::now();
+        let leg = walk(p(0.0, 0.0), p(30_000.0, 0.0), &lake);
+        assert!(leg.points.len() < 48, "{}", leg.points.len());
+        assert_eq!(blocked_length(&leg.points, &lake), 0.0);
+        assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_route_walks_around_on_its_way_and_marks_the_stop() {
+        let lake = Shape(Ground::Water, |at: Point| p(500.0, 0.0).distance(at) < 150.0);
+        let route =
+            Graph::new().route_over(&[p(0.0, 0.0), p(1000.0, 0.0)], &[Mode::Walk], &Speeds::default(), &lake).unwrap();
+        assert!(route.legs.iter().all(|leg| leg.kind == LegKind::Direct));
+        assert_eq!(blocked_length(&route.polyline(), &lake), 0.0);
+        assert!((route.stop_ends[0] - route.length).abs() < 1e-9);
+    }
+
+    fn tile(pixel: u8) -> Vec<u8> {
+        vec![pixel; TILE_PIXELS * TILE_PIXELS]
+    }
+
+    const GRASS: u8 = 2 | (8 << 4);
+    const WATER: u8 = 1 | (12 << 4);
+    const CLIFF: u8 = 5 | (14 << 4);
+
+    #[test]
+    fn tile_pixels_say_what_the_ground_is() {
+        assert_eq!(ground_of_tile_pixel(0), Ground::Unknown);
+        assert_eq!(ground_of_tile_pixel(GRASS), Ground::Land);
+        assert_eq!(ground_of_tile_pixel(WATER), Ground::Water);
+        assert_eq!(ground_of_tile_pixel(11 | (8 << 4)), Ground::Water, "lava");
+        assert_eq!(ground_of_tile_pixel(CLIFF), Ground::Steep, "lit stone");
+        assert_eq!(ground_of_tile_pixel(5), Ground::Steep, "stone in shadow");
+        assert_eq!(ground_of_tile_pixel(3 | (14 << 4)), Ground::Land, "a tree top is not a cliff");
+        assert_eq!(ground_of_tile_pixel(9), Ground::Land, "nor is a roof");
+    }
+
+    #[test]
+    fn a_thin_cliff_marks_its_cell_and_a_puddle_does_not() {
+        let mut pixels = tile(GRASS);
+        for z in 0..16 {
+            pixels[z * TILE_PIXELS + 3] = CLIFF; // One block wide, through the first cell.
+            pixels[z * TILE_PIXELS + 20] = WATER; // One block of water through the second.
+        }
+        let mut map = TerrainMap::default();
+        map.store(0, 0, 0, &pixels);
+        assert_eq!(map.ground(p(5.0, 5.0)), Ground::Steep);
+        assert_eq!(map.ground(p(21.0, 5.0)), Ground::Land);
+        assert_eq!(map.ground(p(40.0, 40.0)), Ground::Land);
+    }
+
+    #[test]
+    fn the_finest_tile_wins_and_a_coarse_one_fills_the_gaps() {
+        let mut map = TerrainMap::default();
+        map.store(2, 0, 0, &tile(WATER));
+        assert_eq!(map.ground(p(10.0, 10.0)), Ground::Water);
+        map.store(0, 0, 0, &tile(GRASS));
+        assert_eq!(map.ground(p(10.0, 10.0)), Ground::Land);
+        assert_eq!(map.ground(p(600.0, 10.0)), Ground::Water, "level 0 does not reach this far");
+        assert_eq!(map.ground(p(-10.0, 10.0)), Ground::Unknown);
+    }
+
+    #[test]
+    fn negative_coordinates_land_in_the_right_cell() {
+        let mut pixels = tile(GRASS);
+        for z in 240..256 {
+            for x in 240..256 {
+                pixels[z * TILE_PIXELS + x] = WATER;
+            }
+        }
+        let mut map = TerrainMap::default();
+        map.store(0, -1, -1, &pixels);
+        assert_eq!(map.ground(p(-1.0, -1.0)), Ground::Water);
+        assert_eq!(map.ground(p(-100.0, -100.0)), Ground::Land);
+    }
+
+    #[test]
+    fn an_empty_tile_or_a_wrong_size_is_not_remembered() {
+        let mut map = TerrainMap::default();
+        map.store(0, 0, 0, &tile(0));
+        map.store(1, 0, 0, &[GRASS; 12]);
+        assert_eq!(map.tiles.len(), 0);
+    }
+
+    #[test]
+    fn the_map_forgets_the_oldest_tiles_and_a_tile_seen_again_is_not_counted_twice() {
+        let mut map = TerrainMap::default();
+        map.store(0, 0, 0, &tile(GRASS));
+        map.store(0, 0, 0, &tile(WATER));
+        assert_eq!((map.tiles.len(), map.order.len()), (1, 1));
+        assert_eq!(map.ground(p(1.0, 1.0)), Ground::Water, "the newer drawing replaces the old one");
+        let small = tile(GRASS);
+        for x in 1..=TERRAIN_MAX_TILES as i32 {
+            map.store(0, x, 0, &small);
+        }
+        assert_eq!(map.tiles.len(), TERRAIN_MAX_TILES);
+        assert_eq!(map.ground(p(1.0, 1.0)), Ground::Unknown);
+    }
+
+    #[test]
+    fn the_map_can_be_walked_around_like_any_other_terrain() {
+        let mut map = TerrainMap::default();
+        let mut lake = tile(GRASS);
+        for z in 96..160 {
+            for x in 96..160 {
+                lake[z * TILE_PIXELS + x] = WATER;
+            }
+        }
+        map.store(0, 0, 0, &lake);
+        let leg = walk(p(20.0, 128.0), p(236.0, 128.0), &map);
+        assert_eq!(blocked_length(&leg.points, &map), 0.0, "{:?}", leg.points);
     }
 }
 
@@ -1041,6 +1716,8 @@ mod tests {
         let stops = [p(0.0, 0.0), p(300.0, 0.0), p(100.0, 0.0)];
         let r = g.route(&stops, &[Mode::Walk], &Speeds::default()).unwrap();
         assert!((r.length - 500.0).abs() < 1e-9);
+        assert_eq!(r.stop_ends.len(), 2);
+        assert!((r.stop_ends[0] - 300.0).abs() < 1e-9 && (r.stop_ends[1] - 500.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1112,8 +1789,8 @@ mod tests {
     fn hints_name_the_turns() {
         // North, then east (a right turn), then north again (a left turn).
         let points = vec![p(0.0, 0.0), p(0.0, -100.0), p(100.0, -100.0), p(100.0, -200.0), p(100.0, -300.0)];
-        let leg = Leg { mode: Mode::Walk, kind: LegKind::Network, points, length: 400.0, seconds: 0.0 };
-        let route = Route { legs: vec![leg], length: 400.0, seconds: 0.0 };
+        let leg = Leg { mode: Mode::Walk, kind: LegKind::Network, points, length: 400.0, seconds: 0.0, effort: 1.0 };
+        let route = Route { legs: vec![leg], length: 400.0, seconds: 0.0, stop_ends: vec![400.0] };
         let hints = route.hints();
         assert_eq!(hints.iter().map(|h| h.turn).collect::<Vec<_>>(), vec![Turn::Right, Turn::Left]);
         assert_eq!(hints[0].after, 100.0);

@@ -134,6 +134,8 @@ pub fn router(core: Core, rate: RateLimit, positions: Arc<PositionStore>) -> Rou
         .route("/network/nodes", post(network::post_node))
         .route("/network/lines", post(network::post_line))
         .route("/network/lines/{id}/closed", put(network::put_line_closed))
+        .route("/network/history", get(network::get_history))
+        .route("/network/history/{seq}/revert", post(network::post_revert))
         .route("/route", post(network::post_route))
         .route_layer(middleware::from_fn_with_state(state.clone(), limit_client));
     Router::new()

@@ -9,3 +9,10 @@ license.workspace = true
 [lib]
 # This exact source is also injected into Horizon as the `vexmap_routing` module, see mods/vexmap/mixins/vexmap.
 path = "../../mods/vexmap/mixins/vexmap/routing.rs"
+
+[[bench]]
+name = "routing"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }

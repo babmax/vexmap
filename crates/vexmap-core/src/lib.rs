@@ -32,6 +32,13 @@ pub const MAX_ROUTE_COORDINATE: i64 = 30_000_000;
 
 /// The most journal rows one read returns.
 pub const MAX_JOURNAL_PAGE: i64 = 1000;
+/// The most entries of the network's history one read returns.
+pub const MAX_ROUTE_HISTORY_PAGE: i64 = 100;
+
+/// The newest change to the network. Removals count, or rolling back the last row would look like an older database.
+const ROUTE_VERSION_SQL: &str = "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
+     UNION ALL SELECT MAX(updated_seq) FROM route_lines \
+     UNION ALL SELECT MAX(updated_seq) FROM route_removed) AS versions";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -109,8 +116,8 @@ pub struct RouteNetwork {
     pub lines: Vec<RouteLine>,
 }
 
-/// What changed in the network after a version, oldest first, up to a page. Rows are never removed, so a client that
-/// applies these in order holds the whole network.
+/// What changed in the network after a version, oldest first, up to a page. A client that applies these in order holds
+/// the whole network. Rows come first and removals second: one id is never both in the same page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RouteChanges {
     /// The reader is up to date to this version once it has applied the rows.
@@ -119,6 +126,34 @@ pub struct RouteChanges {
     pub latest: i64,
     pub nodes: Vec<RouteNode>,
     pub lines: Vec<RouteLine>,
+    pub removed_nodes: Vec<i64>,
+    pub removed_lines: Vec<i64>,
+}
+
+/// One edit of the network, as the history screen shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteHistoryEntry {
+    pub seq: i64,
+    pub at_ms: i64,
+    /// `player:…` or `system:…`, as in the journal.
+    pub actor: String,
+    /// The player's name when it is known.
+    pub actor_name: Option<String>,
+    pub kind: String,
+    pub object_id: i64,
+    /// For a line closed or opened: which of the two.
+    pub closed: Option<bool>,
+    /// A block on or next to the object, when one can still be found.
+    pub place: Option<(i64, i64)>,
+    /// The edit no longer stands: it was rolled back, or changed again since.
+    pub undone: bool,
+}
+
+/// Newest first. `more` says there is an older page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteHistory {
+    pub entries: Vec<RouteHistoryEntry>,
+    pub more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -383,23 +418,13 @@ impl Core {
 
     /// The newest change to the network, 0 when it is empty. Cheap, so a cache can ask before rebuilding.
     pub async fn route_network_version(&self) -> Result<i64, CoreError> {
-        Ok(sqlx::query_scalar(
-            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
-             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
-        )
-        .fetch_one(&self.pool)
-        .await?)
+        Ok(sqlx::query_scalar(ROUTE_VERSION_SQL).fetch_one(&self.pool).await?)
     }
 
     /// The network as of one snapshot, nodes and lines ordered by id.
     pub async fn route_network(&self) -> Result<RouteNetwork, CoreError> {
         let mut tx = self.pool.begin().await?;
-        let version: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
-             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let version: i64 = sqlx::query_scalar(ROUTE_VERSION_SQL).fetch_one(&mut *tx).await?;
         let node_rows =
             sqlx::query("SELECT id, x, z, transfer FROM route_nodes ORDER BY id").fetch_all(&mut *tx).await?;
         let line_rows = sqlx::query("SELECT id, a, b, mode, one_way, closed FROM route_lines ORDER BY id")
@@ -416,12 +441,7 @@ impl Core {
     pub async fn route_network_changes(&self, since: i64, limit: usize) -> Result<RouteChanges, CoreError> {
         let limit = limit.max(1);
         let mut tx = self.pool.begin().await?;
-        let latest: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(v), 0) FROM (SELECT MAX(updated_seq) AS v FROM route_nodes \
-             UNION ALL SELECT MAX(updated_seq) FROM route_lines) AS versions",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let latest: i64 = sqlx::query_scalar(ROUTE_VERSION_SQL).fetch_one(&mut *tx).await?;
         let node_rows = sqlx::query(
             "SELECT id, x, z, transfer, updated_seq FROM route_nodes WHERE updated_seq > $1 ORDER BY updated_seq LIMIT $2",
         )
@@ -437,14 +457,24 @@ impl Core {
         .bind(limit as i64)
         .fetch_all(&mut *tx)
         .await?;
+        let removed_rows = sqlx::query(
+            "SELECT object_type, id, updated_seq FROM route_removed WHERE updated_seq > $1 ORDER BY updated_seq LIMIT $2",
+        )
+        .bind(since)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await?;
         tx.rollback().await?;
 
-        let mut seqs = Vec::with_capacity(node_rows.len() + line_rows.len());
+        let mut seqs = Vec::with_capacity(node_rows.len() + line_rows.len() + removed_rows.len());
         for row in &node_rows {
             seqs.push(row.try_get::<i64, _>(4)?);
         }
         for row in &line_rows {
             seqs.push(row.try_get::<i64, _>(6)?);
+        }
+        for row in &removed_rows {
+            seqs.push(row.try_get::<i64, _>(2)?);
         }
         seqs.sort_unstable();
         // Each list is complete up to its own last row, so both are complete up to the page's last seq.
@@ -461,7 +491,95 @@ impl Core {
                 lines.push(route_line(row)?);
             }
         }
-        Ok(RouteChanges { to, latest, nodes, lines })
+        let (mut removed_nodes, mut removed_lines) = (Vec::new(), Vec::new());
+        for row in &removed_rows {
+            if row.try_get::<i64, _>(2)? <= to {
+                let id = row.try_get::<i64, _>(1)?;
+                match row.try_get::<&str, _>(0)? {
+                    ROUTE_NODE => removed_nodes.push(id),
+                    _ => removed_lines.push(id),
+                }
+            }
+        }
+        Ok(RouteChanges { to, latest, nodes, lines, removed_nodes, removed_lines })
+    }
+
+    /// The edits of the network older than `before`, newest first (0 starts from the newest), at most `limit`.
+    pub async fn route_history(&self, before: i64, limit: i64) -> Result<RouteHistory, CoreError> {
+        let before = if before <= 0 { i64::MAX } else { before };
+        let limit = limit.clamp(1, MAX_ROUTE_HISTORY_PAGE);
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT seq, at_ms, actor, kind, object_id, before_json, after_json FROM journal \
+             WHERE seq < $1 AND kind LIKE 'route.%' ORDER BY seq DESC LIMIT $2",
+        )
+        .bind(before)
+        .bind(limit + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+        let more = rows.len() as i64 > limit;
+        let mut names: HashMap<String, Option<String>> = HashMap::new();
+        let mut entries = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.iter().take(limit as usize) {
+            let actor: String = row.try_get(2)?;
+            if !names.contains_key(&actor) {
+                let name = player_name(&mut tx, &actor).await?;
+                names.insert(actor.clone(), name);
+            }
+            let kind: String = row.try_get(3)?;
+            let object_id = parse_object_id(row.try_get(4)?)?;
+            let before_json = parse_json(row.try_get(5)?)?;
+            let after_json = parse_json(row.try_get(6)?)?;
+            let closed = after_json.as_ref().and_then(|value| value["closed"].as_bool());
+            let (place, undone) =
+                route_edit_state(&mut tx, &kind, object_id, before_json.as_ref(), after_json.as_ref()).await?;
+            entries.push(RouteHistoryEntry {
+                seq: row.try_get(0)?,
+                at_ms: row.try_get(1)?,
+                actor_name: names.get(&actor).cloned().flatten(),
+                actor,
+                kind,
+                object_id,
+                closed,
+                place,
+                undone,
+            });
+        }
+        tx.rollback().await?;
+        Ok(RouteHistory { entries, more })
+    }
+
+    /// Undoes one edit of the network. The undoing is an edit of its own, journaled and undoable in turn, so nothing is
+    /// ever lost by a misclick. A node that still has lines stays until those are rolled back.
+    pub async fn revert_route_edit(&self, ctx: &CommandContext, target: i64) -> Result<Outcome, CoreError> {
+        let (mut tx, seq) = match self.begin_write(ctx).await? {
+            Write::Open { tx, seq } => (tx, seq),
+            Write::Replayed(seq) => return Ok(Outcome::Replayed { seq }),
+        };
+        access::check_edit_network(actor_role(&mut tx, &ctx.actor).await?)?;
+        let row = sqlx::query("SELECT kind, object_id, before_json FROM journal WHERE seq = $1")
+            .bind(target)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let Some(row) = row else { return Err(CoreError::Invalid(format!("no journal entry {target}"))) };
+        let kind: String = row.try_get(0)?;
+        if !kind.starts_with("route.") {
+            return Err(CoreError::Invalid("only edits of the route network can be rolled back here".into()));
+        }
+        let id = parse_object_id(row.try_get(1)?)?;
+        let before = parse_json(row.try_get(2)?)?;
+        match kind.as_str() {
+            "route.node_added" | "route.node_restored" => remove_route_node(tx, ctx, seq, target, id).await,
+            "route.line_added" | "route.line_restored" => remove_route_line(tx, ctx, seq, target, id).await,
+            "route.line_closed_changed" => {
+                let closed = before.as_ref().and_then(|value| value["closed"].as_bool());
+                let Some(closed) = closed else { return Err(CoreError::Corrupt(format!("journal entry {target}"))) };
+                restore_line_closed(tx, ctx, seq, target, id, closed).await
+            }
+            "route.node_removed" => restore_route_node(tx, ctx, seq, target, id, before).await,
+            "route.line_removed" => restore_route_line(tx, ctx, seq, target, id, before).await,
+            _ => Err(CoreError::Invalid("only edits of the route network can be rolled back here".into())),
+        }
     }
 
     /// Whether this player's role allows drawing the network. The commands check again, this is for showing the editor.
@@ -662,6 +780,305 @@ fn route_line(row: &sqlx::any::AnyRow) -> Result<RouteLine, CoreError> {
         one_way: row.try_get::<i64, _>(4)? != 0,
         closed: row.try_get::<i64, _>(5)? != 0,
     })
+}
+
+const ROUTE_NODE: &str = "route_node";
+const ROUTE_LINE: &str = "route_line";
+
+fn parse_object_id(text: String) -> Result<i64, CoreError> {
+    text.parse().map_err(|_| CoreError::Corrupt(format!("object id {text:?}")))
+}
+
+async fn player_name(tx: &mut Tx, actor: &str) -> Result<Option<String>, CoreError> {
+    let Some(id) = actor.strip_prefix("player:") else { return Ok(None) };
+    let name: Option<Option<String>> =
+        sqlx::query_scalar("SELECT name FROM players WHERE id = $1").bind(id).fetch_optional(&mut **tx).await?;
+    Ok(name.flatten())
+}
+
+async fn load_route_node(tx: &mut Tx, id: i64) -> Result<Option<RouteNode>, CoreError> {
+    let row = sqlx::query("SELECT id, x, z, transfer FROM route_nodes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.as_ref().map(route_node).transpose()
+}
+
+async fn load_route_line(tx: &mut Tx, id: i64) -> Result<Option<RouteLine>, CoreError> {
+    let row = sqlx::query("SELECT id, a, b, mode, one_way, closed FROM route_lines WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.as_ref().map(route_line).transpose()
+}
+
+async fn node_place(tx: &mut Tx, id: i64) -> Result<Option<(i64, i64)>, CoreError> {
+    Ok(load_route_node(tx, id).await?.map(|node| (node.x, node.z)))
+}
+
+/// Where an edit happened, and whether it no longer stands. The journal holds what a removed row looked like.
+async fn route_edit_state(
+    tx: &mut Tx,
+    kind: &str,
+    id: i64,
+    before: Option<&Value>,
+    after: Option<&Value>,
+) -> Result<(Option<(i64, i64)>, bool), CoreError> {
+    let saved_place = |value: Option<&Value>| Some((value?["x"].as_i64()?, value?["z"].as_i64()?));
+    let saved_end = |value: Option<&Value>| value.and_then(|value| value["a"].as_i64());
+    Ok(match kind {
+        "route.node_added" | "route.node_restored" => {
+            let place = node_place(tx, id).await?;
+            (place.or_else(|| saved_place(after)), place.is_none())
+        }
+        "route.node_removed" => {
+            let place = node_place(tx, id).await?;
+            (place.or_else(|| saved_place(before)), place.is_some())
+        }
+        "route.line_added" | "route.line_restored" => {
+            let line = load_route_line(tx, id).await?;
+            let end = line.as_ref().map(|line| line.a).or_else(|| saved_end(after));
+            let place = if let Some(end) = end { node_place(tx, end).await? } else { None };
+            (place, line.is_none())
+        }
+        "route.line_removed" => {
+            let line = load_route_line(tx, id).await?;
+            let end = line.as_ref().map(|line| line.a).or_else(|| saved_end(before));
+            let place = if let Some(end) = end { node_place(tx, end).await? } else { None };
+            (place, line.is_some())
+        }
+        "route.line_closed_changed" => {
+            let line = load_route_line(tx, id).await?;
+            let wanted = after.and_then(|value| value["closed"].as_bool());
+            let place = if let Some(line) = &line { node_place(tx, line.a).await? } else { None };
+            (place, line.is_none_or(|line| Some(line.closed) != wanted))
+        }
+        _ => (None, false),
+    })
+}
+
+/// Remembers that a row is gone, for the clients that hold a copy of it.
+async fn mark_removed(tx: &mut Tx, object_type: &str, id: i64, seq: i64) -> Result<(), CoreError> {
+    sqlx::query(
+        "INSERT INTO route_removed (object_type, id, updated_seq) VALUES ($1, $2, $3) \
+         ON CONFLICT (object_type, id) DO UPDATE SET updated_seq = excluded.updated_seq",
+    )
+    .bind(object_type)
+    .bind(id)
+    .bind(seq)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn clear_removed(tx: &mut Tx, object_type: &str, id: i64) -> Result<(), CoreError> {
+    sqlx::query("DELETE FROM route_removed WHERE object_type = $1 AND id = $2")
+        .bind(object_type)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn remove_route_node(
+    mut tx: Box<Tx>,
+    ctx: &CommandContext,
+    seq: i64,
+    target: i64,
+    id: i64,
+) -> Result<Outcome, CoreError> {
+    let Some(node) = load_route_node(&mut tx, id).await? else {
+        tx.rollback().await?;
+        return Ok(Outcome::Unchanged);
+    };
+    let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_lines WHERE a = $1 OR b = $1")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if lines > 0 {
+        return Err(CoreError::Invalid("this node still has lines: roll those back first".into()));
+    }
+    sqlx::query("DELETE FROM route_nodes WHERE id = $1").bind(id).execute(&mut **tx).await?;
+    mark_removed(&mut tx, ROUTE_NODE, id, seq).await?;
+    let object_id = id.to_string();
+    let change = Change {
+        kind: "route.node_removed",
+        object_type: ROUTE_NODE,
+        object_id: &object_id,
+        before: Some(json!({ "x": node.x, "z": node.z, "transfer": node.transfer })),
+        after: json!({ "removed": true, "reverts": target }),
+    };
+    finish(tx, ctx, seq, change).await
+}
+
+async fn remove_route_line(
+    mut tx: Box<Tx>,
+    ctx: &CommandContext,
+    seq: i64,
+    target: i64,
+    id: i64,
+) -> Result<Outcome, CoreError> {
+    let Some(line) = load_route_line(&mut tx, id).await? else {
+        tx.rollback().await?;
+        return Ok(Outcome::Unchanged);
+    };
+    sqlx::query("DELETE FROM route_lines WHERE id = $1").bind(id).execute(&mut **tx).await?;
+    mark_removed(&mut tx, ROUTE_LINE, id, seq).await?;
+    let object_id = id.to_string();
+    let change = Change {
+        kind: "route.line_removed",
+        object_type: ROUTE_LINE,
+        object_id: &object_id,
+        before: Some(json!({
+            "a": line.a, "b": line.b, "mode": line.mode, "one_way": line.one_way, "closed": line.closed
+        })),
+        after: json!({ "removed": true, "reverts": target }),
+    };
+    finish(tx, ctx, seq, change).await
+}
+
+async fn restore_line_closed(
+    mut tx: Box<Tx>,
+    ctx: &CommandContext,
+    seq: i64,
+    target: i64,
+    id: i64,
+    closed: bool,
+) -> Result<Outcome, CoreError> {
+    let Some(line) = load_route_line(&mut tx, id).await? else {
+        return Err(CoreError::Invalid(format!("no line {id}")));
+    };
+    if line.closed == closed {
+        tx.rollback().await?;
+        return Ok(Outcome::Unchanged);
+    }
+    sqlx::query("UPDATE route_lines SET closed = $1, updated_seq = $2 WHERE id = $3")
+        .bind(i64::from(closed))
+        .bind(seq)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    let object_id = id.to_string();
+    let change = Change {
+        kind: "route.line_closed_changed",
+        object_type: ROUTE_LINE,
+        object_id: &object_id,
+        before: Some(json!({ "closed": line.closed })),
+        after: json!({ "closed": closed, "reverts": target }),
+    };
+    finish(tx, ctx, seq, change).await
+}
+
+async fn restore_route_node(
+    mut tx: Box<Tx>,
+    ctx: &CommandContext,
+    seq: i64,
+    target: i64,
+    id: i64,
+    saved: Option<Value>,
+) -> Result<Outcome, CoreError> {
+    if load_route_node(&mut tx, id).await?.is_some() {
+        tx.rollback().await?;
+        return Ok(Outcome::Unchanged);
+    }
+    let corrupt = || CoreError::Corrupt(format!("journal entry {target}"));
+    let saved = saved.ok_or_else(corrupt)?;
+    let x = saved["x"].as_i64().ok_or_else(corrupt)?;
+    let z = saved["z"].as_i64().ok_or_else(corrupt)?;
+    let transfer = saved["transfer"].as_bool().ok_or_else(corrupt)?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_nodes").fetch_one(&mut **tx).await?;
+    if count >= MAX_ROUTE_NODES {
+        return Err(CoreError::Invalid("the network has the most nodes it may".into()));
+    }
+    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM route_nodes WHERE x = $1 AND z = $2")
+        .bind(x)
+        .bind(z)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if taken.is_some() {
+        return Err(CoreError::Invalid("another node stands at this block now".into()));
+    }
+    sqlx::query("INSERT INTO route_nodes (id, x, z, transfer, updated_seq) VALUES ($1, $2, $3, $4, $5)")
+        .bind(id)
+        .bind(x)
+        .bind(z)
+        .bind(i64::from(transfer))
+        .bind(seq)
+        .execute(&mut **tx)
+        .await?;
+    clear_removed(&mut tx, ROUTE_NODE, id).await?;
+    let object_id = id.to_string();
+    let change = Change {
+        kind: "route.node_restored",
+        object_type: ROUTE_NODE,
+        object_id: &object_id,
+        before: None,
+        after: json!({ "x": x, "z": z, "transfer": transfer, "reverts": target }),
+    };
+    finish(tx, ctx, seq, change).await
+}
+
+async fn restore_route_line(
+    mut tx: Box<Tx>,
+    ctx: &CommandContext,
+    seq: i64,
+    target: i64,
+    id: i64,
+    saved: Option<Value>,
+) -> Result<Outcome, CoreError> {
+    if load_route_line(&mut tx, id).await?.is_some() {
+        tx.rollback().await?;
+        return Ok(Outcome::Unchanged);
+    }
+    let corrupt = || CoreError::Corrupt(format!("journal entry {target}"));
+    let saved = saved.ok_or_else(corrupt)?;
+    let a = saved["a"].as_i64().ok_or_else(corrupt)?;
+    let b = saved["b"].as_i64().ok_or_else(corrupt)?;
+    let mode = saved["mode"].as_str().and_then(RouteMode::parse).ok_or_else(corrupt)?;
+    let one_way = saved["one_way"].as_bool().ok_or_else(corrupt)?;
+    let closed = saved["closed"].as_bool().ok_or_else(corrupt)?;
+    for node in [a, b] {
+        if load_route_node(&mut tx, node).await?.is_none() {
+            return Err(CoreError::Invalid(format!("node {node} of this line is gone: restore it first")));
+        }
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_lines").fetch_one(&mut **tx).await?;
+    if count >= MAX_ROUTE_LINES {
+        return Err(CoreError::Invalid("the network has the most lines it may".into()));
+    }
+    let twin: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM route_lines WHERE mode = $1 AND ((a = $2 AND b = $3) OR (a = $3 AND b = $2))",
+    )
+    .bind(mode.as_str())
+    .bind(a)
+    .bind(b)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if twin.is_some() {
+        return Err(CoreError::Invalid("these nodes have a line of this mode again".into()));
+    }
+    sqlx::query(
+        "INSERT INTO route_lines (id, a, b, mode, one_way, closed, updated_seq) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(a)
+    .bind(b)
+    .bind(mode.as_str())
+    .bind(i64::from(one_way))
+    .bind(i64::from(closed))
+    .bind(seq)
+    .execute(&mut **tx)
+    .await?;
+    clear_removed(&mut tx, ROUTE_LINE, id).await?;
+    let object_id = id.to_string();
+    let change = Change {
+        kind: "route.line_restored",
+        object_type: ROUTE_LINE,
+        object_id: &object_id,
+        before: None,
+        after: json!({ "a": a, "b": b, "mode": mode, "one_way": one_way, "closed": closed, "reverts": target }),
+    };
+    finish(tx, ctx, seq, change).await
 }
 
 /// `None` for a local mod. A player unknown to the database has no powers.

@@ -56,6 +56,8 @@ const MAX_TILE_BYTES_PER_TICK: usize = 150 * 1024;
 const MIN_TILE_REQUEST_GAP_MS: u64 = 100;
 /// A client walks the network page by page, so this also bounds how fast one player can make the sidecar read.
 const MIN_NETWORK_REQUEST_GAP_MS: u64 = 100;
+/// Someone paging through the history by hand.
+const MIN_HISTORY_REQUEST_GAP_MS: u64 = 250;
 const DISC_EVERY_MS: u64 = 10_000;
 /// Past this a border is the vanilla "no border": the map uses `VEXMAP_MAP_RADIUS` instead.
 const NO_BORDER_HALF_SIZE: f64 = 1_000_000.0;
@@ -106,6 +108,7 @@ struct Server {
     tile_out: Vec<link::Delivery>,
     next_tile_request: HashMap<u128, u64>,
     next_network_request: HashMap<u128, u64>,
+    next_history_request: HashMap<u128, u64>,
     /// Per player: when the current second began and how many edits it has seen.
     edit_limits: HashMap<u128, (u64, u32)>,
     edit_answers: Vec<link::EditDone>,
@@ -179,6 +182,7 @@ fn with_server<R>(f: impl FnOnce(&mut Server) -> R) -> Option<R> {
             tile_out: Vec::new(),
             next_tile_request: HashMap::new(),
             next_network_request: HashMap::new(),
+            next_history_request: HashMap::new(),
             edit_limits: HashMap::new(),
             edit_answers: Vec::new(),
             next_disc_ms: 0,
@@ -350,6 +354,7 @@ fn network_edit(server: &mut Server, player: u128, token: u32, edit: proto::Netw
             link::LinkEdit::AddLine { a, b, mode: mode.name(), one_way }
         }
         proto::NetworkEdit::SetClosed { line, closed } => link::LinkEdit::SetClosed { line, closed },
+        proto::NetworkEdit::Revert { seq } => link::LinkEdit::Revert { seq },
     };
     if !EDITS.push(link::EditJob { player, token, edit }) {
         // A full queue is told as "unavailable" on the next tick, through the same path as a dead sidecar.
@@ -438,7 +443,21 @@ fn forward_network_want(server: &mut Server, player: u128, since: u64, render: b
         return;
     }
     *next = now + MIN_NETWORK_REQUEST_GAP_MS;
-    NETWORK_WANTS.try_push(link::NetworkWant { viewer: player, since, render });
+    NETWORK_WANTS.try_push(link::NetworkWant { viewer: player, since, render, history: false });
+}
+
+/// A client pages through the network's history. The sidecar answers only those the database lets edit.
+fn forward_network_history(server: &mut Server, player: u128, before: u64, now: u64) {
+    let admitted = server.gate.features(player).is_some_and(|features| features & ROUTING != 0);
+    if !admitted || SERVER_FEATURES.load(Ordering::Relaxed) & ROUTING == 0 {
+        return;
+    }
+    let next = server.next_history_request.entry(player).or_insert(0);
+    if now < *next {
+        return;
+    }
+    *next = now + MIN_HISTORY_REQUEST_GAP_MS;
+    NETWORK_WANTS.try_push(link::NetworkWant { viewer: player, since: before, render: false, history: true });
 }
 
 /// Classifies some more block states. `true` once every state is known.
@@ -556,6 +575,7 @@ pub(super) fn player_logged_out(player: u128) {
     with_server(|server| {
         server.next_tile_request.remove(&player);
         server.next_network_request.remove(&player);
+        server.next_history_request.remove(&player);
         server.gate.leave(player);
         server.packs.leave(player);
         server.inbound.remove(&player);
@@ -677,6 +697,7 @@ pub(super) fn payload_from_client(game: &mut crate::game::Game<'_>, player: u128
             }
             proto::Message::NetworkEdit { token, edit } => network_edit(server, player, token, edit, now),
             proto::Message::NetworkWant { since, render } => forward_network_want(server, player, since, render, now),
+            proto::Message::NetworkHistoryWant { before } => forward_network_history(server, player, before, now),
             _ => {}
         }
     });
@@ -692,6 +713,8 @@ pub(super) struct Client {
     pub(super) workspace: editor::Workspace,
     pub(super) navigator: routing::Navigator,
     pub(super) route_search: Option<screen::RouteSearch>,
+    /// What the tiles seen so far say about the ground, for walks off the network.
+    pub(super) terrain: routing::TerrainMap,
     reported_markers: usize,
     pub(super) ui: ui::Ui,
     /// This player, from `Welcome`.
@@ -749,6 +772,7 @@ pub(super) fn with_client<R>(f: impl FnOnce(&mut Client) -> R) -> Option<R> {
             workspace: editor::Workspace::default(),
             navigator: routing::Navigator::default(),
             route_search: None,
+            terrain: Default::default(),
             reported_markers: 0,
             ui: ui::Ui::new(settings, offer_autotune),
             me: None,
@@ -786,7 +810,8 @@ fn report_network(client: &mut Client) {
     if !client.diagnostics {
         return;
     }
-    let seen = (client.workspace.network.len_nodes(), client.workspace.network.lines().len(), client.workspace.may_edit);
+    let seen =
+        (client.workspace.network.len_nodes(), client.workspace.network.lines().len(), client.workspace.may_edit);
     if client.reported_network != Some(seen) {
         client.reported_network = Some(seen);
         log(format_args!("network: nodes={} lines={} may_edit={}", seen.0, seen.1, seen.2));
@@ -853,7 +878,9 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
                 // Another server may have another network: its roads are not the ones this route follows.
                 client.navigator.clear();
                 client.route_search = None;
+                client.terrain = Default::default();
                 client.ui.route.clear();
+                client.ui.stops.clear();
                 client.ui.destination = None;
                 client.ui.banner = None;
                 log(format_args!("welcomed: protocol {protocol}, features {features:#x}"));
@@ -870,7 +897,10 @@ pub(super) fn client_packet(game: &mut crate::game::Game<'_>, packet: &horizon_c
                 screen::network_page(client, &page, now);
                 report_network(client);
             }
-            proto::Message::NetworkEditResult { token, status, id } => screen::edit_result(client, token, status, id, now),
+            proto::Message::NetworkEditResult { token, status, id } => {
+                screen::edit_result(client, token, status, id, now)
+            }
+            proto::Message::NetworkHistory(history) => screen::network_history(client, &history),
             proto::Message::Reject { reason } => log(format_args!("rejected: {reason}")),
             proto::Message::Ping(stamp) => {
                 send_to_server(game, &mut client.outbox, &proto::Message::Pong(stamp));

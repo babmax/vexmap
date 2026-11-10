@@ -171,6 +171,63 @@ async fn edits_reach_the_sidecar_as_the_player_and_the_database_decides() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_reaches_the_sidecar_as_the_player_and_the_history_is_for_editors_only() {
+    use vexmap_core::{Category, Outcome, Role, RouteMode};
+    use vexmap_link::{EditJob, EditQueue, LinkEdit, NetworkWant, start_edits};
+    use vexmap_proto::HistoryKind;
+    use vexmap_sidecar::network::history_for;
+
+    let (core, addr, _dir) = serve().await;
+    let system = |key: &str| CommandContext {
+        actor: Actor::System(ClientName::new("test").unwrap()),
+        region: RegionId::global(),
+        request_id: RequestId::new(key).unwrap(),
+    };
+    let (admin, nobody) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    core.set_role(&system("admin"), admin, Role::Admin, Default::default()).await.unwrap();
+    core.set_role(&system("mod"), nobody, Role::Moderator, [Category::Wiki].into()).await.unwrap();
+    core.record_player(&system("name"), admin, "Builder").await.unwrap();
+    let seq = |outcome| match outcome {
+        Outcome::Applied { seq } => seq,
+        other => panic!("{other:?}"),
+    };
+    let a = seq(core.add_route_node(&system("a"), 0, 0, false).await.unwrap());
+    let b = seq(core.add_route_node(&system("b"), 40, 0, false).await.unwrap());
+    let line = seq(core.add_route_line(&system("l"), a, b, RouteMode::Walk, false).await.unwrap());
+
+    let want =
+        |viewer: uuid::Uuid, since| NetworkWant { viewer: viewer.as_u128(), since, render: false, history: true };
+    assert_eq!(history_for(&core, want(nobody, 0)).await.unwrap(), None);
+    let history = history_for(&core, want(admin, 0)).await.unwrap().unwrap();
+    assert_eq!((history.before, history.more, history.entries[0].seq), (0, false, line as u64));
+    assert_eq!(history.entries[0].kind, HistoryKind::LineAdded);
+
+    let queue: &'static EditQueue = Box::leak(Box::new(EditQueue::new()));
+    start_edits(config(addr, "a"), queue).unwrap();
+    let job = |player: uuid::Uuid, token: u32| EditJob {
+        player: player.as_u128(),
+        token,
+        edit: LinkEdit::Revert { seq: line as u64 },
+    };
+    assert!(queue.push(job(nobody, 1)));
+    assert!(queue.push(job(admin, 2)));
+    let mut done = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done.len() < 2 && Instant::now() < deadline {
+        queue.take_done(&mut done);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    done.sort_by_key(|d| d.token);
+    assert_eq!((done[0].http, done[1].http), (403, 200), "{done:?}");
+    assert!(core.route_network().await.unwrap().lines.is_empty());
+
+    let history = history_for(&core, want(admin, 0)).await.unwrap().unwrap();
+    assert_eq!(history.entries[0].kind, HistoryKind::LineRemoved);
+    assert_eq!(history.entries[0].actor, "Builder");
+    assert!(history.entries[1].undone, "the line it took away");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_sidecar_is_reported_not_hung() {
     use vexmap_link::{EditJob, EditQueue, LinkEdit, start_edits};
     // A port nothing listens on: bind, note the port, drop.

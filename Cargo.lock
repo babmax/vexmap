@@ -2173,6 +2173,9 @@ dependencies = [
 [[package]]
 name = "vexmap-routing"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "vexmap-sidecar"

@@ -596,6 +596,8 @@ pub struct NetworkWant {
     pub since: u64,
     /// Also asks for the whole map to be drawn at full speed.
     pub render: bool,
+    /// This is a request for a page of the network's history instead, older than `since`.
+    pub history: bool,
 }
 
 const MAX_QUEUED_NETWORK_WANTS: usize = 512;
@@ -637,6 +639,7 @@ pub fn encode_network_wants(wants: &[NetworkWant], out: &mut Vec<u8>) {
         out.extend_from_slice(&want.viewer.to_le_bytes());
         out.extend_from_slice(&want.since.to_le_bytes());
         out.push(u8::from(want.render));
+        out.push(u8::from(want.history));
     }
     finish_message(out, start);
 }
@@ -658,6 +661,7 @@ pub fn decode_network_wants(body: &[u8]) -> Result<Vec<NetworkWant>, FeedError> 
             viewer: u128::from_le_bytes(reader.array()?),
             since: u64::from_le_bytes(reader.array()?),
             render: reader.u8()? != 0,
+            history: reader.u8()? != 0,
         });
     }
     reader.end()?;
@@ -1004,6 +1008,10 @@ pub enum LinkEdit {
         line: u64,
         closed: bool,
     },
+    /// Undoes the edit with this journal number.
+    Revert {
+        seq: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1092,6 +1100,9 @@ pub fn edit_request(player: u128, edit: &LinkEdit) -> (&'static str, String, Str
             format!("/v1/network/lines/{line}/closed"),
             format!("{{\"closed\":{closed},\"actor\":\"{actor}\"}}"),
         ),
+        LinkEdit::Revert { seq } => {
+            ("POST", format!("/v1/network/history/{seq}/revert"), format!("{{\"actor\":\"{actor}\"}}"))
+        }
     }
 }
 

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 pub const CHANNEL: &str = "vexmap:main";
-pub const PROTOCOL: u16 = 3;
+pub const PROTOCOL: u16 = 4;
 pub const FRAME_VERSION: u8 = 1;
 pub const MAGIC: [u8; 2] = *b"VM";
 pub const HEADER_LEN: usize = 12;
@@ -37,6 +37,9 @@ pub const MAX_ENCODED_TILE: usize = TILE_AREA + TILE_AREA / 64;
 /// The most nodes, and the most lines, one page of the route network carries. At 27 bytes a line this is about 170 KB
 /// with its nodes: one frame, and about what one server tick forwards.
 pub const MAX_NETWORK_PAGE: usize = 4096;
+/// Entries of the network's history on one screen.
+pub const MAX_HISTORY_PAGE: usize = 10;
+const MAX_HISTORY_ACTOR: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -58,6 +61,8 @@ pub enum Kind {
     NetworkEditResult = 16,
     NetworkWant = 17,
     NetworkPage = 18,
+    NetworkHistoryWant = 19,
+    NetworkHistory = 20,
 }
 
 impl Kind {
@@ -81,6 +86,8 @@ impl Kind {
             16 => Kind::NetworkEditResult,
             17 => Kind::NetworkWant,
             18 => Kind::NetworkPage,
+            19 => Kind::NetworkHistoryWant,
+            20 => Kind::NetworkHistory,
             _ => return None,
         })
     }
@@ -216,9 +223,64 @@ pub enum Message {
         /// Asks the sidecar to finish drawing the whole map at full speed. The sidecar checks the player may.
         render: bool,
     },
-    /// Server to client: the answer to `NetworkWant { since }`. Rows are created or changed, never removed, so applying
-    /// pages in order rebuilds the network. The client asks again from `to` while `to` is behind `latest`.
+    /// Server to client: the answer to `NetworkWant { since }`. Applying pages in order rebuilds the network. The client
+    /// asks again from `to` while `to` is behind `latest`.
     NetworkPage(NetworkPage),
+    /// Client to server: the edits of the network older than `before`, newest first, 0 from the newest.
+    NetworkHistoryWant {
+        before: u64,
+    },
+    /// Server to client: the answer, for a player allowed to edit. Others get nothing.
+    NetworkHistory(NetworkHistory),
+}
+
+/// A page of the network's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkHistory {
+    /// The `before` this answers, so a late copy of an old answer is recognised.
+    pub before: u64,
+    /// There is an older page.
+    pub more: bool,
+    pub entries: Vec<HistoryEntry>,
+}
+
+/// What an edit of the network did. The numbers are on the wire: never renumber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HistoryKind {
+    NodeAdded = 1,
+    LineAdded = 2,
+    LineClosed = 3,
+    LineOpened = 4,
+    NodeRemoved = 5,
+    LineRemoved = 6,
+}
+
+impl HistoryKind {
+    pub fn from_u8(value: u8) -> Option<HistoryKind> {
+        Some(match value {
+            1 => HistoryKind::NodeAdded,
+            2 => HistoryKind::LineAdded,
+            3 => HistoryKind::LineClosed,
+            4 => HistoryKind::LineOpened,
+            5 => HistoryKind::NodeRemoved,
+            6 => HistoryKind::LineRemoved,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub seq: u64,
+    /// Seconds ago, by the sidecar's clock, so the client's own clock does not matter.
+    pub age_seconds: u32,
+    /// The player's name, empty for a mod or a player never seen.
+    pub actor: String,
+    pub kind: HistoryKind,
+    pub object: u64,
+    pub place: Option<(i32, i32)>,
+    pub undone: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +300,9 @@ pub struct NetworkPage {
     pub rendering: bool,
     pub nodes: Vec<NetworkNode>,
     pub lines: Vec<NetworkLine>,
+    /// Rows rolled back since `since`. Applied after `nodes` and `lines`.
+    pub removed_nodes: Vec<u64>,
+    pub removed_lines: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +508,8 @@ impl Message {
             Message::NetworkEditResult { .. } => Kind::NetworkEditResult,
             Message::NetworkWant { .. } => Kind::NetworkWant,
             Message::NetworkPage(_) => Kind::NetworkPage,
+            Message::NetworkHistoryWant { .. } => Kind::NetworkHistoryWant,
+            Message::NetworkHistory(_) => Kind::NetworkHistory,
         }
     }
 
@@ -490,6 +557,8 @@ impl Message {
                 out.push(u8::from(*render));
             }
             Message::NetworkPage(page) => put_network_page(&mut out, page),
+            Message::NetworkHistoryWant { before } => out.extend_from_slice(&before.to_le_bytes()),
+            Message::NetworkHistory(history) => put_network_history(&mut out, history),
             Message::WorldDisc { dimension, center_x, center_z, radius } => {
                 put_short(&mut out, truncate_dimension(dimension));
                 out.extend_from_slice(&center_x.to_le_bytes());
@@ -574,6 +643,8 @@ impl Message {
             },
             Kind::NetworkWant => Message::NetworkWant { since: reader.u64()?, render: reader.flag()? },
             Kind::NetworkPage => Message::NetworkPage(reader.network_page()?),
+            Kind::NetworkHistoryWant => Message::NetworkHistoryWant { before: reader.u64()? },
+            Kind::NetworkHistory => Message::NetworkHistory(reader.network_history()?),
             Kind::WorldDisc => Message::WorldDisc {
                 dimension: reader.short(MAX_DIMENSION)?,
                 center_x: reader.u32()? as i32,
@@ -827,9 +898,25 @@ impl LineMode {
 /// An edit of the route network, as the editor makes it. Coordinates are blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkEdit {
-    AddNode { x: i32, z: i32, transfer: bool },
-    AddLine { a: u64, b: u64, mode: LineMode, one_way: bool },
-    SetClosed { line: u64, closed: bool },
+    AddNode {
+        x: i32,
+        z: i32,
+        transfer: bool,
+    },
+    AddLine {
+        a: u64,
+        b: u64,
+        mode: LineMode,
+        one_way: bool,
+    },
+    SetClosed {
+        line: u64,
+        closed: bool,
+    },
+    /// Undoes the edit with this journal number.
+    Revert {
+        seq: u64,
+    },
 }
 
 /// What became of a `NetworkEdit`.
@@ -888,6 +975,29 @@ fn put_edit(out: &mut Vec<u8>, edit: &NetworkEdit) {
             out.extend_from_slice(&line.to_le_bytes());
             out.push(u8::from(closed));
         }
+        NetworkEdit::Revert { seq } => {
+            out.push(4);
+            out.extend_from_slice(&seq.to_le_bytes());
+        }
+    }
+}
+
+fn put_network_history(out: &mut Vec<u8>, history: &NetworkHistory) {
+    out.extend_from_slice(&history.before.to_le_bytes());
+    out.push(u8::from(history.more));
+    let entries = &history.entries[..history.entries.len().min(MAX_HISTORY_PAGE)];
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.extend_from_slice(&entry.seq.to_le_bytes());
+        out.extend_from_slice(&entry.age_seconds.to_le_bytes());
+        put_str(out, &entry.actor, MAX_HISTORY_ACTOR);
+        out.push(entry.kind as u8);
+        out.extend_from_slice(&entry.object.to_le_bytes());
+        out.push(u8::from(entry.place.is_some()));
+        let (x, z) = entry.place.unwrap_or((0, 0));
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&z.to_le_bytes());
+        out.push(u8::from(entry.undone));
     }
 }
 
@@ -915,6 +1025,13 @@ fn put_network_page(out: &mut Vec<u8>, page: &NetworkPage) {
         out.push(line.mode as u8);
         out.push(u8::from(line.one_way));
         out.push(u8::from(line.closed));
+    }
+    for removed in [&page.removed_nodes, &page.removed_lines] {
+        let removed = &removed[..removed.len().min(MAX_NETWORK_PAGE)];
+        out.extend_from_slice(&(removed.len() as u16).to_le_bytes());
+        for id in removed {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
     }
 }
 
@@ -1062,6 +1179,7 @@ impl<'a> Reader<'a> {
                 one_way: self.flag()?,
             },
             3 => NetworkEdit::SetClosed { line: self.u64()?, closed: self.flag()? },
+            4 => NetworkEdit::Revert { seq: self.u64()? },
             _ => return Err(DecodeError::BadNumber),
         })
     }
@@ -1089,7 +1207,63 @@ impl<'a> Reader<'a> {
                 closed: self.flag()?,
             });
         }
-        Ok(NetworkPage { since, to, latest, may_edit, render_done, render_total, rendering, nodes, lines })
+        let removed_nodes = self.id_list()?;
+        let removed_lines = self.id_list()?;
+        Ok(NetworkPage {
+            since,
+            to,
+            latest,
+            may_edit,
+            render_done,
+            render_total,
+            rendering,
+            nodes,
+            lines,
+            removed_nodes,
+            removed_lines,
+        })
+    }
+
+    fn id_list(&mut self) -> Result<Vec<u64>, DecodeError> {
+        let count = usize::from(self.u16()?);
+        if count > MAX_NETWORK_PAGE {
+            return Err(DecodeError::TooMany);
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(self.u64()?);
+        }
+        Ok(ids)
+    }
+
+    fn network_history(&mut self) -> Result<NetworkHistory, DecodeError> {
+        let before = self.u64()?;
+        let more = self.flag()?;
+        let count = usize::from(self.u8()?);
+        if count > MAX_HISTORY_PAGE {
+            return Err(DecodeError::TooMany);
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let seq = self.u64()?;
+            let age_seconds = self.u32()?;
+            let actor = self.string(MAX_HISTORY_ACTOR)?;
+            let kind = HistoryKind::from_u8(self.u8()?).ok_or(DecodeError::BadNumber)?;
+            let object = self.u64()?;
+            let placed = self.flag()?;
+            let (x, z) = (self.i32()?, self.i32()?);
+            let undone = self.flag()?;
+            entries.push(HistoryEntry {
+                seq,
+                age_seconds,
+                actor,
+                kind,
+                object,
+                place: placed.then_some((x, z)),
+                undone,
+            });
+        }
+        Ok(NetworkHistory { before, more, entries })
     }
 
     fn u64(&mut self) -> Result<u64, DecodeError> {
@@ -1849,6 +2023,32 @@ mod tests {
                 edit: NetworkEdit::AddLine { a: 3, b: u64::MAX, mode: LineMode::Boat, one_way: true },
             },
             Message::NetworkEdit { token: 0, edit: NetworkEdit::SetClosed { line: 9, closed: false } },
+            Message::NetworkEdit { token: 4, edit: NetworkEdit::Revert { seq: u64::MAX } },
+            Message::NetworkHistoryWant { before: 77 },
+            Message::NetworkHistory(NetworkHistory {
+                before: 77,
+                more: true,
+                entries: vec![
+                    HistoryEntry {
+                        seq: 70,
+                        age_seconds: 65,
+                        actor: "Steve".into(),
+                        kind: HistoryKind::LineClosed,
+                        object: 12,
+                        place: Some((-30_000_000, 5)),
+                        undone: false,
+                    },
+                    HistoryEntry {
+                        seq: 69,
+                        age_seconds: 0,
+                        actor: String::new(),
+                        kind: HistoryKind::NodeRemoved,
+                        object: 3,
+                        place: None,
+                        undone: true,
+                    },
+                ],
+            }),
             Message::NetworkEditResult { token: 7, status: EditStatus::Forbidden, id: 0 },
             Message::NetworkEditResult { token: 8, status: EditStatus::Done, id: 123_456 },
             Message::NetworkWant { since: u64::MAX - 1, render: true },
@@ -1862,6 +2062,8 @@ mod tests {
                 rendering: true,
                 nodes: vec![NetworkNode { id: 4, x: -30_000_000, z: 30_000_000, transfer: true }],
                 lines: vec![NetworkLine { id: 9, a: 4, b: 5, mode: LineMode::Train, one_way: true, closed: true }],
+                removed_nodes: vec![11],
+                removed_lines: vec![12, u64::MAX],
             }),
             Message::Reject { reason: "Установите мод VexMap".into() },
             Message::Ping(42),
@@ -2323,6 +2525,8 @@ mod tests {
             rendering: false,
             nodes: vec![node; MAX_NETWORK_PAGE],
             lines: vec![line; MAX_NETWORK_PAGE],
+            removed_nodes: vec![7; 2],
+            removed_lines: vec![u64::MAX; MAX_NETWORK_PAGE],
         };
         let message = Message::NetworkPage(page);
         let body = message.body();

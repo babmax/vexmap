@@ -113,7 +113,7 @@ impl Grid {
     }
 }
 
-/// What the client holds of the network. Ids are the server's. Rows are added or changed and never removed.
+/// What the client holds of the network. Ids are the server's. Rows are added and changed; a rollback removes them.
 #[derive(Clone, Debug, Default)]
 pub struct Network {
     nodes: Vec<Node>,
@@ -131,8 +131,6 @@ fn pair(a: u64, b: u64, mode: Mode) -> (u64, u64, Mode) {
 }
 
 impl Network {
-    // Read by tests.
-    #[allow(dead_code)]
     pub fn new(nodes: Vec<Node>, lines: Vec<Line>) -> Self {
         let mut network = Network::default();
         network.apply(&nodes, &lines);
@@ -147,6 +145,19 @@ impl Network {
         for line in lines {
             self.upsert_line(*line);
         }
+    }
+
+    /// Drops rows that were rolled back. Rare, so the grids are simply built again. Returns whether anything went.
+    pub fn remove(&mut self, nodes: &[u64], lines: &[u64]) -> bool {
+        let gone_nodes: HashSet<u64> = nodes.iter().copied().filter(|id| self.by_id.contains_key(id)).collect();
+        let gone_lines: HashSet<u64> = lines.iter().copied().filter(|id| self.line_by_id.contains_key(id)).collect();
+        if gone_nodes.is_empty() && gone_lines.is_empty() {
+            return false;
+        }
+        let kept_nodes = self.nodes.iter().filter(|node| !gone_nodes.contains(&node.id)).copied().collect();
+        let kept_lines = self.lines.iter().filter(|line| !gone_lines.contains(&line.id)).copied().collect();
+        *self = Network::new(kept_nodes, kept_lines);
+        true
     }
 
     fn upsert_node(&mut self, node: Node) {
@@ -253,9 +264,25 @@ pub enum Tool {
 /// An edit to send. The same shapes as the wire's `NetworkEdit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edit {
-    AddNode { x: i32, z: i32, transfer: bool },
-    AddLine { a: u64, b: u64, mode: Mode, one_way: bool },
-    SetClosed { line: u64, closed: bool },
+    AddNode {
+        x: i32,
+        z: i32,
+        transfer: bool,
+    },
+    AddLine {
+        a: u64,
+        b: u64,
+        mode: Mode,
+        one_way: bool,
+    },
+    SetClosed {
+        line: u64,
+        closed: bool,
+    },
+    /// Undoes the edit with this journal number.
+    Revert {
+        seq: u64,
+    },
 }
 
 /// A message for the player, by key (the strings live in the language files).
@@ -273,6 +300,11 @@ pub enum Notice {
     PickDestination,
     NoRoute,
     Arrived,
+    PickStop,
+    TooManyStops,
+    StopReached,
+    /// The sidecar would not undo it: a node that still has lines, or something else stands there now.
+    RevertRefused,
 }
 
 impl Notice {
@@ -290,6 +322,14 @@ impl Notice {
             Notice::PickDestination => ("Click where to go", "Нажмите на точку назначения"),
             Notice::NoRoute => ("No route to there", "Туда нет маршрута"),
             Notice::Arrived => ("You have arrived", "Вы прибыли"),
+            Notice::PickStop => {
+                ("Click to add a stop, click a stop to remove it", "Нажмите: новая остановка, на метку: убрать")
+            }
+            Notice::TooManyStops => ("A route has 15 stops at most", "В маршруте не больше 15 остановок"),
+            Notice::StopReached => ("Stop reached", "Остановка пройдена"),
+            Notice::RevertRefused => {
+                ("Cannot be undone yet: undo its lines first", "Пока нельзя: сначала откатите его линии")
+            }
         }
     }
 }
@@ -551,6 +591,10 @@ const POLL_WITH_MAP_MS: u64 = 2_000;
 const POLL_IDLE_MS: u64 = 30_000;
 /// How long a message stays on the panel.
 const NOTICE_MS: u64 = 4_000;
+/// Where a route can go, the start not counted: `vexmap_routing::MAX_STOPS` less one.
+pub const MAX_ROUTE_STOPS: usize = 15;
+/// Tokens of rollbacks waiting for an answer. Only so that a refusal can be worded properly.
+const MAX_REVERTS_IN_THE_AIR: usize = 32;
 
 /// One page from the server, in the editor's types.
 #[derive(Clone, Debug, Default)]
@@ -564,6 +608,67 @@ pub struct Page {
     pub rendering: bool,
     pub nodes: Vec<Node>,
     pub lines: Vec<Line>,
+    pub removed_nodes: Vec<u64>,
+    pub removed_lines: Vec<u64>,
+}
+
+/// What an edit of the network did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryKind {
+    NodeAdded,
+    LineAdded,
+    LineClosed,
+    LineOpened,
+    NodeRemoved,
+    LineRemoved,
+}
+
+/// One line of the network's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub seq: u64,
+    pub age_seconds: u32,
+    /// Empty for a mod or a player never seen.
+    pub actor: String,
+    pub kind: HistoryKind,
+    pub place: Option<(i32, i32)>,
+    /// It no longer stands, so there is nothing to undo.
+    pub undone: bool,
+}
+
+impl HistoryRow {
+    pub fn describe(&self, ru: bool) -> String {
+        let age = match (self.age_seconds, ru) {
+            (0..60, false) => "now".to_owned(),
+            (0..60, true) => "сейчас".to_owned(),
+            (seconds @ 60..3600, false) => format!("{} min", seconds / 60),
+            (seconds @ 60..3600, true) => format!("{} мин", seconds / 60),
+            (seconds @ 3600..86_400, false) => format!("{} h", seconds / 3600),
+            (seconds @ 3600..86_400, true) => format!("{} ч", seconds / 3600),
+            (seconds, false) => format!("{} d", seconds / 86_400),
+            (seconds, true) => format!("{} д", seconds / 86_400),
+        };
+        let what = match (self.kind, ru) {
+            (HistoryKind::NodeAdded, false) => "node added",
+            (HistoryKind::NodeAdded, true) => "добавлен узел",
+            (HistoryKind::LineAdded, false) => "line added",
+            (HistoryKind::LineAdded, true) => "добавлена линия",
+            (HistoryKind::LineClosed, false) => "line closed",
+            (HistoryKind::LineClosed, true) => "закрыта линия",
+            (HistoryKind::LineOpened, false) => "line opened",
+            (HistoryKind::LineOpened, true) => "открыта линия",
+            (HistoryKind::NodeRemoved, false) => "node removed",
+            (HistoryKind::NodeRemoved, true) => "убран узел",
+            (HistoryKind::LineRemoved, false) => "line removed",
+            (HistoryKind::LineRemoved, true) => "убрана линия",
+        };
+        let who = match (self.actor.is_empty(), ru) {
+            (true, false) => "a mod",
+            (true, true) => "мод",
+            (false, _) => &self.actor,
+        };
+        format!("{age}  {who}: {what}")
+    }
 }
 
 /// One button of the editor's panel.
@@ -581,6 +686,12 @@ pub enum Button {
     Reroute,
     /// Draws the whole map now.
     Render,
+    /// The next clicks on the map add stops to the route being followed.
+    AddStop,
+    /// Drops the last stop of the route.
+    RemoveStop,
+    /// Shows or hides who changed what in the network, and how to undo it.
+    History,
 }
 
 impl Button {
@@ -599,11 +710,14 @@ impl Button {
             Button::Route => ("Route", "Маршрут"),
             Button::Reroute => ("Reroute", "Перестроить"),
             Button::Render => ("Load map", "Прогрузить"),
+            Button::AddStop => ("+ Stop", "+ Остановка"),
+            Button::RemoveStop => ("- Stop", "- Остановка"),
+            Button::History => ("History", "Журнал"),
         }
     }
 }
 
-const EDITOR_BUTTONS: [Button; 9] = [
+const EDITOR_BUTTONS: [Button; 10] = [
     Button::Toggle,
     Button::Tool(Tool::Node),
     Button::Tool(Tool::Line),
@@ -613,6 +727,7 @@ const EDITOR_BUTTONS: [Button; 9] = [
     Button::Mode(Mode::Train),
     Button::OneWay,
     Button::Transfer,
+    Button::History,
 ];
 
 /// Everything the client keeps about the network: the copy of it, how far that copy is behind, and the open editor.
@@ -636,15 +751,29 @@ pub struct Workspace {
     outbox: Vec<(u32, Edit)>,
     /// The next click on the map is where to go.
     pub picking_route: bool,
+    /// And the ones after it too: the player is adding stops, until told otherwise.
+    keep_picking: bool,
+    /// Where the route goes or is about to go, the start not counted. Told by whoever holds the route after each search,
+    /// and changed here at once, so a second quick click builds on the first.
+    pub route_stops: Vec<(f64, f64)>,
     /// A route is being followed, and whether the player has left it. Told each frame by whoever holds the route.
     pub route_shown: bool,
     pub off_route: bool,
-    route_request: Option<(f64, f64)>,
+    route_request: Option<Vec<(f64, f64)>>,
     route_dropped: bool,
     route_again: bool,
     want_render: bool,
     /// Regions of the world drawn, all of them, and whether a full drawing is running.
     pub render: (u32, u32, bool),
+    /// The history panel is up, and the page in it.
+    pub history_open: bool,
+    pub history: Vec<HistoryRow>,
+    history_more: bool,
+    /// The `before` of each page gone through. The last is the one shown; the first is always 0, the newest.
+    history_pages: Vec<u64>,
+    history_asked_at: Option<u64>,
+    history_ask_now: bool,
+    reverts: Vec<u32>,
 }
 
 impl Workspace {
@@ -685,6 +814,7 @@ impl Workspace {
         self.render = (page.render_done, page.render_total, page.rendering);
         if !page.may_edit {
             self.editing = false;
+            self.history_open = false;
         }
         if page.latest < page.since {
             // The server's database is older than what we hold: it was restored or replaced.
@@ -696,8 +826,17 @@ impl Workspace {
         self.have = page.to.max(page.since);
         self.latest = page.latest;
         self.network.apply(&page.nodes, &page.lines);
+        let removed = self.network.remove(&page.removed_nodes, &page.removed_lines);
+        if self.editor.pending().is_some_and(|node| self.network.node(node).is_none()) {
+            self.editor.cancel();
+        }
         self.ask_now = self.have < page.latest;
-        !page.nodes.is_empty() || !page.lines.is_empty()
+        let changed = removed || !page.nodes.is_empty() || !page.lines.is_empty();
+        if changed && self.history_open {
+            // Someone else's edit, or ours: the list is out of date.
+            self.history_ask_now = true;
+        }
+        changed
     }
 
     /// Still downloading the network.
@@ -711,7 +850,7 @@ impl Workspace {
     }
 
     /// Where the player chose to go, once.
-    pub fn take_route_request(&mut self) -> Option<(f64, f64)> {
+    pub fn take_route_request(&mut self) -> Option<Vec<(f64, f64)>> {
         self.route_request.take()
     }
 
@@ -735,8 +874,14 @@ impl Workspace {
         }
         if !self.editing {
             let mut buttons = vec![(Button::Route, self.picking_route || self.route_shown)];
-            if self.route_shown && self.off_route {
-                buttons.push((Button::Reroute, false));
+            if self.route_shown {
+                buttons.push((Button::AddStop, self.picking_route));
+                if self.route_stops.len() > 1 {
+                    buttons.push((Button::RemoveStop, false));
+                }
+                if self.off_route {
+                    buttons.push((Button::Reroute, false));
+                }
             }
             if self.may_edit {
                 buttons.push((Button::Toggle, false));
@@ -748,7 +893,13 @@ impl Workspace {
             .iter()
             .map(|button| {
                 let lit = match button {
-                    Button::Toggle | Button::Route | Button::Reroute | Button::Render => false,
+                    Button::Toggle
+                    | Button::Route
+                    | Button::Reroute
+                    | Button::Render
+                    | Button::AddStop
+                    | Button::RemoveStop => false,
+                    Button::History => self.history_open,
                     Button::Tool(tool) => self.editor.tool == *tool,
                     Button::Mode(mode) => self.editor.mode == *mode,
                     Button::OneWay => self.editor.one_way,
@@ -764,14 +915,41 @@ impl Workspace {
             Button::Toggle => {
                 self.editing = !self.editing;
                 self.editor.cancel();
+                self.history_open = false;
             }
             Button::Tool(tool) => self.editor.set_tool(tool),
             Button::Mode(mode) => self.editor.mode = mode,
             Button::OneWay => self.editor.one_way = !self.editor.one_way,
             Button::Transfer => self.editor.transfer = !self.editor.transfer,
-            Button::Route if self.route_shown => self.route_dropped = true,
-            Button::Route => self.picking_route = !self.picking_route,
+            Button::Route if self.route_shown => {
+                self.route_dropped = true;
+                self.picking_route = false;
+                self.keep_picking = false;
+                self.route_stops.clear();
+            }
+            Button::Route => {
+                self.picking_route = !self.picking_route;
+                self.keep_picking = false;
+            }
+            Button::AddStop => {
+                self.picking_route = !self.picking_route;
+                self.keep_picking = self.picking_route;
+            }
+            Button::RemoveStop => {
+                if self.route_stops.len() > 1 {
+                    self.route_stops.pop();
+                    self.route_request = Some(self.route_stops.clone());
+                }
+            }
             Button::Reroute => self.route_again = true,
+            Button::History => {
+                self.history_open = !self.history_open;
+                self.history.clear();
+                self.history_more = false;
+                self.history_pages = vec![0];
+                self.history_asked_at = None;
+                self.history_ask_now = self.history_open;
+            }
             Button::Render => {
                 self.want_render = true;
                 self.ask_now = true;
@@ -793,8 +971,9 @@ impl Workspace {
             self.say(Notice::WrongDimension, now_ms);
             return;
         }
-        if std::mem::take(&mut self.picking_route) {
-            self.route_request = Some(world);
+        if self.picking_route {
+            self.picking_route = self.keep_picking;
+            self.pick_stop(world, px_per_block, now_ms);
             return;
         }
         match self.editor.click(&self.network, world, px_per_block) {
@@ -802,6 +981,101 @@ impl Workspace {
             Click::Notice(notice) => self.say(notice, now_ms),
             Click::Picked(_) | Click::Cancelled => {}
         }
+    }
+
+    /// A click while choosing where to go: on a stop it removes that stop, anywhere else it adds one.
+    fn pick_stop(&mut self, world: (f64, f64), px_per_block: f64, now_ms: u64) {
+        let reach = snap_blocks(px_per_block);
+        let hit = self.route_stops.iter().position(|stop| (stop.0 - world.0).hypot(stop.1 - world.1) <= reach);
+        if let Some(index) = hit {
+            self.route_stops.remove(index);
+            if self.route_stops.is_empty() {
+                self.route_dropped = true;
+                self.picking_route = false;
+                self.keep_picking = false;
+            } else {
+                self.route_request = Some(self.route_stops.clone());
+            }
+            return;
+        }
+        if self.route_stops.len() >= MAX_ROUTE_STOPS {
+            self.say(Notice::TooManyStops, now_ms);
+            return;
+        }
+        self.route_stops.push(world);
+        self.route_request = Some(self.route_stops.clone());
+    }
+
+    /// The player is adding stops, rather than choosing the one place to go.
+    pub fn adding_stops(&self) -> bool {
+        self.picking_route && self.keep_picking
+    }
+
+    /// The `before` to ask the server about, if a page of the history is due.
+    pub fn history_due(&mut self, now_ms: u64) -> Option<u64> {
+        if !self.history_open {
+            return None;
+        }
+        if let Some(at) = self.history_asked_at {
+            if now_ms.saturating_sub(at) < ANSWER_TIMEOUT_MS {
+                return None;
+            }
+        } else if !self.history_ask_now {
+            return None;
+        }
+        self.history_asked_at = Some(now_ms);
+        self.history_ask_now = false;
+        self.history_pages.last().copied()
+    }
+
+    /// A page of the history from the server. A late copy of another page is dropped.
+    pub fn history_page(&mut self, before: u64, more: bool, rows: Vec<HistoryRow>) {
+        if !self.history_open || self.history_pages.last() != Some(&before) {
+            return;
+        }
+        self.history = rows;
+        self.history_more = more;
+        self.history_asked_at = None;
+    }
+
+    pub fn history_has_older(&self) -> bool {
+        self.history_more && !self.history.is_empty()
+    }
+
+    pub fn history_has_newer(&self) -> bool {
+        self.history_pages.len() > 1
+    }
+
+    pub fn history_older(&mut self) {
+        if let (true, Some(oldest)) = (self.history_has_older(), self.history.last()) {
+            self.history_pages.push(oldest.seq);
+            self.history_asked_at = None;
+            self.history_ask_now = true;
+        }
+    }
+
+    pub fn history_newer(&mut self) {
+        if self.history_has_newer() {
+            self.history_pages.pop();
+            self.history_asked_at = None;
+            self.history_ask_now = true;
+        }
+    }
+
+    /// Asks the server to undo the edit on this line of the panel. Sent on the next frame.
+    pub fn revert(&mut self, row: usize) {
+        let Some(seq) = self.history.get(row).filter(|row| !row.undone).map(|row| row.seq) else { return };
+        let token = self.editor.token();
+        self.outbox.push((token, Edit::Revert { seq }));
+        if self.reverts.len() >= MAX_REVERTS_IN_THE_AIR {
+            self.reverts.remove(0);
+        }
+        self.reverts.push(token);
+    }
+
+    /// Where the edit on this line of the panel happened.
+    pub fn history_place(&self, row: usize) -> Option<(i32, i32)> {
+        self.history.get(row)?.place
     }
 
     /// The right button: only drops a half-drawn line, so a stray click never leaves the editor.
@@ -819,10 +1093,14 @@ impl Workspace {
     /// Escape. `false` when there was nothing to step back from, so the key may close the map.
     pub fn step_back(&mut self) -> bool {
         if std::mem::take(&mut self.picking_route) {
+            self.keep_picking = false;
             return true;
         }
         if self.editor.pending().is_some() {
             self.editor.cancel();
+            return true;
+        }
+        if std::mem::take(&mut self.history_open) {
             return true;
         }
         std::mem::take(&mut self.editing)
@@ -830,6 +1108,22 @@ impl Workspace {
 
     /// The server's answer to an edit.
     pub fn result(&mut self, token: u32, status: EditStatus, id: u64, now_ms: u64) {
+        if let Some(index) = self.reverts.iter().position(|sent| *sent == token) {
+            self.reverts.remove(index);
+            match status {
+                EditStatus::Done | EditStatus::AlreadyDone => {
+                    self.ask_now = true;
+                    self.history_ask_now = true;
+                }
+                EditStatus::Forbidden => self.say(Notice::Forbidden, now_ms),
+                EditStatus::Invalid => {
+                    self.say(Notice::RevertRefused, now_ms);
+                    self.history_ask_now = true;
+                }
+                EditStatus::Unavailable => self.say(Notice::Unavailable, now_ms),
+            }
+            return;
+        }
         match self.editor.on_result(token, status, id) {
             Some(Ok(Click::Send { token, edit })) => self.outbox.push((token, edit)),
             Some(Err(notice)) => self.say(notice, now_ms),
@@ -1026,7 +1320,7 @@ mod workspace_tests {
         assert_eq!(workspace.buttons()[0], (Button::Route, true));
         workspace.click((50.0, 60.0), 1.0, true, 1);
         assert!(!workspace.picking_route);
-        assert_eq!(workspace.take_route_request(), Some((50.0, 60.0)));
+        assert_eq!(workspace.take_route_request(), Some(vec![(50.0, 60.0)]));
         assert_eq!(workspace.take_route_request(), None);
         assert!(workspace.take_outbox().is_empty(), "choosing a place is not an edit");
     }
@@ -1043,6 +1337,206 @@ mod workspace_tests {
         workspace.press(Button::Route);
         assert!(workspace.take_route_dropped());
         assert!(!workspace.picking_route);
+    }
+
+    fn following(stops: &[(f64, f64)]) -> Workspace {
+        let mut workspace = welcomed();
+        workspace.route_shown = true;
+        workspace.route_stops = stops.to_vec();
+        workspace
+    }
+
+    #[test]
+    fn stops_are_added_one_click_after_another_until_the_button_is_pressed_again() {
+        let mut workspace = following(&[(100.0, 0.0)]);
+        assert!(workspace.buttons().contains(&(Button::AddStop, false)));
+        workspace.press(Button::AddStop);
+        assert!(workspace.adding_stops());
+        assert!(workspace.buttons().contains(&(Button::AddStop, true)));
+        workspace.click((200.0, 0.0), 1.0, true, 1);
+        assert_eq!(workspace.take_route_request(), Some(vec![(100.0, 0.0), (200.0, 0.0)]));
+        workspace.click((300.0, 0.0), 1.0, true, 2);
+        assert_eq!(workspace.take_route_request(), Some(vec![(100.0, 0.0), (200.0, 0.0), (300.0, 0.0)]));
+        assert!(workspace.picking_route, "still adding");
+        workspace.press(Button::AddStop);
+        assert!(!workspace.picking_route);
+        assert!(workspace.take_outbox().is_empty(), "stops are not edits");
+    }
+
+    #[test]
+    fn a_click_on_a_stop_removes_it() {
+        let mut workspace = following(&[(100.0, 0.0), (200.0, 0.0), (300.0, 0.0)]);
+        workspace.press(Button::AddStop);
+        workspace.click((201.0, 2.0), 1.0, true, 1);
+        assert_eq!(workspace.take_route_request(), Some(vec![(100.0, 0.0), (300.0, 0.0)]));
+    }
+
+    #[test]
+    fn removing_the_only_stop_drops_the_route() {
+        let mut workspace = following(&[(100.0, 0.0)]);
+        workspace.press(Button::AddStop);
+        workspace.click((100.0, 0.0), 1.0, true, 1);
+        assert!(workspace.take_route_dropped());
+        assert_eq!(workspace.take_route_request(), None);
+        assert!(!workspace.picking_route);
+    }
+
+    #[test]
+    fn the_last_stop_can_be_dropped_but_never_the_only_one() {
+        let mut workspace = following(&[(100.0, 0.0)]);
+        assert!(workspace.buttons().iter().all(|(button, _)| *button != Button::RemoveStop));
+        workspace.press(Button::RemoveStop);
+        assert_eq!(workspace.take_route_request(), None);
+        let mut workspace = following(&[(100.0, 0.0), (200.0, 0.0)]);
+        workspace.press(Button::RemoveStop);
+        assert_eq!(workspace.take_route_request(), Some(vec![(100.0, 0.0)]));
+    }
+
+    #[test]
+    fn a_route_has_a_limit_of_stops() {
+        let stops: Vec<(f64, f64)> = (0..MAX_ROUTE_STOPS).map(|i| (i as f64 * 1000.0, 0.0)).collect();
+        let mut workspace = following(&stops);
+        workspace.press(Button::AddStop);
+        workspace.click((0.0, 9000.0), 1.0, true, 1);
+        assert_eq!(workspace.take_route_request(), None);
+        assert_eq!(workspace.notice(2), Some(Notice::TooManyStops));
+    }
+
+    #[test]
+    fn dropping_the_route_forgets_the_stops() {
+        let mut workspace = following(&[(100.0, 0.0), (200.0, 0.0)]);
+        workspace.press(Button::Route);
+        assert!(workspace.take_route_dropped());
+        assert!(workspace.route_stops.is_empty());
+    }
+
+    fn row(seq: u64, undone: bool) -> HistoryRow {
+        HistoryRow {
+            seq,
+            age_seconds: 90,
+            actor: "Steve".into(),
+            kind: HistoryKind::LineAdded,
+            place: Some((4, 5)),
+            undone,
+        }
+    }
+
+    fn with_history() -> Workspace {
+        let mut workspace = welcomed();
+        workspace.may_edit = true;
+        workspace.press(Button::Toggle);
+        workspace.press(Button::History);
+        workspace
+    }
+
+    #[test]
+    fn the_history_is_asked_for_once_and_again_after_a_lost_answer() {
+        assert_eq!(welcomed().history_due(0), None, "closed");
+        let mut workspace = with_history();
+        assert_eq!(workspace.history_due(0), Some(0));
+        assert_eq!(workspace.history_due(100), None);
+        assert_eq!(workspace.history_due(3_000), Some(0));
+    }
+
+    #[test]
+    fn the_history_is_paged_back_and_forth() {
+        let mut workspace = with_history();
+        workspace.history_due(0);
+        workspace.history_page(0, true, vec![row(9, false), row(7, false)]);
+        assert!(workspace.history_has_older() && !workspace.history_has_newer());
+        workspace.history_older();
+        assert_eq!(workspace.history_due(1), Some(7));
+        workspace.history_page(0, false, vec![]);
+        assert_eq!(workspace.history.len(), 2, "a late copy of the page before");
+        workspace.history_page(7, false, vec![row(3, false)]);
+        assert_eq!(workspace.history[0].seq, 3);
+        assert!(!workspace.history_has_older() && workspace.history_has_newer());
+        workspace.history_newer();
+        assert_eq!(workspace.history_due(2), Some(0));
+    }
+
+    #[test]
+    fn a_rollback_is_sent_and_its_answer_refreshes_the_list_and_the_network() {
+        let mut workspace = with_history();
+        workspace.history_due(0);
+        workspace.history_page(0, false, vec![row(9, false), row(7, true)]);
+        workspace.revert(1);
+        assert!(workspace.take_outbox().is_empty(), "what no longer stands cannot be undone");
+        workspace.revert(0);
+        let sent = workspace.take_outbox();
+        assert_eq!(sent[0].1, Edit::Revert { seq: 9 });
+        workspace.result(sent[0].0, EditStatus::Done, 12, 1);
+        assert_eq!(workspace.history_due(2), Some(0));
+        assert_eq!(workspace.want_due(3, true), Some(0));
+    }
+
+    #[test]
+    fn a_refused_rollback_says_why_and_keeps_a_half_drawn_line() {
+        let mut workspace = with_history();
+        workspace.want_due(0, false);
+        workspace.page(&page(0, 1, 1, vec![node(1, 0, 0)], vec![]), 1);
+        workspace.click((0.0, 0.0), 1.0, true, 2);
+        workspace.history_due(3);
+        workspace.history_page(0, false, vec![row(1, false)]);
+        workspace.revert(0);
+        let sent = workspace.take_outbox();
+        workspace.result(sent[0].0, EditStatus::Invalid, 0, 4);
+        assert_eq!(workspace.notice(5), Some(Notice::RevertRefused));
+        assert_eq!(workspace.editor.pending(), Some(1));
+    }
+
+    #[test]
+    fn someone_elses_edit_refreshes_an_open_history() {
+        let mut workspace = with_history();
+        workspace.history_due(0);
+        workspace.history_page(0, false, vec![]);
+        assert_eq!(workspace.history_due(1), None);
+        workspace.want_due(0, false);
+        workspace.page(&page(0, 1, 1, vec![node(1, 0, 0)], vec![]), 2);
+        assert_eq!(workspace.history_due(3), Some(0));
+    }
+
+    #[test]
+    fn a_rolled_back_row_leaves_the_copy_and_a_line_drawn_from_it_is_dropped() {
+        let mut workspace = welcomed();
+        workspace.want_due(0, false);
+        workspace.page(&page(0, 3, 3, vec![node(1, 0, 0), node(2, 9, 0)], vec![line(3, 1, 2)]), 1);
+        workspace.click((9.0, 0.0), 1.0, true, 2);
+        assert_eq!(workspace.editor.pending(), Some(2));
+        workspace.want_due(10_000, false);
+        let removal = Page { removed_lines: vec![3], removed_nodes: vec![2], ..page(3, 5, 5, vec![], vec![]) };
+        assert!(workspace.page(&removal, 10_001));
+        assert_eq!(workspace.network.lines().len(), 0);
+        assert_eq!(workspace.network.nodes().len(), 1);
+        assert_eq!(workspace.editor.pending(), None);
+    }
+
+    #[test]
+    fn escape_closes_the_history_before_the_editor() {
+        let mut workspace = with_history();
+        assert!(workspace.step_back());
+        assert!(!workspace.history_open && workspace.editing);
+        assert!(workspace.step_back());
+        assert!(!workspace.editing);
+    }
+
+    #[test]
+    fn leaving_the_editor_closes_the_history() {
+        let mut workspace = with_history();
+        workspace.press(Button::Toggle);
+        assert!(!workspace.history_open);
+        assert_eq!(workspace.history_due(0), None);
+    }
+
+    #[test]
+    fn a_history_row_reads_like_a_sentence() {
+        assert_eq!(row(1, false).describe(true), "1 мин  Steve: добавлена линия");
+        assert_eq!(row(1, false).describe(false), "1 min  Steve: line added");
+        let old =
+            HistoryRow { age_seconds: 200_000, actor: String::new(), kind: HistoryKind::NodeRemoved, ..row(1, false) };
+        assert_eq!(old.describe(true), "2 д  мод: убран узел");
+        assert_eq!(HistoryRow { age_seconds: 5, ..row(1, false) }.describe(false), "now  Steve: line added");
+        assert_eq!(HistoryRow { age_seconds: 7200, ..row(1, false) }.describe(true), "2 ч  Steve: добавлена линия");
     }
 
     #[test]
@@ -1218,6 +1712,22 @@ mod tests {
         editor.click(&net(), (0.0, 0.0), 1.0);
         editor.set_tool(Tool::Close);
         assert_eq!(editor.pending(), None);
+    }
+
+    #[test]
+    fn removing_rows_leaves_the_rest_findable_and_they_can_come_back() {
+        let mut network = net();
+        assert!(!network.remove(&[99], &[98]), "nothing we hold");
+        assert!(network.remove(&[], &[10]));
+        assert!(network.lines().is_empty());
+        let editor = Editor::default();
+        assert_eq!(editor.hover(&network, (50.0, 2.0), 1.0), Hover::Nothing);
+        assert_eq!(editor.hover(&network, (100.0, 2.0), 1.0), Hover::Node(2));
+        let mut drawing = Editor::default();
+        drawing.click(&network, (0.0, 0.0), 1.0);
+        assert!(matches!(drawing.click(&network, (100.0, 0.0), 1.0), Click::Send { .. }), "the pair is free again");
+        network.apply(&[], &[line(10, 1, 2)]);
+        assert_eq!(editor.hover(&network, (50.0, 2.0), 1.0), Hover::Line(10));
     }
 
     #[test]
